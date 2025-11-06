@@ -24,10 +24,11 @@ public:
         po.curvature = pi.curvature;
     }     
 
-    static void findCorresp(int& effect_num_k, const SplineState* spline, KD_TREE<pcl::PointXYZINormal>* ikdtree, Eigen::aligned_deque<PointData>& pt_meas)
+    static void findCorresp(int& effect_num_k, const SplineState* spline, KD_TREE<pcl::PointXYZINormal>* ikdtree, 
+                            Eigen::aligned_deque<PointData>& pt_meas, int num_threads = 5, int num_match_points = 5)
     {
         int num_pt = pt_meas.size();
-        #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
+        #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
         for (int i = 0; i < num_pt; i++) {
             PointData& pt_data = pt_meas[i];
             pt_data.if_valid = false;
@@ -35,10 +36,10 @@ public:
                 continue;
             }
             Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
-            std::vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
+            std::vector<float> pointSearchSqDis(num_match_points);
             pt_data.nearest_points.clear();
-            ikdtree->Nearest_Search(pt_data.pt_w, NUM_MATCH_POINTS, pt_data.nearest_points, pointSearchSqDis, 2.236); 
-            if (pt_data.nearest_points.size() >= (size_t)NUM_MATCH_POINTS && pointSearchSqDis[NUM_MATCH_POINTS - 1] < 5) {     
+            ikdtree->Nearest_Search(pt_data.pt_w, num_match_points, pt_data.nearest_points, pointSearchSqDis, 2.236); 
+            if (pt_data.nearest_points.size() >= (size_t)num_match_points && pointSearchSqDis[num_match_points - 1] < 5) {
                 Eigen::Vector4f pabcd;       
                 pabcd.setZero();
                 if (CommonUtils::esti_plane(pabcd, pt_data.nearest_points, 0.1f)) {

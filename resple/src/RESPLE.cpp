@@ -39,6 +39,13 @@ public:
     explicit RESPLE(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
         : rclcpp::Node("RESPLE", options)
     {
+        // Parameterize thread count and nearest neighbor count
+        num_threads_ = this->declare_parameter<int>("num_threads", 5);
+        num_match_points_ = this->declare_parameter<int>("num_match_points", 5);
+        
+        RCLCPP_INFO(this->get_logger(), "Using %d threads for parallel processing", num_threads_);
+        RCLCPP_INFO(this->get_logger(), "Using %d nearest neighbor points for matching", num_match_points_);
+        
         readParameters();
         
         // Create callback groups to separate sensor IO from control/estimation callbacks
@@ -106,18 +113,18 @@ public:
         while (true) {
             for (auto& [lidar_name, lidar_data] : lidars_data) {
                 while (!lidar_data.t_buff.empty()) {
-                    pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame(new pcl::PointCloud<pcl::PointXYZINormal>());
+                    pc_frame_reusable_->clear();
                     lidar_data.mtx_pc.lock();
-                    pc_frame->points = lidar_data.pc_buff.front();
+                    pc_frame_reusable_->points = lidar_data.pc_buff.front();
                     lidar_data.pc_buff.pop_front();
                     int64_t time_begin = lidar_data.t_buff.front();
                     lidar_data.t_buff.pop_front();
                     lidar_data.mtx_pc.unlock();
                     std::vector<int> indices;
-                    pcl::removeNaNFromPointCloud(*pc_frame, *pc_frame, indices);
+                    pcl::removeNaNFromPointCloud(*pc_frame_reusable_, *pc_frame_reusable_, indices);
                     pc_last_ds->clear();
 
-                    ds_filter_body.setInputCloud(pc_frame);
+                    ds_filter_body.setInputCloud(pc_frame_reusable_);
                     ds_filter_body.filter(*pc_last_ds);
                     sort(pc_last_ds->points.begin(), pc_last_ds->points.end(), &CommonUtils::time_list);
                     const LidarConfig& lidar = lidars.at(lidar_name);
@@ -150,7 +157,7 @@ public:
                 int64_t max_time_ns = pt_meas.back().time_ns;
                 if (if_lidar_only) {
                     estimator_lo.propRCP(max_time_ns);
-                    estimator_lo.updateIEKFLiDAR(pt_meas, &ikdtree, param.nn_thresh, param.coeff_cov);
+                    estimator_lo.updateIEKFLiDAR(pt_meas, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
                 } else {
                     if (!imu_meas.empty()) {
                         max_time_ns = std::max(imu_meas.back().time_ns, max_time_ns);
@@ -159,9 +166,9 @@ public:
                         imu_meas.pop_front();
                     }
                     estimator_lio.propRCP(max_time_ns);
-                    estimator_lio.updateIEKFLiDARInertial(pt_meas, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov);
+                    estimator_lio.updateIEKFLiDARInertial(pt_meas, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
                 }
-                #pragma omp parallel for num_threads(NUM_OF_THREAD)
+                #pragma omp parallel for num_threads(num_threads_)
                 for (size_t i = 0; i < pt_meas.size(); i++) {
                     PointData& pt_data = pt_meas[i];
                     Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
@@ -213,6 +220,14 @@ private:
     // Callback groups (initialized in constructor)
     rclcpp::CallbackGroup::SharedPtr sensor_cb_group;
     rclcpp::CallbackGroup::SharedPtr control_cb_group;
+
+    // Performance tuning parameters (Phase 3)
+    int num_threads_;
+    int num_match_points_;
+    
+    // Pre-allocated reusable buffers (Phase 3 - avoid repeated heap allocations)
+    pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame_reusable_;
+    pcl::PointCloud<pcl::PointXYZI>::Ptr laser_cloud_world_reusable_;
 
     std::string node_name = "RESPLE";
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_ouster;
@@ -326,7 +341,11 @@ private:
         }
         pc_last.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
         pc_last_ds.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
-        NUM_MATCH_POINTS = CommonUtils::readParam<int>(*this, "num_nn", 5);
+        // num_match_points_ is now initialized in constructor from parameters
+        
+        // Initialize reusable buffers (Phase 3)
+        pc_frame_reusable_.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
+        laser_cloud_world_reusable_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         double lidar_time_offset = CommonUtils::readParam<double>(*this, "lidar_time_offset", 0.0);
         time_offset = 1e9*lidar_time_offset;
     }
@@ -628,18 +647,21 @@ private:
     void publishFrameWorld()
     {
         int size = pc_world.points.size();
-        pcl::PointCloud<pcl::PointXYZI>::Ptr laserCloudWorld(new pcl::PointCloud<pcl::PointXYZI>(size, 1));
+        laser_cloud_world_reusable_->clear();
+        laser_cloud_world_reusable_->points.resize(size);
         for (int i = 0; i < size; i++) {
-            laserCloudWorld->points[i].x = pc_world.points[i].x;
-            laserCloudWorld->points[i].y = pc_world.points[i].y;
-            laserCloudWorld->points[i].z = pc_world.points[i].z;
-            laserCloudWorld->points[i].intensity = pc_world.points[i].curvature;
+            laser_cloud_world_reusable_->points[i].x = pc_world.points[i].x;
+            laser_cloud_world_reusable_->points[i].y = pc_world.points[i].y;
+            laser_cloud_world_reusable_->points[i].z = pc_world.points[i].z;
+            laser_cloud_world_reusable_->points[i].intensity = pc_world.points[i].curvature;
         }
-        sensor_msgs::msg::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-        laserCloudmsg.header.stamp = rclcpp::Time(spline->maxTimeNs());
-        laserCloudmsg.header.frame_id = odom_id;
-        pub_cur_scan->publish(laserCloudmsg);
+        
+        // Use loaned message to avoid DDS serialization copy (Phase 3 optimization)
+        auto loaned_msg = pub_cur_scan->borrow_loaned_message();
+        pcl::toROSMsg(*laser_cloud_world_reusable_, loaned_msg.get());
+        loaned_msg.get().header.stamp = rclcpp::Time(spline->maxTimeNs());
+        loaned_msg.get().header.frame_id = odom_id;
+        pub_cur_scan->publish(std::move(loaned_msg));
     }
 
     bool initialization()

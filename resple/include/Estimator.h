@@ -52,7 +52,8 @@ class Estimator
         return state;
     }  
 
-    void updateIEKFLiDAR(Eigen::aligned_deque<PointData>& pt_meas, KD_TREE<pcl::PointXYZINormal>* ikdtree, const double pt_thresh, const double cov_thresh)
+    void updateIEKFLiDAR(Eigen::aligned_deque<PointData>& pt_meas, KD_TREE<pcl::PointXYZINormal>* ikdtree, const double pt_thresh, const double cov_thresh,
+                          int num_threads = 5, int num_match_points = 5)
     {
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
@@ -63,10 +64,10 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas);
+                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, num_threads, num_match_points);
             }
             if (num_tot_eff > 0) {
-                updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh);
+                updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads);
             } else {
                 break;
             }
@@ -89,7 +90,8 @@ class Estimator
     }
 
     void updateIEKFLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, KD_TREE<pcl::PointXYZINormal>* ikdtree, const double pt_thresh,
-        Eigen::aligned_deque<ImuData>& imu_meas, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro, const double cov_thresh)
+        Eigen::aligned_deque<ImuData>& imu_meas, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro, const double cov_thresh,
+        int num_threads = 5, int num_match_points = 5)
     {
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
@@ -100,12 +102,12 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas);
+                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, num_threads, num_match_points);
             }
             if (num_tot_eff > 0 && imu_meas.empty()) {
-                updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh);
+                updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads);
             } else if (num_tot_eff > 0) {
-                updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, g, cov_acc, cov_gyro);
+                updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, g, cov_acc, cov_gyro, num_threads);
             } else {
                 break;
             }
@@ -226,7 +228,7 @@ class Estimator
     }        
 
     bool updateLiDAR(Eigen::aligned_deque<PointData>& pt_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
-        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const double pt_thresh, const double cov_thresh)
+        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const double pt_thresh, const double cov_thresh, int num_threads = 5)
     {
         Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H(num_valid, XSIZE);
         Eigen::Matrix<double, Eigen::Dynamic, 1> innv(num_valid, 1);
@@ -235,11 +237,11 @@ class Estimator
         innv.setZero();
         mat_cov_inv.setConstant(1/0.01);
         size_t num_pt = pt_meas.size();    
-        #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
+        #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
         for (size_t i = 0; i < num_pt; i++) {
             PointData& pt_data = pt_meas[i];
             prepLiDAR(pt_data);
-        }        
+        }
         int idx_offset = 0;
         for(size_t i = 0; i < num_pt; i++) {
             const PointData& pt_data = pt_meas[i];
@@ -261,18 +263,18 @@ class Estimator
     }           
 
     void updateLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, Eigen::aligned_deque<ImuData>& imu_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
-        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const double pt_thresh, const double cov_thresh, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro)
+        const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const double pt_thresh, const double cov_thresh, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro, int num_threads = 5)
     {
         Eigen::Matrix<double, 6, 1> cov_imu_inv =  Eigen::Matrix<double, 6, 1>(1/cov_acc[0], 1/cov_acc[1], 1/cov_acc[2], 1/cov_gyro[0], 1/cov_gyro[1], 1/cov_gyro[2]);
-        #pragma omp parallel for num_threads(NUM_OF_THREAD) schedule(dynamic)
+        #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
         for (size_t i = 0; i < pt_meas.size(); i++) {
             PointData& pt_data = pt_meas[i];
             prepLiDAR(pt_data); 
         }
-        #pragma omp parallel for num_threads(NUM_OF_THREAD) 
+        #pragma omp parallel for num_threads(num_threads) 
         for (size_t i = 0; i < imu_meas.size(); i++) {
             prepIMU(imu_meas[i], g);
-        }                
+        }
         int dim_meas = 6*imu_meas.size() + num_valid;
         Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H(dim_meas, XSIZE);
         Eigen::Matrix<double, Eigen::Dynamic, 1> innv(dim_meas, 1);

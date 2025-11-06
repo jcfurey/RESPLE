@@ -10,8 +10,10 @@
 
 #include "utils/eigen_utils.hpp"
 
-int NUM_OF_THREAD = 5;
-int NUM_MATCH_POINTS = 5;
+// NOTE: NUM_OF_THREAD and NUM_MATCH_POINTS are now ROS parameters in RESPLE node
+// They were previously global variables but are now configurable per-node instance
+// int NUM_OF_THREAD = 5;
+// int NUM_MATCH_POINTS = 5;
 
 struct ImuData {
     int64_t time_ns;
