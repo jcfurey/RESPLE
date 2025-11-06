@@ -30,9 +30,12 @@ class MappingBase
 
     std::mutex mtx;
     LidarConfig lidar;
-    MappingBase(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : lidar(lidar_config)
+    MappingBase(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config, 
+                rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr) : lidar(lidar_config)
     {
-        pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("global_map", 2);
+        // Phase 2: Explicit QoS profile for visualization (reliable for RViz compatibility)
+        pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("global_map", 
+            rclcpp::QoS(2).reliable());
         ds_filter_each_scan.setLeafSize(0.2, 0.2, 0.2);
         pc_last.reset(new typename pcl::PointCloud<PointType>());
         pc_last_ds.reset(new typename pcl::PointCloud<PointType>());
@@ -65,6 +68,7 @@ class MappingBase
     void publishMap(const typename pcl::PointCloud<PointType>::Ptr& pcs,
                          const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher) const
     {
+        // Note: Loaned messages not used here due to compatibility with PCL toROSMsg
         sensor_msgs::msg::PointCloud2 msgs;
         pcl::toROSMsg(*pcs, msgs);
         msgs.header.frame_id = odom_id;
@@ -98,6 +102,8 @@ class MappingBase
         int64_t time_begin = rclcpp::Time(pc_in.header.stamp).nanoseconds();
         pc->clear();
         pc_out->points.resize(pc_in.size());
+        // Phase 3: Parallelize point transformation (conservative 5 threads)
+        #pragma omp parallel for num_threads(5)
         for (size_t i = 0; i < pc_in.size(); i++) {
             const PointType& pt = pc_in.points[i];
             int64_t t_ns = int64_t(pt.intensity * float(1e6)) + time_begin;
@@ -122,29 +128,40 @@ class MappingBase
 class OusterBuff : public MappingBase<pcl::PointXYZINormal>
 {
   public:
-  OusterBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : MappingBase<pcl::PointXYZINormal>(nh, lidar_config)
+  OusterBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config, 
+             rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr) 
+      : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
+        // Phase 2: QoS profile and callback group
+        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
+        rclcpp::SubscriptionOptions sub_opt;
+        if (sensor_cb) sub_opt.callback_group = sensor_cb;
+        
         pc_subscription_ouster = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
-            this->lidar.topic, 100, std::bind(&OusterBuff::ousterLidarCallback, this, std::placeholders::_1));
+            this->lidar.topic, lidar_qos, std::bind(&OusterBuff::ousterLidarCallback, this, std::placeholders::_1), sub_opt);
         double lidar_time_offset = CommonUtils::readParam<double>(nh, "lidar_time_offset", 0.0);
         time_offset = 1e9*lidar_time_offset;
+        
+        // Phase 3: Pre-allocate reusable buffer
+        pc_ouster_reusable_.reset(new pcl::PointCloud<ouster_ros::Point>());
     }
 
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
     {
         this->pc_last->clear();
-        pcl::PointCloud<ouster_ros::Point>::Ptr pc_last_ouster(new pcl::PointCloud<ouster_ros::Point>());
-        pcl::fromROSMsg(*ouster_msg_in, *pc_last_ouster);
-        size_t plsize = pc_last_ouster->size();
+        // Phase 3: Use pre-allocated buffer instead of repeated allocation
+        pc_ouster_reusable_->clear();
+        pcl::fromROSMsg(*ouster_msg_in, *pc_ouster_reusable_);
+        size_t plsize = pc_ouster_reusable_->size();
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
         for (uint i = 1; i < plsize; i++) {
-            pt.x = pc_last_ouster->points[i].x;
-            pt.y = pc_last_ouster->points[i].y;
-            pt.z = pc_last_ouster->points[i].z;
-            pt.intensity = float (pc_last_ouster->points[i].t) / float (1e6); // unit: ms
-            pt.curvature = 0.1 * pc_last_ouster->points[i].intensity;
+            pt.x = pc_ouster_reusable_->points[i].x;
+            pt.y = pc_ouster_reusable_->points[i].y;
+            pt.z = pc_ouster_reusable_->points[i].z;
+            pt.intensity = float (pc_ouster_reusable_->points[i].t) / float (1e6); // unit: ms
+            pt.curvature = 0.1 * pc_ouster_reusable_->points[i].intensity;
 
             if (pt.intensity >= 0) {
                 this->pc_last->points.push_back(pt);
@@ -168,15 +185,24 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
   private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_ouster;
     int64_t time_offset = 0;
+    // Phase 3: Pre-allocated reusable buffer
+    pcl::PointCloud<ouster_ros::Point>::Ptr pc_ouster_reusable_;
 };
 
 class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
 {
   public:
-  Mid70AviaBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : MappingBase<pcl::PointXYZINormal>(nh, lidar_config)
+  Mid70AviaBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config,
+                rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
+      : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
+        // Phase 2: QoS profile and callback group
+        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
+        rclcpp::SubscriptionOptions sub_opt;
+        if (sensor_cb) sub_opt.callback_group = sensor_cb;
+        
         pc_subscription_livox = nh->create_subscription<livox_ros_driver::msg::CustomMsg>(
-            this->lidar.topic, 100, std::bind(&Mid70AviaBuff::livoxLidarCallback, this, std::placeholders::_1));
+            this->lidar.topic, lidar_qos, std::bind(&Mid70AviaBuff::livoxLidarCallback, this, std::placeholders::_1), sub_opt);
     }
 
     void livoxLidarCallback(const livox_ros_driver::msg::CustomMsg::SharedPtr livox_msg_in)
@@ -218,10 +244,17 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
 class HAP360Buff : public MappingBase<pcl::PointXYZINormal>
 {
 public:
-    HAP360Buff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : MappingBase<pcl::PointXYZINormal>(nh, lidar_config)
+    HAP360Buff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config,
+               rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
+        : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
+        // Phase 2: QoS profile and callback group
+        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
+        rclcpp::SubscriptionOptions sub_opt;
+        if (sensor_cb) sub_opt.callback_group = sensor_cb;
+        
         pc_subscription_livox = nh->create_subscription<livox_ros_driver2::msg::CustomMsg>(
-            this->lidar.topic, 100, std::bind(&HAP360Buff::livoxLidarCallback, this, std::placeholders::_1));
+            this->lidar.topic, lidar_qos, std::bind(&HAP360Buff::livoxLidarCallback, this, std::placeholders::_1), sub_opt);
     }
 
     void livoxLidarCallback(livox_ros_driver2::msg::CustomMsg::SharedPtr livox_msg_in)
@@ -263,10 +296,17 @@ public:
 class AviaRespleBuff : public MappingBase<pcl::PointXYZINormal>
 {
 public:
-    AviaRespleBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : MappingBase<pcl::PointXYZINormal>(nh, lidar_config)
+    AviaRespleBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config,
+                   rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
+        : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
+        // Phase 2: QoS profile and callback group
+        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
+        rclcpp::SubscriptionOptions sub_opt;
+        if (sensor_cb) sub_opt.callback_group = sensor_cb;
+        
         pc_subscription_livox = nh->create_subscription<livox_interfaces::msg::CustomMsg>(
-            this->lidar.topic, 100, std::bind(&AviaRespleBuff::livoxLidarCallback, this, std::placeholders::_1));
+            this->lidar.topic, lidar_qos, std::bind(&AviaRespleBuff::livoxLidarCallback, this, std::placeholders::_1), sub_opt);
     }
 
     void livoxLidarCallback(livox_interfaces::msg::CustomMsg::SharedPtr livox_msg_in)
@@ -308,32 +348,43 @@ public:
 class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
 {
   public:
-  HesaiBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : MappingBase<pcl::PointXYZINormal>(nh, lidar_config)
+  HesaiBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config,
+            rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
+      : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
+        // Phase 2: QoS profile and callback group
+        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
+        rclcpp::SubscriptionOptions sub_opt;
+        if (sensor_cb) sub_opt.callback_group = sensor_cb;
+        
         pc_subscription_hesai = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
-            this->lidar.topic, 100, std::bind(&HesaiBuff::hesaiLidarCallback, this, std::placeholders::_1));
+            this->lidar.topic, lidar_qos, std::bind(&HesaiBuff::hesaiLidarCallback, this, std::placeholders::_1), sub_opt);
+        
+        // Phase 3: Pre-allocate reusable buffer
+        pc_hesai_reusable_.reset(new pcl::PointCloud<hesai_ros::Point>());
     }
 
     void hesaiLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr hesai_msg_in)
     {
         this->pc_last->clear();
-        pcl::PointCloud<hesai_ros::Point>::Ptr pc_last_hesai(new pcl::PointCloud<hesai_ros::Point>());
-        pcl::fromROSMsg(*hesai_msg_in, *pc_last_hesai);
-        size_t plsize = pc_last_hesai->size();
+        // Phase 3: Use pre-allocated buffer
+        pc_hesai_reusable_->clear();
+        pcl::fromROSMsg(*hesai_msg_in, *pc_hesai_reusable_);
+        size_t plsize = pc_hesai_reusable_->size();
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(hesai_msg_in->header.stamp);
         pcl::PointXYZINormal pt;
         for (uint i = 0; i < plsize; i++) {
-            pt.x = pc_last_hesai->points[i].x;
-            pt.y = pc_last_hesai->points[i].y;
-            pt.z = pc_last_hesai->points[i].z;
+            pt.x = pc_hesai_reusable_->points[i].x;
+            pt.y = pc_hesai_reusable_->points[i].y;
+            pt.z = pc_hesai_reusable_->points[i].z;
             double timestamp_s;
-            double timestamp_ns = std::modf(pc_last_hesai->points[i].timestamp, &timestamp_s);
+            double timestamp_ns = std::modf(pc_hesai_reusable_->points[i].timestamp, &timestamp_s);
             rclcpp::Time timestamp_ros(static_cast<int32_t>(timestamp_s), static_cast<int32_t>(timestamp_ns * 1.0e9),
                 rcl_clock_type_t::RCL_ROS_TIME);
             pt.intensity = (timestamp_ros - timestamp_begin).seconds() * 1.0e3;
-            pt.curvature = pc_last_hesai->points[i].intensity;
+            pt.curvature = pc_hesai_reusable_->points[i].intensity;
 
             if (pt.intensity >= 0) {
                 this->pc_last->points.push_back(pt);
@@ -356,35 +407,48 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
 
   private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_hesai;
+    // Phase 3: Pre-allocated reusable buffer
+    pcl::PointCloud<hesai_ros::Point>::Ptr pc_hesai_reusable_;
 };
 
 class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
 {
   public:
-  Mid360BoxiBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : MappingBase<pcl::PointXYZINormal>(nh, lidar_config)
+  Mid360BoxiBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config,
+                 rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
+      : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
+        // Phase 2: QoS profile and callback group
+        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
+        rclcpp::SubscriptionOptions sub_opt;
+        if (sensor_cb) sub_opt.callback_group = sensor_cb;
+        
         pc_subscription_mid360 = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
-            this->lidar.topic, 100, std::bind(&Mid360BoxiBuff::mid360BoxiCallback, this, std::placeholders::_1));
+            this->lidar.topic, lidar_qos, std::bind(&Mid360BoxiBuff::mid360BoxiCallback, this, std::placeholders::_1), sub_opt);
+        
+        // Phase 3: Pre-allocate reusable buffer
+        pc_mid360_reusable_.reset(new pcl::PointCloud<livox_mid360_boxi::Point>());
     }
 
     void mid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
     {
         this->pc_last->clear();
-        pcl::PointCloud<livox_mid360_boxi::Point>::Ptr pc_last_livox(new pcl::PointCloud<livox_mid360_boxi::Point>());
-        pcl::fromROSMsg(*livox_msg_in, *pc_last_livox);
-        size_t plsize = pc_last_livox->size();
+        // Phase 3: Use pre-allocated buffer
+        pc_mid360_reusable_->clear();
+        pcl::fromROSMsg(*livox_msg_in, *pc_mid360_reusable_);
+        size_t plsize = pc_mid360_reusable_->size();
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(livox_msg_in->header.stamp);
         pcl::PointXYZINormal pt;
         for (uint i = 0; i < plsize; i++) {
-            pt.x = pc_last_livox->points[i].x;
-            pt.y = pc_last_livox->points[i].y;
-            pt.z = pc_last_livox->points[i].z;
-            rclcpp::Time timestamp_ros(static_cast<int64_t>(pc_last_livox->points[i].timestamp),
+            pt.x = pc_mid360_reusable_->points[i].x;
+            pt.y = pc_mid360_reusable_->points[i].y;
+            pt.z = pc_mid360_reusable_->points[i].z;
+            rclcpp::Time timestamp_ros(static_cast<int64_t>(pc_mid360_reusable_->points[i].timestamp),
                 rcl_clock_type_t::RCL_ROS_TIME);
             pt.intensity = (timestamp_ros - timestamp_begin).seconds() * 1.0e3;
-            pt.curvature = pc_last_livox->points[i].intensity;
+            pt.curvature = pc_mid360_reusable_->points[i].intensity;
 
             if (pt.intensity >= 0) {
                 this->pc_last->points.push_back(pt);
@@ -407,6 +471,8 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
 
   private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_mid360;
+    // Phase 3: Pre-allocated reusable buffer
+    pcl::PointCloud<livox_mid360_boxi::Point>::Ptr pc_mid360_reusable_;
 };
 
 class Mapping
@@ -416,14 +482,22 @@ public:
 
 Mapping(rclcpp::Node::SharedPtr &nh, std::vector<MappingBase<pcl::PointXYZINormal>*>& mappings)
     {
-        sub_start = nh->create_subscription<std_msgs::msg::Int64>("/start_time", 100, std::bind(&Mapping::startCallBack, this, std::placeholders::_1));
+        // Phase 2: Explicit QoS profiles for all publishers/subscribers
+        auto reliable_qos = rclcpp::QoS(100).reliable();
+        auto large_reliable_qos = rclcpp::QoS(10000).reliable();
+        
+        sub_start = nh->create_subscription<std_msgs::msg::Int64>("/start_time", reliable_qos, 
+            std::bind(&Mapping::startCallBack, this, std::placeholders::_1));
         spl_window_st_ns = 0;
-        sub_est = nh->create_subscription<estimate_msgs::msg::Estimate>("/est_window", 10000, std::bind(&Mapping::getEstCallback, this, std::placeholders::_1));
-        pub_path = nh->create_publisher<nav_msgs::msg::Path>("traj_path", 100);
-        pub_knots = nh->create_publisher<sensor_msgs::msg::PointCloud>("active_control_points",20);
+        sub_est = nh->create_subscription<estimate_msgs::msg::Estimate>("/est_window", large_reliable_qos, 
+            std::bind(&Mapping::getEstCallback, this, std::placeholders::_1));
+        pub_path = nh->create_publisher<nav_msgs::msg::Path>("traj_path", reliable_qos);
+        pub_knots = nh->create_publisher<sensor_msgs::msg::PointCloud>("active_control_points", 
+            rclcpp::QoS(20).reliable());
         opt_old_path.header.frame_id = odom_id;
         vis_maps = mappings;
-        pub_odom = nh->create_publisher<nav_msgs::msg::Odometry>("odometry", 500);
+        pub_odom = nh->create_publisher<nav_msgs::msg::Odometry>("odometry", 
+            rclcpp::QoS(500).reliable());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(nh);
     }
 
@@ -609,20 +683,23 @@ int main(int argc, char** argv) {
             lidars.emplace_back(nh, lidar_name + ".");
         }
     }
+    // Phase 2: Create callback group for sensor processing
+    auto sensor_cb_group = nh->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    
     std::vector<MappingBase<pcl::PointXYZINormal>*> buffs;
     for (const auto& lidar : lidars) {
         if (!lidar.type.compare("Ouster")) {
-            buffs.push_back(new OusterBuff(nh, lidar));
+            buffs.push_back(new OusterBuff(nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("Mid70Avia")) {
-            buffs.push_back(new Mid70AviaBuff(nh, lidar));
+            buffs.push_back(new Mid70AviaBuff(nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("HAP360")) {
-            buffs.push_back(new HAP360Buff(nh, lidar));
+            buffs.push_back(new HAP360Buff(nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("AviaResple")) {
-            buffs.push_back(new AviaRespleBuff(nh, lidar));
+            buffs.push_back(new AviaRespleBuff(nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("Hesai")) {
-            buffs.push_back(new HesaiBuff(nh, lidar));
+            buffs.push_back(new HesaiBuff(nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("Mid360Boxi")) {
-            buffs.push_back(new Mid360BoxiBuff(nh, lidar));
+            buffs.push_back(new Mid360BoxiBuff(nh, lidar, sensor_cb_group));
         } else {
             exit(1);
         }
