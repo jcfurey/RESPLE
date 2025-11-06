@@ -19,7 +19,7 @@
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>visualization_msgs</depend>
-  <depend>message_runtime</depend>
+  <!-- message_runtime is not required for ROS2 packages; removed to match modern ros2 package conventions -->
   <depend>livox_ros_driver</depend>  
   <depend>livox_ros_driver2</depend>
   <depend>livox_interfaces</depend>
