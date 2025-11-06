@@ -16,7 +16,9 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <diagnostic_updater/diagnostic_updater.hpp>
 #include <diagnostic_updater/publisher.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/io/pcd_io.h>
 #include <queue>
 #include <thread>
 #include <mutex>
@@ -34,6 +36,7 @@
 #include "estimate_msgs/msg/calib.hpp"
 #include "estimate_msgs/msg/spline.hpp"
 #include "estimate_msgs/msg/estimate.hpp"
+#include "estimate_msgs/action/save_map.hpp"
 #include "Estimator.h"
 
 KD_TREE<pcl::PointXYZINormal> ikdtree;
@@ -99,6 +102,14 @@ public:
         pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", rclcpp::QoS(50).reliable());
         pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        
+        // Phase 4: Create SaveMap action server
+        save_map_action_server_ = rclcpp_action::create_server<estimate_msgs::action::SaveMap>(
+            this,
+            "save_map",
+            std::bind(&RESPLE::handleSaveMapGoal, this, std::placeholders::_1, std::placeholders::_2),
+            std::bind(&RESPLE::handleSaveMapCancel, this, std::placeholders::_1),
+            std::bind(&RESPLE::handleSaveMapAccepted, this, std::placeholders::_1));
         
         RCLCPP_INFO(this->get_logger(), "RESPLE configured successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -391,6 +402,11 @@ private:
     std::atomic<bool> processing_active_;
     std::thread processing_thread_;
     
+    // Phase 4: SaveMap action server
+    using SaveMapAction = estimate_msgs::action::SaveMap;
+    using GoalHandleSaveMap = rclcpp_action::ServerGoalHandle<SaveMapAction>;
+    rclcpp_action::Server<SaveMapAction>::SharedPtr save_map_action_server_;
+    
     // Pre-allocated reusable buffers (Phase 3 - avoid repeated heap allocations)
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame_reusable_;
     pcl::PointCloud<pcl::PointXYZI>::Ptr laser_cloud_world_reusable_;
@@ -463,6 +479,96 @@ private:
 
     const std::string baselink_frame = "base_link";
     const std::string odom_frame = "odom";
+    
+    // Phase 4: SaveMap action server handlers
+    rclcpp_action::GoalResponse handleSaveMapGoal(
+        const rclcpp_action::GoalUUID & uuid,
+        std::shared_ptr<const SaveMapAction::Goal> goal)
+    {
+        (void)uuid;
+        RCLCPP_INFO(this->get_logger(), "Received save map request: %s", goal->filename.c_str());
+        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    }
+    
+    rclcpp_action::CancelResponse handleSaveMapCancel(
+        const std::shared_ptr<GoalHandleSaveMap> goal_handle)
+    {
+        (void)goal_handle;
+        RCLCPP_INFO(this->get_logger(), "Received request to cancel save map");
+        return rclcpp_action::CancelResponse::ACCEPT;
+    }
+    
+    void handleSaveMapAccepted(const std::shared_ptr<GoalHandleSaveMap> goal_handle)
+    {
+        // Execute in separate thread to not block action server
+        std::thread{std::bind(&RESPLE::executeSaveMap, this, std::placeholders::_1), goal_handle}.detach();
+    }
+    
+    void executeSaveMap(const std::shared_ptr<GoalHandleSaveMap> goal_handle)
+    {
+        RCLCPP_INFO(this->get_logger(), "Executing save map action...");
+        
+        const auto goal = goal_handle->get_goal();
+        auto feedback = std::make_shared<SaveMapAction::Feedback>();
+        auto result = std::make_shared<SaveMapAction::Result>();
+        
+        try {
+            // Get all points from ikd-tree
+            feedback->status = "Extracting points from map...";
+            feedback->progress = 10.0;
+            goal_handle->publish_feedback(feedback);
+            
+            pcl::PointCloud<pcl::PointXYZINormal>::Ptr map_cloud(new pcl::PointCloud<pcl::PointXYZINormal>());
+            ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+            map_cloud->points = ikdtree.PCL_Storage;
+            map_cloud->width = map_cloud->points.size();
+            map_cloud->height = 1;
+            map_cloud->is_dense = false;
+            
+            // Check for cancellation
+            if (goal_handle->is_canceling()) {
+                result->success = false;
+                result->message = "Save map operation was cancelled";
+                result->points_saved = 0;
+                goal_handle->canceled(result);
+                RCLCPP_INFO(this->get_logger(), "Save map cancelled");
+                return;
+            }
+            
+            feedback->status = "Writing map to file...";
+            feedback->progress = 50.0;
+            goal_handle->publish_feedback(feedback);
+            
+            // Save to PCD file
+            if (pcl::io::savePCDFileBinary(goal->filename, *map_cloud) == -1) {
+                result->success = false;
+                result->message = "Failed to write PCD file: " + goal->filename;
+                result->points_saved = 0;
+                goal_handle->abort(result);
+                RCLCPP_ERROR(this->get_logger(), "%s", result->message.c_str());
+                return;
+            }
+            
+            feedback->status = "Map saved successfully";
+            feedback->progress = 100.0;
+            goal_handle->publish_feedback(feedback);
+            
+            result->success = true;
+            result->message = "Map saved successfully to " + goal->filename;
+            result->points_saved = map_cloud->points.size();
+            goal_handle->succeed(result);
+            
+            RCLCPP_INFO(this->get_logger(), "Saved %u points to %s", 
+                       result->points_saved, goal->filename.c_str());
+                       
+        } catch (const std::exception& e) {
+            result->success = false;
+            result->message = std::string("Exception during save: ") + e.what();
+            result->points_saved = 0;
+            goal_handle->abort(result);
+            RCLCPP_ERROR(this->get_logger(), "%s", result->message.c_str());
+        }
+    }
 
     void readParameters()
     {
