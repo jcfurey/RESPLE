@@ -36,6 +36,12 @@ class MappingBase
     MappingBase(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config, 
                 rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr) : lidar(lidar_config)
     {
+        // Read frame ID parameters
+        frame_id = CommonUtils::readParam<std::string>(nh, "frame_id", "base_link");
+        odom_id = CommonUtils::readParam<std::string>(nh, "odom_frame_id", "odom");
+        body_frame_id = CommonUtils::readParam<std::string>(nh, "body_frame_id", "base_link");
+        footprint_frame_id = CommonUtils::readParam<std::string>(nh, "footprint_frame_id", "base_footprint");
+        
         // Phase 2: Explicit QoS profile for visualization (reliable for RViz compatibility)
         pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("global_map", 
             rclcpp::QoS(2).reliable());
@@ -121,8 +127,10 @@ class MappingBase
     typename pcl::PointCloud<PointType>::Ptr pc_last;
     typename pcl::PointCloud<PointType>::Ptr pc_last_ds;
     pcl::VoxelGrid<pcl::PointXYZINormal> ds_filter_each_scan;
-    const std::string frame_id = "base_link";
-    const std::string odom_id = "odom";
+    std::string frame_id;
+    std::string odom_id;
+    std::string body_frame_id;
+    std::string footprint_frame_id;
     typename pcl::PointCloud<PointType>::Ptr pc;
 
 };
@@ -500,6 +508,15 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     {
         RCLCPP_INFO(this->get_logger(), "Configuring Mapping...");
         
+        // Read frame ID parameters
+        frame_id = CommonUtils::readParam<std::string>(*this, "frame_id", "base_link");
+        odom_id = CommonUtils::readParam<std::string>(*this, "odom_frame_id", "odom");
+        body_frame_id = CommonUtils::readParam<std::string>(*this, "body_frame_id", "base_link");
+        footprint_frame_id = CommonUtils::readParam<std::string>(*this, "footprint_frame_id", "base_footprint");
+        
+        RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s, footprint: %s", 
+                    odom_id.c_str(), body_frame_id.c_str(), footprint_frame_id.c_str());
+        
         // Create publishers (inactive until activated)
         auto reliable_qos = rclcpp::QoS(100).reliable();
         pub_path = this->create_publisher<nav_msgs::msg::Path>("traj_path", reliable_qos);
@@ -647,8 +664,10 @@ private:
     std::atomic<bool> processing_active_;
     std::thread processing_thread_;
     std::vector<MappingBase<pcl::PointXYZINormal>*> vis_maps;
-    const std::string frame_id = "body";
-    const std::string odom_id = "world";
+    std::string frame_id;
+    std::string odom_id;
+    std::string body_frame_id;
+    std::string footprint_frame_id;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     bool if_init_succeed = false;
     std::mutex m_spline;
@@ -701,50 +720,61 @@ private:
         geometry_msgs::msg::PoseStamped odom_pose = opt_old_path.poses.back();
         odom_msg.header.stamp = rclcpp::Time(odom_pose.header.stamp);
         odom_msg.header.frame_id = odom_id;
-        odom_msg.child_frame_id = frame_id;
+        odom_msg.child_frame_id = body_frame_id;
         odom_msg.pose.pose = odom_pose.pose;
         pub_odom->publish(odom_msg);
+        
+        // Publish odom -> body_frame transform
         geometry_msgs::msg::TransformStamped transformStamped;
         transformStamped.header.stamp = odom_msg.header.stamp;
         transformStamped.header.frame_id = odom_id;
-        transformStamped.child_frame_id = frame_id;
+        transformStamped.child_frame_id = body_frame_id;
         transformStamped.transform.translation.x = odom_pose.pose.position.x;
         transformStamped.transform.translation.y = odom_pose.pose.position.y;
         transformStamped.transform.translation.z = odom_pose.pose.position.z;
         transformStamped.transform.rotation = odom_pose.pose.orientation;
         br->sendTransform(transformStamped);
+        
+        // Publish body_frame -> footprint transform (z-projection for navigation)
+        if (body_frame_id != footprint_frame_id) {
+            transformStamped.header.stamp = odom_msg.header.stamp;
+            transformStamped.header.frame_id = body_frame_id;
+            transformStamped.child_frame_id = footprint_frame_id;
+            transformStamped.transform.translation.x = 0;
+            transformStamped.transform.translation.y = 0;
+            transformStamped.transform.translation.z = -odom_pose.pose.position.z; // Project to ground plane
+            transformStamped.transform.rotation.w = 1;
+            transformStamped.transform.rotation.x = 0;
+            transformStamped.transform.rotation.y = 0;
+            transformStamped.transform.rotation.z = 0;
+            br->sendTransform(transformStamped);
+        }
+        
+        // Publish body_frame -> imu transform (identity if co-located)
         transformStamped.header.stamp = odom_msg.header.stamp;
-        transformStamped.header.frame_id = odom_id;
-        transformStamped.child_frame_id = "imu_frame";
-        transformStamped.transform.translation.x = odom_pose.pose.position.x;
-        transformStamped.transform.translation.y = odom_pose.pose.position.y;
-        transformStamped.transform.translation.z = odom_pose.pose.position.z;
-        transformStamped.transform.rotation.w = odom_pose.pose.orientation.w;
-        transformStamped.transform.rotation.x = odom_pose.pose.orientation.x;
-        transformStamped.transform.rotation.y = odom_pose.pose.orientation.y;
-        transformStamped.transform.rotation.z = odom_pose.pose.orientation.z;
+        transformStamped.header.frame_id = body_frame_id;
+        transformStamped.child_frame_id = "imu";
+        transformStamped.transform.translation.x = 0;
+        transformStamped.transform.translation.y = 0;
+        transformStamped.transform.translation.z = 0;
+        transformStamped.transform.rotation.w = 1;
+        transformStamped.transform.rotation.x = 0;
+        transformStamped.transform.rotation.y = 0;
+        transformStamped.transform.rotation.z = 0;
         br->sendTransform(transformStamped);
 
-        int id_lidar = 0;
-        for (const auto vis_map : vis_maps) {
-            Eigen::Quaterniond q_wi(odom_pose.pose.orientation.w, odom_pose.pose.orientation.x, odom_pose.pose.orientation.y, odom_pose.pose.orientation.z);
-            Eigen::Vector3d t_wi(odom_pose.pose.position.x, odom_pose.pose.position.y, odom_pose.pose.position.z);
-            Eigen::Quaterniond q_wl = q_wi * vis_map->lidar.q_bl;
-            Eigen::Vector3d t_wl = q_wi * vis_map->lidar.t_bl + t_wi;
-            std::string lidar_str = "lidar" + std::to_string(id_lidar) + "_frame";
-            transformStamped.header.stamp = odom_msg.header.stamp;
-            transformStamped.header.frame_id = odom_id;
-            transformStamped.child_frame_id = lidar_str;
-            transformStamped.transform.translation.x = t_wl.x();
-            transformStamped.transform.translation.y = t_wl.y();
-            transformStamped.transform.translation.z = t_wl.z();
-            transformStamped.transform.rotation.w = q_wl.w();
-            transformStamped.transform.rotation.x = q_wl.x();
-            transformStamped.transform.rotation.y = q_wl.y();
-            transformStamped.transform.rotation.z = q_wl.z();
-            br->sendTransform(transformStamped);
-            id_lidar++;
-        }                 
+        // Publish body_frame -> lidar transform (identity if co-located, otherwise use extrinsics)
+        transformStamped.header.stamp = odom_msg.header.stamp;
+        transformStamped.header.frame_id = body_frame_id;
+        transformStamped.child_frame_id = "lidar";
+        transformStamped.transform.translation.x = 0;
+        transformStamped.transform.translation.y = 0;
+        transformStamped.transform.translation.z = 0;
+        transformStamped.transform.rotation.w = 1;
+        transformStamped.transform.rotation.x = 0;
+        transformStamped.transform.rotation.y = 0;
+        transformStamped.transform.rotation.z = 0;
+        br->sendTransform(transformStamped);
     }
 
     void startCallBack(const std_msgs::msg::Int64::SharedPtr start_time_msg)

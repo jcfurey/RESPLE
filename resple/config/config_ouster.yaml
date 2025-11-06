@@ -1,5 +1,11 @@
 /**:
   ros__parameters:
+    # Frame IDs for TF tree
+    frame_id: base_link              # Default sensor frame (deprecated, use body_frame_id)
+    odom_frame_id: odom              # Odometry reference frame
+    body_frame_id: base_link         # Main body/robot frame
+    footprint_frame_id: base_footprint  # Ground projection frame for navigation
+    
     topic_imu: /os_cloud_node/imu
     acc_ratio: false
     lidars: ["Ouster"]

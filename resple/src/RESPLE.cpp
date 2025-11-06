@@ -423,8 +423,10 @@ private:
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
     rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
-    const std::string frame_id = "base_link";
-    const std::string odom_id = "odom";
+    std::string frame_id;
+    std::string odom_id;
+    std::string body_frame_id;
+    std::string footprint_frame_id;
 
     std::map<std::string, LidarConfig> lidars;
     float ds_lm_voxel;
@@ -477,8 +479,6 @@ private:
     int64_t dt_ns;
     int num_points_upd;
 
-    const std::string baselink_frame = "base_link";
-    const std::string odom_frame = "odom";
     
     // Phase 4: SaveMap action server handlers
     rclcpp_action::GoalResponse handleSaveMapGoal(
@@ -572,6 +572,15 @@ private:
 
     void readParameters()
     {
+        // Frame ID parameters
+        frame_id = CommonUtils::readParam<std::string>(*this, "frame_id", "base_link");
+        odom_id = CommonUtils::readParam<std::string>(*this, "odom_frame_id", "odom");
+        body_frame_id = CommonUtils::readParam<std::string>(*this, "body_frame_id", "base_link");
+        footprint_frame_id = CommonUtils::readParam<std::string>(*this, "footprint_frame_id", "base_footprint");
+        
+        RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s, footprint: %s", 
+                    odom_id.c_str(), body_frame_id.c_str(), footprint_frame_id.c_str());
+        
         ds_lm_voxel = CommonUtils::readParam<float>(*this, "ds_lm_voxel");
         
         // Phase 4: Validate ds_scan_voxel parameter
