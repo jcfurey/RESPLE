@@ -246,7 +246,7 @@ public:
         rclcpp::Rate rate(20);
         int64_t max_spl_knots = 0;
         int64_t t_last_map_upd = 0;
-        while (processing_active_) {
+        while (processing_active_ && rclcpp::ok()) {
             for (auto& [lidar_name, lidar_data] : lidars_data) {
                 while (!lidar_data.t_buff.empty()) {
                     pc_frame_reusable_->clear();
@@ -286,7 +286,9 @@ public:
                 }
             }
             if(!initialization()) {
-                rate.sleep();
+                if (rclcpp::ok()) {
+                    rate.sleep();
+                }
                 continue;
             }
             while (collectMeasurements()) {
@@ -1164,10 +1166,18 @@ int main(int argc, char *argv[])
     exec.add_node(node->get_node_base_interface());
     exec.spin();
 
-    // Cleanup on shutdown
-    node->deactivate();
-    node->cleanup();
-    node->shutdown();
+    // Cleanup on shutdown (only if context still valid)
+    if (rclcpp::ok()) {
+        RCLCPP_INFO(node->get_logger(), "Gracefully shutting down RESPLE...");
+        node->deactivate();
+        node->cleanup();
+        node->shutdown();
+    } else {
+        // Context already shut down (Ctrl+C), just stop processing
+        RCLCPP_WARN(node->get_logger(), "Context invalid, forcing shutdown...");
+        // Manually trigger deactivation to stop thread
+        node->on_deactivate(node->get_current_state());
+    }
     exec.remove_node(node->get_node_base_interface());
     rclcpp::shutdown();
     return 0;

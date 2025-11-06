@@ -611,7 +611,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     void process() {
         rclcpp::Rate rate(20);
         int64_t num_knot = 0;
-        while (processing_active_) {
+        while (processing_active_ && rclcpp::ok()) {
             if (if_init_succeed && spline_global.numKnots() > num_knot) {
                 lock_mappings();
                 publishPath();
@@ -621,7 +621,9 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 unlock_mappings();
             }
             if (!if_init_succeed) {
-                rate.sleep();
+                if (rclcpp::ok()) {
+                    rate.sleep();
+                }
                 continue;
             }
             for (const auto vis_map : vis_maps) {
@@ -772,8 +774,9 @@ private:
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
     
-    // Phase 4: Create temporary node for parameter loading
+    // Phase 4: Create temporary node for parameter loading (use unique name)
     rclcpp::NodeOptions temp_options;
+    temp_options.arguments({"--ros-args", "-r", "__node:=MappingInit"});
     auto temp_nh = rclcpp::Node::make_shared("MappingInit", temp_options);
     
     std::vector<LidarConfig> lidars;
@@ -826,10 +829,18 @@ int main(int argc, char** argv) {
     exec.add_node(temp_nh);
     exec.spin();
     
-    // Cleanup on shutdown
-    node->deactivate();
-    node->cleanup();
-    node->shutdown();
+    // Cleanup on shutdown (only if context still valid)
+    if (rclcpp::ok()) {
+        RCLCPP_INFO(node->get_logger(), "Gracefully shutting down Mapping...");
+        node->deactivate();
+        node->cleanup();
+        node->shutdown();
+    } else {
+        // Context already shut down (Ctrl+C), just stop processing
+        RCLCPP_WARN(node->get_logger(), "Context invalid, forcing shutdown...");
+        // Manually trigger deactivation to stop thread
+        node->on_deactivate(node->get_current_state());
+    }
     exec.remove_node(node->get_node_base_interface());
     exec.remove_node(temp_nh);
     
