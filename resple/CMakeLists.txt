@@ -27,6 +27,9 @@ find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(tf2_eigen REQUIRED)
+find_package(tf2_sensor_msgs REQUIRED)
 # Phase 4: Advanced ROS 2 features
 find_package(diagnostic_updater REQUIRED)
 find_package(rclcpp_action REQUIRED)
@@ -86,6 +89,9 @@ ament_target_dependencies(${PROJECT_NAME}
 	estimate_msgs
 	pcl_conversions
 	tf2_ros
+	tf2_geometry_msgs
+	tf2_eigen
+	tf2_sensor_msgs
 	diagnostic_updater
 	rclcpp_action
 	rclcpp_lifecycle

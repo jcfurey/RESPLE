@@ -1,4 +1,4 @@
-﻿#include <pcl_conversions/pcl_conversions.h>
+#include <pcl_conversions/pcl_conversions.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/features/normal_3d.h>
 #include <pcl/filters/voxel_grid.h>
@@ -6,6 +6,9 @@
 #include <iostream>
 #include <queue>
 #include <string>
+#include <cmath>
+#include <tf2/convert.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -676,7 +679,7 @@ private:
     {
         sensor_msgs::msg::PointCloud points_msg;
         points_msg.header.frame_id = odom_id;
-        points_msg.header.stamp = rclcpp::Time(spline_global.minTimeNs());
+        points_msg.header.stamp = rclcpp::Time(spline_global.maxTimeNs());
         for (int64_t i = spline_global.numKnots() - 4; i < spline_global.numKnots(); i++) {
             points_msg.points.push_back(CommonUtils::getPointMsg(spline_global.getKnotPos(i)));
         }
@@ -718,39 +721,86 @@ private:
         }
         nav_msgs::msg::Odometry odom_msg;
         geometry_msgs::msg::PoseStamped odom_pose = opt_old_path.poses.back();
-        odom_msg.header.stamp = rclcpp::Time(odom_pose.header.stamp);
+        
+        // Use the latest spline time for better sync with current_scan
+        rclcpp::Time current_time = rclcpp::Time(spline_global.maxTimeNs());
+        
+        // Interpolate pose at current time if different from last path pose
+        int64_t pose_stamp_ns = rclcpp::Time(odom_pose.header.stamp).nanoseconds();
+        if (std::abs(spline_global.maxTimeNs() - pose_stamp_ns) > 1000000) {  // > 1ms
+            Eigen::Vector3d t_current = spline_global.itpPosition(spline_global.maxTimeNs());
+            Eigen::Quaterniond q_current;
+            spline_global.itpQuaternion(spline_global.maxTimeNs(), &q_current);
+            odom_pose.pose = CommonUtils::pose2msg(t_current, q_current);
+            odom_pose.header.stamp = current_time;
+        }
+        
+        odom_msg.header.stamp = current_time;
         odom_msg.header.frame_id = odom_id;
-        odom_msg.child_frame_id = body_frame_id;
+        odom_msg.child_frame_id = footprint_frame_id;  // Odometry references footprint
         odom_msg.pose.pose = odom_pose.pose;
         pub_odom->publish(odom_msg);
         
-        // Publish odom -> body_frame transform
         geometry_msgs::msg::TransformStamped transformStamped;
-        transformStamped.header.stamp = odom_msg.header.stamp;
-        transformStamped.header.frame_id = odom_id;
-        transformStamped.child_frame_id = body_frame_id;
-        transformStamped.transform.translation.x = odom_pose.pose.position.x;
-        transformStamped.transform.translation.y = odom_pose.pose.position.y;
-        transformStamped.transform.translation.z = odom_pose.pose.position.z;
-        transformStamped.transform.rotation = odom_pose.pose.orientation;
-        br->sendTransform(transformStamped);
         
-        // Publish body_frame -> footprint transform (z-projection for navigation)
+        // Publish odom -> base_footprint (ground-projected, yaw-only for navigation)
         if (body_frame_id != footprint_frame_id) {
             transformStamped.header.stamp = odom_msg.header.stamp;
-            transformStamped.header.frame_id = body_frame_id;
+            transformStamped.header.frame_id = odom_id;
             transformStamped.child_frame_id = footprint_frame_id;
-            transformStamped.transform.translation.x = 0;
-            transformStamped.transform.translation.y = 0;
-            transformStamped.transform.translation.z = -odom_pose.pose.position.z; // Project to ground plane
-            transformStamped.transform.rotation.w = 1;
+            
+            // Project position to ground plane
+            transformStamped.transform.translation.x = odom_pose.pose.position.x;
+            transformStamped.transform.translation.y = odom_pose.pose.position.y;
+            transformStamped.transform.translation.z = 0.0;  // Ground plane
+            
+            // Extract yaw from quaternion and create yaw-only rotation
+            double qw = odom_pose.pose.orientation.w;
+            double qx = odom_pose.pose.orientation.x;
+            double qy = odom_pose.pose.orientation.y;
+            double qz = odom_pose.pose.orientation.z;
+            double yaw = std::atan2(2.0 * (qw*qz + qx*qy), 1.0 - 2.0 * (qy*qy + qz*qz));
+            
+            transformStamped.transform.rotation.w = std::cos(yaw / 2.0);
             transformStamped.transform.rotation.x = 0;
             transformStamped.transform.rotation.y = 0;
-            transformStamped.transform.rotation.z = 0;
+            transformStamped.transform.rotation.z = std::sin(yaw / 2.0);
+            br->sendTransform(transformStamped);
+            
+            // Publish base_footprint -> base_link (full 6-DoF, elevation + roll/pitch)
+            transformStamped.header.stamp = odom_msg.header.stamp;
+            transformStamped.header.frame_id = footprint_frame_id;
+            transformStamped.child_frame_id = body_frame_id;
+            
+            // Offset is the height and orientation relative to footprint
+            transformStamped.transform.translation.x = 0.0;
+            transformStamped.transform.translation.y = 0.0;
+            transformStamped.transform.translation.z = odom_pose.pose.position.z;  // Height above ground
+            
+            // Rotation is the roll/pitch component (yaw already in footprint)
+            // Divide out yaw to get roll/pitch only
+            Eigen::Quaterniond qfull(qw, qx, qy, qz);
+            Eigen::Quaterniond qyaw(std::cos(yaw / 2.0), 0, 0, std::sin(yaw / 2.0));
+            Eigen::Quaterniond qrollpitch = qyaw.inverse() * qfull;
+            
+            transformStamped.transform.rotation.w = qrollpitch.w();
+            transformStamped.transform.rotation.x = qrollpitch.x();
+            transformStamped.transform.rotation.y = qrollpitch.y();
+            transformStamped.transform.rotation.z = qrollpitch.z();
+            br->sendTransform(transformStamped);
+        } else {
+            // If footprint == body, just publish odom -> body_frame
+            transformStamped.header.stamp = odom_msg.header.stamp;
+            transformStamped.header.frame_id = odom_id;
+            transformStamped.child_frame_id = body_frame_id;
+            transformStamped.transform.translation.x = odom_pose.pose.position.x;
+            transformStamped.transform.translation.y = odom_pose.pose.position.y;
+            transformStamped.transform.translation.z = odom_pose.pose.position.z;
+            transformStamped.transform.rotation = odom_pose.pose.orientation;
             br->sendTransform(transformStamped);
         }
         
-        // Publish body_frame -> imu transform (identity if co-located)
+        // Publish base_link -> imu transform (identity for now, could use extrinsics)
         transformStamped.header.stamp = odom_msg.header.stamp;
         transformStamped.header.frame_id = body_frame_id;
         transformStamped.child_frame_id = "imu";
@@ -763,7 +813,7 @@ private:
         transformStamped.transform.rotation.z = 0;
         br->sendTransform(transformStamped);
 
-        // Publish body_frame -> lidar transform (identity if co-located, otherwise use extrinsics)
+        // Publish base_link -> lidar transform (identity for now, could use extrinsics)
         transformStamped.header.stamp = odom_msg.header.stamp;
         transformStamped.header.frame_id = body_frame_id;
         transformStamped.child_frame_id = "lidar";
@@ -796,6 +846,8 @@ private:
             opt_old_path.poses.push_back(CommonUtils::pose2msg(t_ns, t_interp, orient_interp));
             t_ns += 1e8;
         }
+        opt_old_path.header.frame_id = odom_id;
+        opt_old_path.header.stamp = rclcpp::Time(spline_global.maxTimeNs());
         pub_path->publish(opt_old_path);
     }
 

@@ -25,6 +25,10 @@
   <depend>livox_ros_driver2</depend>
   <depend>livox_interfaces</depend>
   <depend>estimate_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>tf2_eigen</depend>
+  <depend>tf2_sensor_msgs</depend>
   <!-- Phase 4: Advanced ROS 2 features -->
   <depend>diagnostic_updater</depend>
   <depend>rclcpp_action</depend>

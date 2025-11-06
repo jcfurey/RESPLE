@@ -14,6 +14,11 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 #include <diagnostic_updater/diagnostic_updater.hpp>
 #include <diagnostic_updater/publisher.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
@@ -102,6 +107,8 @@ public:
         pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", rclcpp::QoS(50).reliable());
         pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
         
         // Phase 4: Create SaveMap action server
         save_map_action_server_ = rclcpp_action::create_server<estimate_msgs::action::SaveMap>(
@@ -423,6 +430,13 @@ private:
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
     rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    bool have_imu_transform_ = false;
+    bool have_lidar_transform_ = false;
+    geometry_msgs::msg::TransformStamped lidar_to_baselink_;
+    geometry_msgs::msg::TransformStamped imu_to_baselink_;
+    
     std::string frame_id;
     std::string odom_id;
     std::string body_frame_id;
@@ -670,10 +684,83 @@ private:
         }
     }
 
+    sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::ConstSharedPtr& imu_raw, 
+                                                   const geometry_msgs::msg::TransformStamped& transform)
+    {
+        sensor_msgs::msg::Imu::SharedPtr imu(new sensor_msgs::msg::Imu);
+        Eigen::Affine3d transform_eigen = tf2::transformToEigen(transform);
+
+        // Copy header
+        imu->header = imu_raw->header;
+
+        // Transform orientation
+        Eigen::Quaterniond orientation(imu_raw->orientation.w, imu_raw->orientation.x, 
+                                       imu_raw->orientation.y, imu_raw->orientation.z);
+        Eigen::Quaterniond rotation(transform_eigen.rotation());
+        Eigen::Quaterniond quat_transformed = orientation * rotation.inverse();
+
+        imu->orientation.w = quat_transformed.w();
+        imu->orientation.x = quat_transformed.x();
+        imu->orientation.y = quat_transformed.y();
+        imu->orientation.z = quat_transformed.z();
+
+        // Transform angular velocity
+        Eigen::Vector3d ang_vel(imu_raw->angular_velocity.x,
+                                imu_raw->angular_velocity.y,
+                                imu_raw->angular_velocity.z);
+        Eigen::Vector3d ang_vel_transformed = transform_eigen.rotation() * ang_vel;
+
+        imu->angular_velocity.x = ang_vel_transformed[0];
+        imu->angular_velocity.y = ang_vel_transformed[1];
+        imu->angular_velocity.z = ang_vel_transformed[2];
+
+        // Transform linear acceleration (accounting for centripetal acceleration)
+        Eigen::Vector3d lin_accel(imu_raw->linear_acceleration.x,
+                                  imu_raw->linear_acceleration.y,
+                                  imu_raw->linear_acceleration.z);
+        Eigen::Vector3d lin_accel_transformed = transform_eigen.rotation() * lin_accel
+                                               + ang_vel_transformed.cross(ang_vel_transformed.cross(-transform_eigen.translation()));
+
+        imu->linear_acceleration.x = lin_accel_transformed[0];
+        imu->linear_acceleration.y = lin_accel_transformed[1];
+        imu->linear_acceleration.z = lin_accel_transformed[2];
+
+        return imu;
+    }
+    
     void getImuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg)
     {
+        // Lookup IMU transform if not yet initialized
+        if (!if_lidar_only && !have_imu_transform_) {
+            try {
+                if (tf_buffer_->canTransform(body_frame_id, imu_msg->header.frame_id, 
+                                            this->now(), rclcpp::Duration::from_seconds(0.1))) {
+                    imu_to_baselink_ = tf_buffer_->lookupTransform(body_frame_id, imu_msg->header.frame_id, 
+                                                                   this->now());
+                    have_imu_transform_ = true;
+                    RCLCPP_INFO(this->get_logger(), "Got IMU transform: %s -> %s", 
+                               imu_msg->header.frame_id.c_str(), body_frame_id.c_str());
+                } else {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                                        "Waiting for IMU transform: %s -> %s", 
+                                        imu_msg->header.frame_id.c_str(), body_frame_id.c_str());
+                    return;
+                }
+            } catch (tf2::TransformException& ex) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                                    "IMU transform exception: %s", ex.what());
+                return;
+            }
+        }
+        
         m_buff.lock();
-        imu_int_buff.push_back(imu_msg);
+        if (have_imu_transform_) {
+            sensor_msgs::msg::Imu::SharedPtr transformed_imu = transformImu(imu_msg, imu_to_baselink_);
+            imu_int_buff.push_back(transformed_imu);
+        } else {
+            // If no transform available, pass through (assumes IMU already in base_link frame)
+            imu_int_buff.push_back(imu_msg);
+        }
         m_buff.unlock();
     }
     
@@ -730,11 +817,53 @@ private:
     template<typename T>
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
     {
+        // Find the Ouster lidar config
         std::string name = "Ouster";
+        if (lidars.find(name) == lidars.end()) {
+            // Try to find any Ouster-type lidar
+            for (const auto& [lidar_name, lidar_cfg] : lidars) {
+                if (lidar_cfg.type == "Ouster") {
+                    name = lidar_name;
+                    break;
+                }
+            }
+        }
         const LidarConfig& lidar = lidars.at(name);
+        
+        // Lookup LiDAR transform if not yet initialized
+        if (!have_lidar_transform_) {
+            try {
+                if (tf_buffer_->canTransform(body_frame_id, ouster_msg_in->header.frame_id, 
+                                            this->now(), rclcpp::Duration::from_seconds(0.1))) {
+                    lidar_to_baselink_ = tf_buffer_->lookupTransform(body_frame_id, ouster_msg_in->header.frame_id, 
+                                                                     this->now());
+                    have_lidar_transform_ = true;
+                    RCLCPP_INFO(this->get_logger(), "Got LiDAR transform: %s -> %s", 
+                               ouster_msg_in->header.frame_id.c_str(), body_frame_id.c_str());
+                } else {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                                        "Waiting for LiDAR transform: %s -> %s", 
+                                        ouster_msg_in->header.frame_id.c_str(), body_frame_id.c_str());
+                    return;
+                }
+            } catch (tf2::TransformException& ex) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                                    "LiDAR transform exception: %s", ex.what());
+                return;
+            }
+        }
+        
+        // Transform point cloud to base_link frame
+        sensor_msgs::msg::PointCloud2::SharedPtr transformed_msg(new sensor_msgs::msg::PointCloud2());
+        if (have_lidar_transform_) {
+            tf2::doTransform(*ouster_msg_in, *transformed_msg, lidar_to_baselink_);
+        } else {
+            transformed_msg = ouster_msg_in;
+        }
+        
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         typename pcl::PointCloud<T>::Ptr pc_last_ouster(new typename pcl::PointCloud<T>());
-        pcl::fromROSMsg(*ouster_msg_in, *pc_last_ouster);
+        pcl::fromROSMsg(*transformed_msg, *pc_last_ouster);
         size_t plsize = pc_last_ouster->size();
         if (plsize == 0) return;
         pc_last->reserve(plsize);
