@@ -299,15 +299,77 @@ None identified. Build succeeds with only pre-existing Eigen-related warnings.
 
 ---
 
+## Phase 4 Medium-Priority Features
+
+### 5. Action Server for Save Map ✅ IMPLEMENTED
+
+**Status**: Implementation complete, testing pending.
+
+Created action interface `estimate_msgs/action/SaveMap.action` with:
+- **Goal**: `filename` (string)
+- **Result**: `success` (bool), `message` (string), `points_saved` (uint32)
+- **Feedback**: `progress` (float 0-100), `status` (string)
+
+**Implementation** in RESPLE node:
+- Action server created in `on_configure()`
+- Extracts points from ikdtree using `flatten()`
+- Saves to PCD file with `pcl::io::savePCDFileBinary()`
+- Reports progress at 10%, 50%, and 100%
+- Supports cancellation
+
+**Testing** (see `docs/SaveMap_Action_Testing.md`):
+```bash
+# Save map
+ros2 action send_goal --feedback /save_map estimate_msgs/action/SaveMap \
+  "{filename: '/tmp/my_map.pcd'}"
+
+# View map
+pcl_viewer /tmp/my_map.pcd
+```
+
+**Files**:
+- `estimate_msgs/action/SaveMap.action`
+- Implementation in `resple/src/RESPLE.cpp`
+- Documentation: `docs/SaveMap_Action_Testing.md`
+
+### 6. ROS 2 Bag Recording Integration ⚠️ PARTIALLY IMPLEMENTED
+
+**Status**: Service definition complete, handler implementation deferred.
+
+Created service interface `estimate_msgs/srv/RecordBag.srv` with:
+- **Request**: `start` (bool), `output_path` (string), `topics` (string[]), `max_duration_sec` (int32)
+- **Response**: `success` (bool), `message` (string), `bag_path` (string)
+
+**Implementation Note**: The service handler in RESPLE.cpp is **not implemented** due to complexity of rosbag2_cpp Writer API, thread safety concerns, and resource management challenges.
+
+**Recommendation**: Use `ros2 bag record` CLI for recording needs:
+```bash
+# Record all topics
+ros2 bag record -a -o /tmp/my_bag
+
+# Record specific topics
+ros2 bag record /diagnostics /pose /current_scan -o /tmp/my_bag
+
+# Record for duration
+ros2 bag record -a --duration 60 -o /tmp/my_bag
+```
+
+**Future Implementation**: See `docs/Bag_Recording_Implementation_Note.md` for:
+- Detailed implementation guide using rosbag2_cpp Writer
+- Alternative approach using system calls to launch `ros2 bag record`
+- Thread safety and lifecycle integration considerations
+
+**Files**:
+- `estimate_msgs/srv/RecordBag.srv`
+- `docs/Bag_Recording_Implementation_Note.md`
+
+---
+
 ## Next Steps (Future Work)
 
-### Medium Priority (Not Yet Implemented)
-- **Action Server for Save Map**: Replace service-based map saving with ROS 2 Actions for progress feedback
-  - Estimated time: 1-2 days
-
-### Low Priority (Future)
-- **ROS 2 Bag Recording Integration**: Programmatic bag recording control
-  - Estimated time: 1 day
+### Testing
+- Test SaveMap action server with various bag playbacks
+- Benchmark intra-process communication latency (optional)
 
 ### Testing & Validation
 - [ ] Test lifecycle state transitions with external lifecycle manager

@@ -31,6 +31,7 @@ find_package(tf2_ros REQUIRED)
 find_package(diagnostic_updater REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+find_package(rosbag2_cpp REQUIRED)
 # OpenMP is optional and only required when ENABLE_OPENMP=ON
 if(ENABLE_OPENMP)
 	find_package(OpenMP REQUIRED)
@@ -88,6 +89,7 @@ ament_target_dependencies(${PROJECT_NAME}
 	diagnostic_updater
 	rclcpp_action
 	rclcpp_lifecycle
+	rosbag2_cpp
 )
 
 # Use plain signature consistently (ament_target_dependencies uses plain internally)
@@ -142,6 +144,7 @@ ament_export_dependencies(
 	diagnostic_updater
 	rclcpp_action
 	rclcpp_lifecycle
+	rosbag2_cpp
 )
 ament_export_libraries(${PROJECT_NAME})
 ament_package()
