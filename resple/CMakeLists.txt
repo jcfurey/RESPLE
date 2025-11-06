@@ -11,6 +11,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -67,6 +68,7 @@ target_sources(RESPLE PRIVATE src/RESPLE.cpp)
 
 ament_target_dependencies(${PROJECT_NAME} 
 	rclcpp
+	rclcpp_components
 	std_msgs
 	geometry_msgs
 	nav_msgs
@@ -109,10 +111,20 @@ install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config
   DESTINATION share/${PROJECT_NAME})
+# Register components for composition
+rclcpp_components_register_node(${PROJECT_NAME}
+  PLUGIN "RESPLE"
+  EXECUTABLE RESPLE_node
+)
+
 install(TARGETS RESPLE
   DESTINATION lib/${PROJECT_NAME})
 install(TARGETS Mapping
   DESTINATION lib/${PROJECT_NAME})
+install(TARGETS ${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin)
 
 # Export only ament packages (yaml-cpp is not an ament package)
 ament_export_dependencies(

@@ -1,4 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_components/register_node_macro.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <std_msgs/msg/int64.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -30,54 +32,68 @@
 
 KD_TREE<pcl::PointXYZINormal> ikdtree;
 
-class RESPLE
+class RESPLE : public rclcpp::Node
 {
 
 public:
-    RESPLE(rclcpp::Node::SharedPtr& nh)
+    explicit RESPLE(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
+        : rclcpp::Node("RESPLE", options)
     {
-        readParameters(nh);
+        readParameters();
+        
+        // Create callback groups to separate sensor IO from control/estimation callbacks
+        sensor_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        control_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        
+        rclcpp::SubscriptionOptions sensor_sub_opt;
+        sensor_sub_opt.callback_group = sensor_cb_group;
+        
+        // QoS profiles for different topics
+        auto imu_qos = rclcpp::SensorDataQoS().keep_last(200).best_effort();
+        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
+        
         if (!if_lidar_only) {
-            std::string imu_type = CommonUtils::readParam<std::string>(nh, "topic_imu");
-            sub_imu = nh->create_subscription<sensor_msgs::msg::Imu>(imu_type, 2000000, std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1));
+            std::string imu_type = CommonUtils::readParam<std::string>(*this, "topic_imu");
+            sub_imu = this->create_subscription<sensor_msgs::msg::Imu>(
+                imu_type, imu_qos, std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1), sensor_sub_opt);
         }
-        pub_est = nh->create_publisher<estimate_msgs::msg::Estimate>("est_window", 50);
-        pub_start_time = nh->create_publisher<std_msgs::msg::Int64>("start_time", 50);
-        pub_pose = nh->create_publisher<geometry_msgs::msg::PoseStamped>("pose", 50);
-        pub_cur_scan = nh->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", 2);
-        br = std::make_shared<tf2_ros::TransformBroadcaster>(nh);
-        auto lidar_names = nh->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
-        assert(nh->get_parameter({"lidars"}, lidar_names));
+        pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
+        pub_start_time = this->create_publisher<std_msgs::msg::Int64>("start_time", rclcpp::QoS(50).reliable());
+        pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", rclcpp::QoS(50).reliable());
+        pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).best_effort());
+        br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        auto lidar_names = this->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
+        assert(this->get_parameter("lidars", lidar_names));
         if (lidar_names.empty()) {
-            LidarConfig lidar(nh, "");
+            LidarConfig lidar(*this, "");
             lidars.emplace(lidar.type, lidar);
             lidars_data.emplace(std::piecewise_construct, std::make_tuple(lidar.type), std::make_tuple());
         } else {
             for (const auto& lidar_name : lidar_names) {
-                LidarConfig lidar(nh, lidar_name + ".");
+                LidarConfig lidar(*this, lidar_name + ".");
                 lidars.emplace(lidar.type, lidar);
                 lidars_data.emplace(std::piecewise_construct, std::make_tuple(lidar.type), std::make_tuple());
             }
         }
         for (const auto& [lidar_name, lidar] : lidars) {
             if (!lidar.type.compare("Ouster")) {
-                sub_ouster = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
-                        lidar.topic, 200000, std::bind(&RESPLE::ousterLidarCallback<ouster_ros::Point>, this, std::placeholders::_1));
+                sub_ouster = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                        lidar.topic, lidar_qos, std::bind(&RESPLE::ousterLidarCallback<ouster_ros::Point>, this, std::placeholders::_1), sensor_sub_opt);
             } else if (!lidar.type.compare("Mid70Avia")) {
-                sub_livox = nh->create_subscription<livox_ros_driver::msg::CustomMsg>(
-                        lidar.topic, 200000, std::bind(&RESPLE::livoxLidarCallback, this, std::placeholders::_1));
+                sub_livox = this->create_subscription<livox_ros_driver::msg::CustomMsg>(
+                        lidar.topic, lidar_qos, std::bind(&RESPLE::livoxLidarCallback, this, std::placeholders::_1), sensor_sub_opt);
             } else if (!lidar.type.compare("HAP360")) {
-                sub_livox2 = nh->create_subscription<livox_ros_driver2::msg::CustomMsg>(
-                        lidar.topic, 200000, std::bind(&RESPLE::livoxLidar2Callback, this, std::placeholders::_1));
+                sub_livox2 = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+                        lidar.topic, lidar_qos, std::bind(&RESPLE::livoxLidar2Callback, this, std::placeholders::_1), sensor_sub_opt);
             } else if (!lidar.type.compare("AviaResple")) {
-                sub_livox_avia = nh->create_subscription<livox_interfaces::msg::CustomMsg>(
-                        lidar.topic, 200000, std::bind(&RESPLE::livoxAVIACallback, this, std::placeholders::_1));
+                sub_livox_avia = this->create_subscription<livox_interfaces::msg::CustomMsg>(
+                        lidar.topic, lidar_qos, std::bind(&RESPLE::livoxAVIACallback, this, std::placeholders::_1), sensor_sub_opt);
             } else if (!lidar.type.compare("Hesai")) {
-                sub_hesai = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
-                        lidar.topic, 200000, std::bind(&RESPLE::hesaiLidarCallback, this, std::placeholders::_1));
+                sub_hesai = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                        lidar.topic, lidar_qos, std::bind(&RESPLE::hesaiLidarCallback, this, std::placeholders::_1), sensor_sub_opt);
             } else if (!lidar.type.compare("Mid360Boxi")) {
-                sub_livox_mid360_boxi = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
-                        lidar.topic, 200000, std::bind(&RESPLE::livoxMid360BoxiCallback, this, std::placeholders::_1));
+                sub_livox_mid360_boxi = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                        lidar.topic, lidar_qos, std::bind(&RESPLE::livoxMid360BoxiCallback, this, std::placeholders::_1), sensor_sub_opt);
             }
         }
     }
@@ -194,6 +210,9 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
 private:
+    // Callback groups (initialized in constructor)
+    rclcpp::CallbackGroup::SharedPtr sensor_cb_group;
+    rclcpp::CallbackGroup::SharedPtr control_cb_group;
 
     std::string node_name = "RESPLE";
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_ouster;
@@ -264,51 +283,51 @@ private:
     const std::string baselink_frame = "base_link";
     const std::string odom_frame = "odom";
 
-    void readParameters(rclcpp::Node::SharedPtr &nh)
+    void readParameters()
     {
-        ds_lm_voxel = CommonUtils::readParam<float>(nh, "ds_lm_voxel");
-        float ds_scan_voxel = CommonUtils::readParam<float>(nh, "ds_scan_voxel");
+        ds_lm_voxel = CommonUtils::readParam<float>(*this, "ds_lm_voxel");
+        float ds_scan_voxel = CommonUtils::readParam<float>(*this, "ds_scan_voxel");
         ds_filter_body.setLeafSize(ds_scan_voxel, ds_scan_voxel, ds_scan_voxel);
-        param.nn_thresh = CommonUtils::readParam<double>(nh, "nn_thresh");
-        if_lidar_only = CommonUtils::readParam<bool>(nh, "if_lidar_only");
+        param.nn_thresh = CommonUtils::readParam<double>(*this, "nn_thresh");
+        if_lidar_only = CommonUtils::readParam<bool>(*this, "if_lidar_only");
         if (!if_lidar_only) {
-            acc_ratio = CommonUtils::readParam<bool>(nh, "acc_ratio");
-            std::vector<double> bias_acc_var = CommonUtils::readParam<std::vector<double>>(nh, "cov_ba");
+            acc_ratio = CommonUtils::readParam<bool>(*this, "acc_ratio");
+            std::vector<double> bias_acc_var = CommonUtils::readParam<std::vector<double>>(*this, "cov_ba");
             cov_ba << bias_acc_var.at(0), bias_acc_var.at(1), bias_acc_var.at(2);
-            std::vector<double> bias_gyro_var = CommonUtils::readParam<std::vector<double>>(nh, "cov_bg");
+            std::vector<double> bias_gyro_var = CommonUtils::readParam<std::vector<double>>(*this, "cov_bg");
             cov_bg << bias_gyro_var.at(0), bias_gyro_var.at(1), bias_gyro_var.at(2);
-            std::vector<double> acc_var = CommonUtils::readParam<std::vector<double>>(nh, "cov_acc");
+            std::vector<double> acc_var = CommonUtils::readParam<std::vector<double>>(*this, "cov_acc");
             param.cov_acc << acc_var.at(0), acc_var.at(1), acc_var.at(2);
-            std::vector<double> gyro_var = CommonUtils::readParam<std::vector<double>>(nh, "cov_gyro");
+            std::vector<double> gyro_var = CommonUtils::readParam<std::vector<double>>(*this, "cov_gyro");
             param.cov_gyro << gyro_var.at(0), gyro_var.at(1), gyro_var.at(2);
         }
 
-        dt_ns = 1e9 / CommonUtils::readParam<int>(nh, "knot_hz");
+        dt_ns = 1e9 / CommonUtils::readParam<int>(*this, "knot_hz");
         double dt_s = double(dt_ns) * 1e-9;
-        cov_P0 = CommonUtils::readParam<double>(nh, "cov_P0");
+        cov_P0 = CommonUtils::readParam<double>(*this, "cov_P0");
         cov_P0 *= (dt_s*dt_s);
-        cov_RCP_pos_old = CommonUtils::readParam<double>(nh, "cov_RCP_pos_old");
-        cov_RCP_ort_old = CommonUtils::readParam<double>(nh, "cov_RCP_ort_old");
-        cov_RCP_pos_new = CommonUtils::readParam<double>(nh, "cov_RCP_pos_new");
-        cov_RCP_ort_new = CommonUtils::readParam<double>(nh, "cov_RCP_ort_new");
-        double std_pos = CommonUtils::readParam<double>(nh, "std_sys_pos");
-        double std_ort = CommonUtils::readParam<double>(nh, "std_sys_ort");
+        cov_RCP_pos_old = CommonUtils::readParam<double>(*this, "cov_RCP_pos_old");
+        cov_RCP_ort_old = CommonUtils::readParam<double>(*this, "cov_RCP_ort_old");
+        cov_RCP_pos_new = CommonUtils::readParam<double>(*this, "cov_RCP_pos_new");
+        cov_RCP_ort_new = CommonUtils::readParam<double>(*this, "cov_RCP_ort_new");
+        double std_pos = CommonUtils::readParam<double>(*this, "std_sys_pos");
+        double std_ort = CommonUtils::readParam<double>(*this, "std_sys_ort");
         cov_sys_pos = std_pos*std_pos*dt_s*dt_s;
         cov_sys_ort = std_ort*std_ort*dt_s*dt_s;
-        param.coeff_cov = CommonUtils::readParam<double>(nh, "coeff_cov", 10);
+        param.coeff_cov = CommonUtils::readParam<double>(*this, "coeff_cov", 10);
 
-        cube_len = CommonUtils::readParam<double>(nh, "cube_len");
-        point_filter_num = CommonUtils::readParam<int>(nh, "point_filter_num");
-        num_points_upd = CommonUtils::readParam<int>(nh, "num_points_upd");
+        cube_len = CommonUtils::readParam<double>(*this, "cube_len");
+        point_filter_num = CommonUtils::readParam<int>(*this, "point_filter_num");
+        num_points_upd = CommonUtils::readParam<int>(*this, "num_points_upd");
         if (if_lidar_only) {
-            estimator_lo.n_iter = CommonUtils::readParam<int>(nh, "n_iter");
+            estimator_lo.n_iter = CommonUtils::readParam<int>(*this, "n_iter");
         } else {
-            estimator_lio.n_iter = CommonUtils::readParam<int>(nh, "n_iter");
+            estimator_lio.n_iter = CommonUtils::readParam<int>(*this, "n_iter");
         }
         pc_last.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
         pc_last_ds.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
-        NUM_MATCH_POINTS = CommonUtils::readParam<int>(nh, "num_nn", 5);
-        double lidar_time_offset = CommonUtils::readParam<double>(nh, "lidar_time_offset", 0.0);
+        NUM_MATCH_POINTS = CommonUtils::readParam<int>(*this, "num_nn", 5);
+        double lidar_time_offset = CommonUtils::readParam<double>(*this, "lidar_time_offset", 0.0);
         time_offset = 1e9*lidar_time_offset;
     }
 
@@ -879,15 +898,22 @@ private:
 int main(int argc, char *argv[])
 {
     rclcpp::init(argc, argv);
-    auto nh = rclcpp::Node::make_shared("RESPLE");
-    RESPLE resple(nh);
-    RCLCPP_INFO_STREAM(nh->get_logger(), "RESPLE starts!");
-    rclcpp::Rate rate(200);
-    std::thread opt{&RESPLE::processData, &resple};
-    while (rclcpp::ok()) {
-        rclcpp::spin_some(nh);
-        rate.sleep();
-    }
-    opt.join();
+    // Allow running as a standalone node (non-composed) for convenience
+    rclcpp::NodeOptions options;
+    auto node = std::make_shared<RESPLE>(options);
+    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE starts!");
+
+    // Start the background data-processing thread
+    std::thread opt{&RESPLE::processData, node.get()};
+
+    rclcpp::executors::MultiThreadedExecutor exec;
+    exec.add_node(node);
+    exec.spin();
+
+    if (opt.joinable()) opt.join();
+    exec.remove_node(node);
     rclcpp::shutdown();
+    return 0;
 }
+
+RCLCPP_COMPONENTS_REGISTER_NODE(RESPLE)
