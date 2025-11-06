@@ -1,6 +1,7 @@
 #pragma once
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <eigen3/Eigen/Dense>
 #include <fstream>
 #include <filesystem>
@@ -149,6 +150,32 @@ public:
         n->get_parameter_or(name, ans, alternative);
         return ans;
     }
+    
+    // Phase 4: Overloads for LifecycleNode
+    template <typename T>
+    static T readParam(rclcpp_lifecycle::LifecycleNode& n, std::string name)
+    {
+        T ans;
+        if (!n.has_parameter(name)) {
+            n.declare_parameter<T>(name);
+        }
+        if (!n.get_parameter(name, ans)) {
+            RCLCPP_FATAL_STREAM(n.get_logger(), "Failed to load " << name);
+            exit(1);
+        }
+        return ans;
+    }
+
+    template <typename T>
+    static T readParam(rclcpp_lifecycle::LifecycleNode& n, std::string name, const T& alternative)
+    {
+        T ans;
+        if (!n.has_parameter(name)) {
+            n.declare_parameter<T>(name, alternative);
+        }
+        n.get_parameter_or(name, ans, alternative);
+        return ans;
+    }
 
     static Eigen::Vector3d readVector3d(rclcpp::Node& n, const std::string& name)
     {
@@ -157,6 +184,12 @@ public:
     }
 
     static Eigen::Vector3d readVector3d(rclcpp::Node::SharedPtr &n, const std::string& name)
+    {
+        std::vector<double> v = CommonUtils::readParam<std::vector<double>>(n, name);
+        return Eigen::Vector3d(v[0], v[1], v[2]);
+    }
+    
+    static Eigen::Vector3d readVector3d(rclcpp_lifecycle::LifecycleNode& n, const std::string& name)
     {
         std::vector<double> v = CommonUtils::readParam<std::vector<double>>(n, name);
         return Eigen::Vector3d(v[0], v[1], v[2]);
@@ -320,6 +353,21 @@ struct LidarConfig {
     }
 
     LidarConfig(rclcpp::Node::SharedPtr& nh, const std::string& prefix) {
+        std::cout << "Creating LidarConfig with prefix: \"" << prefix << "\"" << std::endl;
+        topic = CommonUtils::readParam<std::string>(nh, prefix + "topic_lidar");
+        type = CommonUtils::readParam<std::string>(nh, prefix + "lidar_type");
+        scan_line = CommonUtils::readParam<int>(nh, prefix + "scan_line");
+        blind = CommonUtils::readParam<float>(nh, prefix + "blind", 0.5f);
+        std::vector<double> q_lb_v = CommonUtils::readParam<std::vector<double>>(nh, prefix + "q_lb");
+        q_lb = Eigen::Quaterniond(q_lb_v.at(0), q_lb_v.at(1), q_lb_v.at(2), q_lb_v.at(3));
+        t_lb = CommonUtils::readVector3d(nh, prefix + "t_lb");
+        q_bl = q_lb.inverse();
+        t_bl = q_lb.inverse() * (- t_lb);
+        w_pt = CommonUtils::readParam<double>(nh, prefix + "w_pt");
+    }
+    
+    // Phase 4: Constructor for LifecycleNode
+    LidarConfig(rclcpp_lifecycle::LifecycleNode& nh, const std::string& prefix) {
         std::cout << "Creating LidarConfig with prefix: \"" << prefix << "\"" << std::endl;
         topic = CommonUtils::readParam<std::string>(nh, prefix + "topic_lidar");
         type = CommonUtils::readParam<std::string>(nh, prefix + "lidar_type");

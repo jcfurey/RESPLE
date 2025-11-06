@@ -16,6 +16,9 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <rclcpp/service.hpp>
 #include <std_srvs/srv/empty.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include <lifecycle_msgs/msg/transition.hpp>
+#include <atomic>
 #include "livox_ros_driver/msg/custom_msg.hpp"
 #include "livox_ros_driver2/msg/custom_msg.hpp"
 #include "livox_interfaces/msg/custom_msg.hpp"
@@ -475,30 +478,122 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
     pcl::PointCloud<livox_mid360_boxi::Point>::Ptr pc_mid360_reusable_;
 };
 
-class Mapping
+class Mapping : public rclcpp_lifecycle::LifecycleNode
 {
 
 public:
 
-Mapping(rclcpp::Node::SharedPtr &nh, std::vector<MappingBase<pcl::PointXYZINormal>*>& mappings)
+Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXYZINormal>*>& mappings)
+    : rclcpp_lifecycle::LifecycleNode("Mapping", 
+          rclcpp::NodeOptions(options).use_intra_process_comms(true)),
+      processing_active_(false),
+      vis_maps(mappings)
     {
-        // Phase 2: Explicit QoS profiles for all publishers/subscribers
+        RCLCPP_INFO(this->get_logger(), "Mapping LifecycleNode created (unconfigured state)");
+        spl_window_st_ns = 0;
+        opt_old_path.header.frame_id = odom_id;
+    }
+    
+    // Phase 4: Lifecycle callbacks
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_configure(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Configuring Mapping...");
+        
+        // Create publishers (inactive until activated)
+        auto reliable_qos = rclcpp::QoS(100).reliable();
+        pub_path = this->create_publisher<nav_msgs::msg::Path>("traj_path", reliable_qos);
+        pub_knots = this->create_publisher<sensor_msgs::msg::PointCloud>("active_control_points", 
+            rclcpp::QoS(20).reliable());
+        pub_odom = this->create_publisher<nav_msgs::msg::Odometry>("odometry", 
+            rclcpp::QoS(500).reliable());
+        br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        
+        RCLCPP_INFO(this->get_logger(), "Mapping configured successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_activate(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Activating Mapping...");
+        
+        // Activate publishers
+        pub_path->on_activate();
+        pub_knots->on_activate();
+        pub_odom->on_activate();
+        
+        // Create subscriptions
         auto reliable_qos = rclcpp::QoS(100).reliable();
         auto large_reliable_qos = rclcpp::QoS(10000).reliable();
-        
-        sub_start = nh->create_subscription<std_msgs::msg::Int64>("/start_time", reliable_qos, 
+        sub_start = this->create_subscription<std_msgs::msg::Int64>("start_time", reliable_qos, 
             std::bind(&Mapping::startCallBack, this, std::placeholders::_1));
-        spl_window_st_ns = 0;
-        sub_est = nh->create_subscription<estimate_msgs::msg::Estimate>("/est_window", large_reliable_qos, 
+        sub_est = this->create_subscription<estimate_msgs::msg::Estimate>("est_window", large_reliable_qos, 
             std::bind(&Mapping::getEstCallback, this, std::placeholders::_1));
-        pub_path = nh->create_publisher<nav_msgs::msg::Path>("traj_path", reliable_qos);
-        pub_knots = nh->create_publisher<sensor_msgs::msg::PointCloud>("active_control_points", 
-            rclcpp::QoS(20).reliable());
-        opt_old_path.header.frame_id = odom_id;
-        vis_maps = mappings;
-        pub_odom = nh->create_publisher<nav_msgs::msg::Odometry>("odometry", 
-            rclcpp::QoS(500).reliable());
-        br = std::make_shared<tf2_ros::TransformBroadcaster>(nh);
+        
+        // Start processing thread
+        processing_active_ = true;
+        processing_thread_ = std::thread(&Mapping::process, this);
+        
+        RCLCPP_INFO(this->get_logger(), "Mapping activated successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_deactivate(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Deactivating Mapping...");
+        
+        // Stop processing thread
+        processing_active_ = false;
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
+        }
+        
+        // Deactivate publishers
+        pub_path->on_deactivate();
+        pub_knots->on_deactivate();
+        pub_odom->on_deactivate();
+        
+        // Reset subscriptions
+        sub_start.reset();
+        sub_est.reset();
+        
+        RCLCPP_INFO(this->get_logger(), "Mapping deactivated successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_cleanup(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Cleaning up Mapping...");
+        
+        // Reset publishers
+        pub_path.reset();
+        pub_knots.reset();
+        pub_odom.reset();
+        br.reset();
+        
+        // Clear data
+        opt_old_path.poses.clear();
+        
+        RCLCPP_INFO(this->get_logger(), "Mapping cleaned up successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_shutdown(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Shutting down Mapping...");
+        
+        // Ensure processing thread is stopped
+        processing_active_ = false;
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "Mapping shutdown complete");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
 
     void lock_mappings() {
@@ -516,7 +611,7 @@ Mapping(rclcpp::Node::SharedPtr &nh, std::vector<MappingBase<pcl::PointXYZINorma
     void process() {
         rclcpp::Rate rate(20);
         int64_t num_knot = 0;
-        while (true) {
+        while (processing_active_) {
             if (if_init_succeed && spline_global.numKnots() > num_knot) {
                 lock_mappings();
                 publishPath();
@@ -541,10 +636,14 @@ private:
     SplineState spline_global;
     rclcpp::Subscription<estimate_msgs::msg::Estimate>::SharedPtr sub_est;
     rclcpp::Subscription<std_msgs::msg::Int64>::SharedPtr sub_start;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;
+    rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;
     nav_msgs::msg::Path opt_old_path;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr pub_knots;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path;
+    rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud>::SharedPtr pub_knots;
+    rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr pub_path;
+    
+    // Phase 4: Lifecycle management
+    std::atomic<bool> processing_active_;
+    std::thread processing_thread_;
     std::vector<MappingBase<pcl::PointXYZINormal>*> vis_maps;
     const std::string frame_id = "body";
     const std::string odom_id = "world";
@@ -672,44 +771,72 @@ private:
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    // Phase 4: Enable intra-process communication
-    rclcpp::NodeOptions options;
-    options.use_intra_process_comms(true);
-    auto nh = rclcpp::Node::make_shared("Mapping", options);
+    
+    // Phase 4: Create temporary node for parameter loading
+    rclcpp::NodeOptions temp_options;
+    auto temp_nh = rclcpp::Node::make_shared("MappingInit", temp_options);
+    
     std::vector<LidarConfig> lidars;
-    auto lidar_names = nh->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
-    assert(nh->get_parameter({"lidars"}, lidar_names));
+    auto lidar_names = temp_nh->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
+    assert(temp_nh->get_parameter({"lidars"}, lidar_names));
     if (lidar_names.empty()) {
-        lidars.emplace_back(nh, "");
+        lidars.emplace_back(temp_nh, "");
     } else {
         for (const auto& lidar_name : lidar_names) {
-            lidars.emplace_back(nh, lidar_name + ".");
+            lidars.emplace_back(temp_nh, lidar_name + ".");
         }
     }
     // Phase 2: Create callback group for sensor processing
-    auto sensor_cb_group = nh->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    auto sensor_cb_group = temp_nh->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     
     std::vector<MappingBase<pcl::PointXYZINormal>*> buffs;
     for (const auto& lidar : lidars) {
         if (!lidar.type.compare("Ouster")) {
-            buffs.push_back(new OusterBuff(nh, lidar, sensor_cb_group));
+            buffs.push_back(new OusterBuff(temp_nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("Mid70Avia")) {
-            buffs.push_back(new Mid70AviaBuff(nh, lidar, sensor_cb_group));
+            buffs.push_back(new Mid70AviaBuff(temp_nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("HAP360")) {
-            buffs.push_back(new HAP360Buff(nh, lidar, sensor_cb_group));
+            buffs.push_back(new HAP360Buff(temp_nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("AviaResple")) {
-            buffs.push_back(new AviaRespleBuff(nh, lidar, sensor_cb_group));
+            buffs.push_back(new AviaRespleBuff(temp_nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("Hesai")) {
-            buffs.push_back(new HesaiBuff(nh, lidar, sensor_cb_group));
+            buffs.push_back(new HesaiBuff(temp_nh, lidar, sensor_cb_group));
         } else if (!lidar.type.compare("Mid360Boxi")) {
-            buffs.push_back(new Mid360BoxiBuff(nh, lidar, sensor_cb_group));
+            buffs.push_back(new Mid360BoxiBuff(temp_nh, lidar, sensor_cb_group));
         } else {
             exit(1);
         }
     }
-    Mapping mapping(nh, buffs);
-    std::thread mappingThread{&Mapping::process, &mapping};
-    rclcpp::spin(nh);
-    mappingThread.join();
+    
+    // Phase 4: Lifecycle node initialization
+    rclcpp::NodeOptions options;
+    auto node = std::make_shared<Mapping>(options, buffs);
+    RCLCPP_INFO(node->get_logger(), "Mapping LifecycleNode created");
+    
+    // Transition to configured state
+    node->configure();
+    RCLCPP_INFO(node->get_logger(), "Mapping configured");
+    
+    // Transition to active state (starts processing)
+    node->activate();
+    RCLCPP_INFO(node->get_logger(), "Mapping activated - processing started");
+    
+    rclcpp::executors::MultiThreadedExecutor exec;
+    exec.add_node(node->get_node_base_interface());
+    exec.add_node(temp_nh);
+    exec.spin();
+    
+    // Cleanup on shutdown
+    node->deactivate();
+    node->cleanup();
+    node->shutdown();
+    exec.remove_node(node->get_node_base_interface());
+    exec.remove_node(temp_nh);
+    
+    // Cleanup buffs
+    for (auto buff : buffs) {
+        delete buff;
+    }
+    
     rclcpp::shutdown();
 }

@@ -1,6 +1,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include <lifecycle_msgs/msg/transition.hpp>
 #include <std_msgs/msg/int64.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -19,6 +21,7 @@
 #include <thread>
 #include <mutex>
 #include <chrono>
+#include <atomic>
 #include <boost/make_shared.hpp>
 #include <rclcpp/service.hpp>
 #include <std_srvs/srv/empty.hpp>
@@ -35,15 +38,25 @@
 
 KD_TREE<pcl::PointXYZINormal> ikdtree;
 
-class RESPLE : public rclcpp::Node
+class RESPLE : public rclcpp_lifecycle::LifecycleNode
 {
 
 public:
     explicit RESPLE(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
-        : rclcpp::Node("RESPLE", 
+        : rclcpp_lifecycle::LifecycleNode("RESPLE", 
           rclcpp::NodeOptions(options).use_intra_process_comms(true)),
-          diagnostics_(this)
+          diagnostics_(this),
+          processing_active_(false)
     {
+        RCLCPP_INFO(this->get_logger(), "RESPLE LifecycleNode created (unconfigured state)");
+    }
+    
+    // Phase 4: Lifecycle callbacks
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_configure(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Configuring RESPLE...");
+        
         // Phase 4: Parameter validation with constraints
         auto num_threads_desc = rcl_interfaces::msg::ParameterDescriptor{};
         num_threads_desc.description = "Number of OpenMP threads for parallel processing";
@@ -80,10 +93,31 @@ public:
         sensor_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         control_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         
+        // Create publishers (inactive until activated)
+        pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
+        pub_start_time = this->create_publisher<std_msgs::msg::Int64>("start_time", rclcpp::QoS(50).reliable());
+        pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", rclcpp::QoS(50).reliable());
+        pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
+        br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE configured successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_activate(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Activating RESPLE...");
+        
+        // Activate publishers
+        pub_est->on_activate();
+        pub_start_time->on_activate();
+        pub_pose->on_activate();
+        pub_cur_scan->on_activate();
+        
+        // Setup subscriptions
         rclcpp::SubscriptionOptions sensor_sub_opt;
         sensor_sub_opt.callback_group = sensor_cb_group;
-        
-        // QoS profiles for different topics
         auto imu_qos = rclcpp::SensorDataQoS().keep_last(200).best_effort();
         auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
         
@@ -92,11 +126,7 @@ public:
             sub_imu = this->create_subscription<sensor_msgs::msg::Imu>(
                 imu_type, imu_qos, std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1), sensor_sub_opt);
         }
-        pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
-        pub_start_time = this->create_publisher<std_msgs::msg::Int64>("start_time", rclcpp::QoS(50).reliable());
-        pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", rclcpp::QoS(50).reliable());
-        pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
-        br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        
         auto lidar_names = this->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
         assert(this->get_parameter("lidars", lidar_names));
         if (lidar_names.empty()) {
@@ -110,6 +140,7 @@ public:
                 lidars_data.emplace(std::piecewise_construct, std::make_tuple(lidar.type), std::make_tuple());
             }
         }
+        
         for (const auto& [lidar_name, lidar] : lidars) {
             if (!lidar.type.compare("Ouster")) {
                 sub_ouster = this->create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -131,6 +162,83 @@ public:
                         lidar.topic, lidar_qos, std::bind(&RESPLE::livoxMid360BoxiCallback, this, std::placeholders::_1), sensor_sub_opt);
             }
         }
+        
+        // Start processing thread
+        processing_active_ = true;
+        processing_thread_ = std::thread(&RESPLE::processData, this);
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE activated successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_deactivate(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Deactivating RESPLE...");
+        
+        // Stop processing thread
+        processing_active_ = false;
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
+        }
+        
+        // Deactivate publishers
+        pub_est->on_deactivate();
+        pub_start_time->on_deactivate();
+        pub_pose->on_deactivate();
+        pub_cur_scan->on_deactivate();
+        
+        // Reset subscriptions
+        sub_imu.reset();
+        sub_ouster.reset();
+        sub_livox.reset();
+        sub_livox2.reset();
+        sub_livox_avia.reset();
+        sub_hesai.reset();
+        sub_livox_mid360_boxi.reset();
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE deactivated successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_cleanup(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Cleaning up RESPLE...");
+        
+        // Clear buffers and data structures
+        lidars.clear();
+        lidars_data.clear();
+        imu_buff.clear();
+        imu_meas.clear();
+        pt_meas.clear();
+        pc_world.clear();
+        accum_nearest_points.clear();
+        
+        // Reset publishers
+        pub_est.reset();
+        pub_start_time.reset();
+        pub_pose.reset();
+        pub_cur_scan.reset();
+        br.reset();
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE cleaned up successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_shutdown(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Shutting down RESPLE...");
+        
+        // Ensure processing thread is stopped
+        processing_active_ = false;
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE shutdown complete");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
 
     void processData()
@@ -138,7 +246,7 @@ public:
         rclcpp::Rate rate(20);
         int64_t max_spl_knots = 0;
         int64_t t_last_map_upd = 0;
-        while (true) {
+        while (processing_active_) {
             for (auto& [lidar_name, lidar_data] : lidars_data) {
                 while (!lidar_data.t_buff.empty()) {
                     pc_frame_reusable_->clear();
@@ -277,6 +385,10 @@ private:
     double total_computation_time_ms_;
     size_t total_iekf_iterations_;
     
+    // Phase 4: Lifecycle management
+    std::atomic<bool> processing_active_;
+    std::thread processing_thread_;
+    
     // Pre-allocated reusable buffers (Phase 3 - avoid repeated heap allocations)
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame_reusable_;
     pcl::PointCloud<pcl::PointXYZI>::Ptr laser_cloud_world_reusable_;
@@ -288,10 +400,10 @@ private:
     rclcpp::Subscription<livox_interfaces::msg::CustomMsg>::SharedPtr sub_livox_avia;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_hesai;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_livox_mid360_boxi;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan;
-    rclcpp::Publisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
-    rclcpp::Publisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
+    rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan;
+    rclcpp_lifecycle::LifecyclePublisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
+    rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
+    rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     const std::string frame_id = "base_link";
     const std::string odom_id = "odom";
@@ -1034,20 +1146,29 @@ private:
 int main(int argc, char *argv[])
 {
     rclcpp::init(argc, argv);
-    // Allow running as a standalone node (non-composed) for convenience
+    
+    // Phase 4: Lifecycle node initialization
     rclcpp::NodeOptions options;
     auto node = std::make_shared<RESPLE>(options);
-    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE starts!");
+    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE LifecycleNode created");
 
-    // Start the background data-processing thread
-    std::thread opt{&RESPLE::processData, node.get()};
+    // Transition to configured state
+    node->configure();
+    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE configured");
+    
+    // Transition to active state (starts processing)
+    node->activate();
+    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE activated - processing started");
 
     rclcpp::executors::MultiThreadedExecutor exec;
-    exec.add_node(node);
+    exec.add_node(node->get_node_base_interface());
     exec.spin();
 
-    if (opt.joinable()) opt.join();
-    exec.remove_node(node);
+    // Cleanup on shutdown
+    node->deactivate();
+    node->cleanup();
+    node->shutdown();
+    exec.remove_node(node->get_node_base_interface());
     rclcpp::shutdown();
     return 0;
 }
