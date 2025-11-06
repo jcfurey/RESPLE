@@ -672,7 +672,10 @@ private:
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    auto nh = rclcpp::Node::make_shared("Mapping");
+    // Phase 4: Enable intra-process communication
+    rclcpp::NodeOptions options;
+    options.use_intra_process_comms(true);
+    auto nh = rclcpp::Node::make_shared("Mapping", options);
     std::vector<LidarConfig> lidars;
     auto lidar_names = nh->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
     assert(nh->get_parameter({"lidars"}, lidar_names));

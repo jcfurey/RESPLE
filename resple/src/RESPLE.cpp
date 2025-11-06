@@ -12,10 +12,13 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <diagnostic_updater/diagnostic_updater.hpp>
+#include <diagnostic_updater/publisher.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <chrono>
 #include <boost/make_shared.hpp>
 #include <rclcpp/service.hpp>
 #include <std_srvs/srv/empty.hpp>
@@ -37,14 +40,39 @@ class RESPLE : public rclcpp::Node
 
 public:
     explicit RESPLE(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
-        : rclcpp::Node("RESPLE", options)
+        : rclcpp::Node("RESPLE", 
+          rclcpp::NodeOptions(options).use_intra_process_comms(true)),
+          diagnostics_(this)
     {
-        // Parameterize thread count and nearest neighbor count
-        num_threads_ = this->declare_parameter<int>("num_threads", 5);
-        num_match_points_ = this->declare_parameter<int>("num_match_points", 5);
+        // Phase 4: Parameter validation with constraints
+        auto num_threads_desc = rcl_interfaces::msg::ParameterDescriptor{};
+        num_threads_desc.description = "Number of OpenMP threads for parallel processing";
+        num_threads_desc.integer_range.resize(1);
+        num_threads_desc.integer_range[0].from_value = 1;
+        num_threads_desc.integer_range[0].to_value = 16;
+        num_threads_desc.integer_range[0].step = 1;
+        num_threads_ = this->declare_parameter<int>("num_threads", 5, num_threads_desc);
+        
+        auto num_match_points_desc = rcl_interfaces::msg::ParameterDescriptor{};
+        num_match_points_desc.description = "Number of nearest neighbor points for matching";
+        num_match_points_desc.integer_range.resize(1);
+        num_match_points_desc.integer_range[0].from_value = 3;
+        num_match_points_desc.integer_range[0].to_value = 10;
+        num_match_points_desc.integer_range[0].step = 1;
+        num_match_points_ = this->declare_parameter<int>("num_match_points", 5, num_match_points_desc);
         
         RCLCPP_INFO(this->get_logger(), "Using %d threads for parallel processing", num_threads_);
         RCLCPP_INFO(this->get_logger(), "Using %d nearest neighbor points for matching", num_match_points_);
+        
+        // Phase 4: Setup diagnostics
+        diagnostics_.setHardwareID("RESPLE");
+        diagnostics_.add("System Health", this, &RESPLE::updateDiagnostics);
+        
+        // Initialize diagnostic metrics
+        last_process_time_ = this->now();
+        frame_count_ = 0;
+        total_computation_time_ms_ = 0.0;
+        total_iekf_iterations_ = 0;
         
         readParameters();
         
@@ -154,10 +182,14 @@ public:
                 continue;
             }
             while (collectMeasurements()) {
+                // Phase 4: Track computation time
+                auto frame_start = std::chrono::high_resolution_clock::now();
+                
                 int64_t max_time_ns = pt_meas.back().time_ns;
                 if (if_lidar_only) {
                     estimator_lo.propRCP(max_time_ns);
                     estimator_lo.updateIEKFLiDAR(pt_meas, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
+                    total_iekf_iterations_ += estimator_lo.n_iter;
                 } else {
                     if (!imu_meas.empty()) {
                         max_time_ns = std::max(imu_meas.back().time_ns, max_time_ns);
@@ -167,6 +199,7 @@ public:
                     }
                     estimator_lio.propRCP(max_time_ns);
                     estimator_lio.updateIEKFLiDARInertial(pt_meas, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
+                    total_iekf_iterations_ += estimator_lio.n_iter;
                 }
                 #pragma omp parallel for num_threads(num_threads_)
                 for (size_t i = 0; i < pt_meas.size(); i++) {
@@ -210,6 +243,18 @@ public:
                     accum_nearest_points.clear();
                     t_last_map_upd = max_time_ns;
                 }
+                
+                // Phase 4: Update diagnostic metrics
+                auto frame_end = std::chrono::high_resolution_clock::now();
+                auto frame_duration = std::chrono::duration_cast<std::chrono::microseconds>(frame_end - frame_start);
+                total_computation_time_ms_ += frame_duration.count() / 1000.0;
+                frame_count_++;
+                
+                // Update diagnostics at 1 Hz
+                if ((this->now() - last_process_time_).seconds() >= 1.0) {
+                    diagnostics_.force_update();
+                    last_process_time_ = this->now();
+                }
             }
         }
     }
@@ -224,6 +269,13 @@ private:
     // Performance tuning parameters (Phase 3)
     int num_threads_;
     int num_match_points_;
+    
+    // Phase 4: Diagnostics
+    diagnostic_updater::Updater diagnostics_;
+    rclcpp::Time last_process_time_;
+    size_t frame_count_;
+    double total_computation_time_ms_;
+    size_t total_iekf_iterations_;
     
     // Pre-allocated reusable buffers (Phase 3 - avoid repeated heap allocations)
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame_reusable_;
@@ -301,9 +353,21 @@ private:
     void readParameters()
     {
         ds_lm_voxel = CommonUtils::readParam<float>(*this, "ds_lm_voxel");
+        
+        // Phase 4: Validate ds_scan_voxel parameter
         float ds_scan_voxel = CommonUtils::readParam<float>(*this, "ds_scan_voxel");
+        if (ds_scan_voxel < 0.01 || ds_scan_voxel > 1.0) {
+            RCLCPP_WARN(this->get_logger(), 
+                "ds_scan_voxel value %.3f outside recommended range [0.01, 1.0]", ds_scan_voxel);
+        }
         ds_filter_body.setLeafSize(ds_scan_voxel, ds_scan_voxel, ds_scan_voxel);
+        
+        // Phase 4: Validate nn_thresh parameter
         param.nn_thresh = CommonUtils::readParam<double>(*this, "nn_thresh");
+        if (param.nn_thresh < 0.1 || param.nn_thresh > 5.0) {
+            RCLCPP_WARN(this->get_logger(), 
+                "nn_thresh value %.3f outside recommended range [0.1, 5.0]", param.nn_thresh);
+        }
         if_lidar_only = CommonUtils::readParam<bool>(*this, "if_lidar_only");
         if (!if_lidar_only) {
             acc_ratio = CommonUtils::readParam<bool>(*this, "acc_ratio");
@@ -382,6 +446,56 @@ private:
         m_buff.lock();
         imu_int_buff.push_back(imu_msg);
         m_buff.unlock();
+    }
+    
+    // Phase 4: Diagnostic updater callback
+    void updateDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& stat)
+    {
+        // Calculate processing rate
+        double time_elapsed = (this->now() - last_process_time_).seconds();
+        double processing_rate = (time_elapsed > 0) ? frame_count_ / time_elapsed : 0.0;
+        double avg_computation_time = (frame_count_ > 0) ? total_computation_time_ms_ / frame_count_ : 0.0;
+        double avg_iekf_iters = (frame_count_ > 0) ? static_cast<double>(total_iekf_iterations_) / frame_count_ : 0.0;
+        
+        // Determine system health
+        const double expected_rate = 20.0;  // Target: 20 Hz
+        const double warn_threshold = 0.7 * expected_rate;  // 14 Hz
+        const double error_threshold = 0.5 * expected_rate;  // 10 Hz
+        
+        if (frame_count_ == 0) {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, "No frames processed yet");
+        } else if (processing_rate < error_threshold) {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, 
+                        "Processing rate critically low");
+        } else if (processing_rate < warn_threshold) {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, 
+                        "Processing rate below target");
+        } else {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "System healthy");
+        }
+        
+        // Add detailed metrics
+        stat.add("Processing Rate (Hz)", processing_rate);
+        stat.add("Target Rate (Hz)", expected_rate);
+        stat.add("Frames Processed", static_cast<int>(frame_count_));
+        stat.add("Avg Computation Time (ms)", avg_computation_time);
+        stat.add("Avg IEKF Iterations", avg_iekf_iters);
+        stat.add("Num Threads", num_threads_);
+        stat.add("Num Match Points", num_match_points_);
+        
+        // Buffer sizes
+        size_t total_lidar_buffer = 0;
+        for (const auto& [name, data] : lidars_data) {
+            total_lidar_buffer += data.pc_buff.size();
+        }
+        stat.add("LiDAR Buffer Size", static_cast<int>(total_lidar_buffer));
+        stat.add("IMU Buffer Size", static_cast<int>(imu_buff.size()));
+        stat.add("Point Meas Buffer Size", static_cast<int>(pt_meas.size()));
+        
+        // Reset counters for next period
+        frame_count_ = 0;
+        total_computation_time_ms_ = 0.0;
+        total_iekf_iterations_ = 0;
     }
 
     template<typename T>

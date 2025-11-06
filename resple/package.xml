@@ -25,6 +25,10 @@
   <depend>livox_ros_driver2</depend>
   <depend>livox_interfaces</depend>
   <depend>estimate_msgs</depend>
+  <!-- Phase 4: Advanced ROS 2 features -->
+  <depend>diagnostic_updater</depend>
+  <depend>rclcpp_action</depend>
+  <depend>rclcpp_lifecycle</depend>
 
   <test_depend>ament_lint_common</test_depend>
   <test_depend>ament_lint_auto</test_depend>  

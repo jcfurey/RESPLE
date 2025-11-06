@@ -27,6 +27,10 @@ find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(tf2_ros REQUIRED)
+# Phase 4: Advanced ROS 2 features
+find_package(diagnostic_updater REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
 # OpenMP is optional and only required when ENABLE_OPENMP=ON
 if(ENABLE_OPENMP)
 	find_package(OpenMP REQUIRED)
@@ -81,6 +85,9 @@ ament_target_dependencies(${PROJECT_NAME}
 	estimate_msgs
 	pcl_conversions
 	tf2_ros
+	diagnostic_updater
+	rclcpp_action
+	rclcpp_lifecycle
 )
 
 # Use plain signature consistently (ament_target_dependencies uses plain internally)
@@ -132,6 +139,9 @@ ament_export_dependencies(
 	livox_ros_driver
 	livox_ros_driver2
 	livox_interfaces
+	diagnostic_updater
+	rclcpp_action
+	rclcpp_lifecycle
 )
 ament_export_libraries(${PROJECT_NAME})
 ament_package()
