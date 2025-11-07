@@ -1,6 +1,6 @@
 Panels:
   - Class: rviz_common/Displays
-    Help Height: 78
+    Help Height: 104
     Name: Displays
     Property Tree Widget:
       Expanded:
@@ -12,8 +12,12 @@ Panels:
         - /global_map1/Topic1
         - /current_scan1
         - /current_scan1/Topic1
+        - /RobotModel1
+        - /RobotModel1/Status1
+        - /RobotModel1/Mass Properties1
+        - /RobotModel1/Description Topic1
       Splitter Ratio: 0.5733944773674011
-    Tree Height: 775
+    Tree Height: 1758
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Tool Properties
@@ -95,13 +99,125 @@ Visualization Manager:
               Value: true
             base_link:
               Value: true
+            camera0/alignment_frame:
+              Value: true
+            camera0/connection_link:
+              Value: true
+            camera0/sensor_frame:
+              Value: true
+            camera0_imu_frame:
+              Value: true
+            camera0_left_camera_frame:
+              Value: true
+            camera0_left_camera_optical_frame:
+              Value: true
+            camera0_model_origin:
+              Value: true
+            camera0_rgb_camera_frame:
+              Value: true
+            camera0_rgb_camera_optical_frame:
+              Value: true
+            camera0_right_camera_frame:
+              Value: true
+            camera0_right_camera_optical_frame:
+              Value: true
+            camera1/alignment_frame:
+              Value: true
+            camera1/connection_link:
+              Value: true
+            camera1/sensor_frame:
+              Value: true
+            camera1_imu_frame:
+              Value: true
+            camera1_left_camera_frame:
+              Value: true
+            camera1_left_camera_optical_frame:
+              Value: true
+            camera1_model_origin:
+              Value: true
+            camera1_rgb_camera_frame:
+              Value: true
+            camera1_rgb_camera_optical_frame:
+              Value: true
+            camera1_right_camera_frame:
+              Value: true
+            camera1_right_camera_optical_frame:
+              Value: true
+            camera2/alignment_frame:
+              Value: true
+            camera2/connection_link:
+              Value: true
+            camera2_imu_frame:
+              Value: true
+            camera2_left_camera_frame:
+              Value: true
+            camera2_left_camera_optical_frame:
+              Value: true
+            camera2_model_origin:
+              Value: true
+            camera2_rgb_camera_frame:
+              Value: true
+            camera2_rgb_camera_optical_frame:
+              Value: true
+            camera2_right_camera_frame:
+              Value: true
+            camera2_right_camera_optical_frame:
+              Value: true
+            camera3/alignment_frame:
+              Value: true
+            camera3/connection_link:
+              Value: true
+            camera3_imu_frame:
+              Value: true
+            camera3_left_camera_frame:
+              Value: true
+            camera3_left_camera_optical_frame:
+              Value: true
+            camera3_model_origin:
+              Value: true
+            camera3_rgb_camera_frame:
+              Value: true
+            camera3_rgb_camera_optical_frame:
+              Value: true
+            camera3_right_camera_frame:
+              Value: true
+            camera3_right_camera_optical_frame:
+              Value: true
+            camera4/alignment_frame:
+              Value: true
+            camera4/connection_link:
+              Value: true
+            camera4/sensor_frame:
+              Value: true
+            camera4_cam_e_camera_frame:
+              Value: true
+            camera4_cam_e_camera_optical_frame:
+              Value: true
+            camera4_model_origin:
+              Value: true
+            camera4_rgb_camera_frame:
+              Value: true
+            camera4_rgb_camera_optical_frame:
+              Value: true
+            chassis_link:
+              Value: true
             imu:
               Value: true
             lidar:
               Value: true
+            lidar0/alignment_frame:
+              Value: true
+            lidar0/connection_link:
+              Value: true
+            lidar0/imu_frame:
+              Value: true
+            lidar0/lidar_frame:
+              Value: true
+            lidar0/sensor_frame:
+              Value: true
             map:
               Value: true
-            my_frame:
+            mounting_plate_link:
               Value: true
             odom:
               Value: true
@@ -114,10 +230,96 @@ Visualization Manager:
             odom:
               base_footprint:
                 base_link:
-                  imu:
-                    {}
-                  lidar:
-                    {}
+                  chassis_link:
+                    mounting_plate_link:
+                      camera0/connection_link:
+                        camera0_imu_frame:
+                          {}
+                        camera0_left_camera_frame:
+                          camera0_left_camera_optical_frame:
+                            {}
+                        camera0_model_origin:
+                          {}
+                        camera0_rgb_camera_frame:
+                          camera0/alignment_frame:
+                            camera0/sensor_frame:
+                              {}
+                          camera0_rgb_camera_optical_frame:
+                            {}
+                        camera0_right_camera_frame:
+                          camera0_right_camera_optical_frame:
+                            {}
+                      camera1/connection_link:
+                        camera1_imu_frame:
+                          {}
+                        camera1_left_camera_frame:
+                          camera1_left_camera_optical_frame:
+                            {}
+                        camera1_model_origin:
+                          {}
+                        camera1_rgb_camera_frame:
+                          camera1/alignment_frame:
+                            camera1/sensor_frame:
+                              {}
+                          camera1_rgb_camera_optical_frame:
+                            {}
+                        camera1_right_camera_frame:
+                          camera1_right_camera_optical_frame:
+                            {}
+                      camera2/connection_link:
+                        camera2_imu_frame:
+                          {}
+                        camera2_left_camera_frame:
+                          camera2_left_camera_optical_frame:
+                            {}
+                        camera2_model_origin:
+                          {}
+                        camera2_rgb_camera_frame:
+                          camera2/alignment_frame:
+                            {}
+                          camera2_rgb_camera_optical_frame:
+                            {}
+                        camera2_right_camera_frame:
+                          camera2_right_camera_optical_frame:
+                            {}
+                      camera3/connection_link:
+                        camera3_imu_frame:
+                          {}
+                        camera3_left_camera_frame:
+                          camera3_left_camera_optical_frame:
+                            {}
+                        camera3_model_origin:
+                          {}
+                        camera3_rgb_camera_frame:
+                          camera3/alignment_frame:
+                            {}
+                          camera3_rgb_camera_optical_frame:
+                            {}
+                        camera3_right_camera_frame:
+                          camera3_right_camera_optical_frame:
+                            {}
+                      camera4/connection_link:
+                        camera4_cam_e_camera_frame:
+                          camera4_cam_e_camera_optical_frame:
+                            {}
+                        camera4_model_origin:
+                          {}
+                        camera4_rgb_camera_frame:
+                          camera4_rgb_camera_optical_frame:
+                            {}
+                      lidar0/connection_link:
+                        lidar0/alignment_frame:
+                          lidar0/sensor_frame:
+                            lidar0/imu_frame:
+                              {}
+                            lidar0/lidar_frame:
+                              {}
+                imu:
+                  {}
+                lidar:
+                  {}
+              map:
+                {}
           Update Interval: 0
           Value: true
         - Class: rviz_default_plugins/Axes
@@ -148,10 +350,10 @@ Visualization Manager:
       Color: 98; 160; 234
       Color Transformer: Intensity
       Decay Time: 9999
-      Enabled: true
+      Enabled: false
       Invert Rainbow: false
       Max Color: 255; 255; 255
-      Max Intensity: 255
+      Max Intensity: 567
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: global_map
@@ -168,7 +370,7 @@ Visualization Manager:
         Value: /global_map
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
     - Alpha: 0.6000000238418579
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -230,10 +432,280 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /traj_path
       Value: true
+    - Alpha: 1
+      Class: rviz_default_plugins/RobotModel
+      Collision Enabled: false
+      Description File: ""
+      Description Source: Topic
+      Description Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /base/robot_description
+      Enabled: true
+      Links:
+        All Links Enabled: true
+        Expand Joint Details: false
+        Expand Link Details: false
+        Expand Tree: false
+        Link Tree Style: Links in Alphabetic Order
+        base_footprint:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        base_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0/alignment_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0/connection_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0/sensor_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0_imu_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0_left_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0_left_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0_model_origin:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        camera0_rgb_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0_rgb_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0_right_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera0_right_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1/alignment_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1/connection_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1/sensor_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1_imu_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1_left_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1_left_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1_model_origin:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        camera1_rgb_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1_rgb_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1_right_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera1_right_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2/alignment_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2/connection_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2/sensor_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2_imu_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2_left_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2_left_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2_model_origin:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        camera2_rgb_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2_rgb_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2_right_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera2_right_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3/alignment_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3/connection_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3/sensor_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3_imu_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3_left_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3_left_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3_model_origin:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        camera3_rgb_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3_rgb_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3_right_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera3_right_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera4/connection_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera4_cam_e_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera4_cam_e_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera4_model_origin:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        camera4_rgb_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        camera4_rgb_camera_optical_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        chassis_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        lidar0/alignment_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        lidar0/connection_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        lidar0/imu_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        lidar0/lidar_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        lidar0/sensor_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        mounting_plate_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+      Mass Properties:
+        Inertia: false
+        Mass: false
+      Name: RobotModel
+      TF Prefix: ""
+      Update Interval: 0
+      Value: true
+      Visual Enabled: true
   Enabled: true
   Global Options:
     Background Color: 0; 0; 0
-    Fixed Frame: odom
+    Fixed Frame: base_footprint
     Frame Rate: 10
   Name: root
   Tools:
@@ -276,39 +748,39 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 160.71255493164062
+      Distance: 11.567721366882324
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.27047592401504517
-        Y: 3.6578409671783447
-        Z: -0.02397032640874386
+        X: 0.19880931079387665
+        Y: 3.847895383834839
+        Z: 1.3245469331741333
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.31979742646217346
+      Pitch: -0.005202745087444782
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 2.845567464828491
+      Yaw: 3.780571937561035
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1011
+  Height: 2056
   Hide Left Dock: false
   Hide Right Dock: true
-  QMainWindow State: 000000ff00000000fd0000000400000000000001b600000395fc020000000cfb0000001200530065006c0065006300740069006f006e00000001e10000009b0000005d00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000005fb0000039500000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c006100790073010000003f00000395000000cc00fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261fb0000000a0049006d0061006700650000000383000000d00000000000000000fb0000000a0049006d0061006700650000000383000000d00000000000000000fb0000000c00430061006d0065007200610000000383000000d00000000000000000fb0000000a0049006d0061006700650100000436000000d700000000000000000000000100000134000003ecfc0200000003fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000000a00560069006500770073000000003d000003ec000000a900fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e10000019700000003000004420000003efc0100000002fb0000000800540069006d00650100000000000004420000000000000000fb0000000800540069006d00650100000000000004500000000000000000000003e40000039500000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000400000000000001b600000794fc020000000cfb0000001200530065006c0065006300740069006f006e00000001e10000009b0000008200fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000005fb0000039500000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c0061007900730100000052000007940000011e00fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261fb0000000a0049006d0061006700650000000383000000d00000000000000000fb0000000a0049006d0061006700650000000383000000d00000000000000000fb0000000c00430061006d0065007200610000000383000000d00000000000000000fb0000000a0049006d0061006700650100000436000000d700000000000000000000000100000134000003ecfc0200000003fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000000a00560069006500770073000000003d000003ec000000e000fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e10000019700000003000004420000003efc0100000002fb0000000800540069006d00650100000000000004420000000000000000fb0000000800540069006d0065010000000000000450000000000000000000000d410000079400000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Selection:
     collapsed: false
   Tool Properties:
     collapsed: false
   Views:
     collapsed: true
-  Width: 1440
-  X: 480
-  Y: 32
+  Width: 3840
+  X: 0
+  Y: 1080

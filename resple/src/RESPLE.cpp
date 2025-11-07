@@ -11,6 +11,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -35,6 +36,8 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
+#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "livox_interfaces/msg/custom_msg.hpp"
 #include "livox_ros_driver/msg/custom_msg.hpp"
 #include "livox_ros_driver2/msg/custom_msg.hpp"
@@ -104,7 +107,7 @@ public:
         // Create publishers (inactive until activated)
         pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
         pub_start_time = this->create_publisher<std_msgs::msg::Int64>("start_time", rclcpp::QoS(50).reliable());
-        pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", rclcpp::QoS(50).reliable());
+        pub_pose = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("pose", rclcpp::QoS(50).reliable());
         pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -356,10 +359,10 @@ public:
                     Eigen::Quaterniond q_pose;
                     spline->itpQuaternion(pose_time_ns, &q_pose);
 
-                    geometry_msgs::msg::PoseStamped pose_msg;
+                    geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
                     pose_msg.header.stamp = rclcpp::Time(pose_time_ns);
                     pose_msg.header.frame_id = odom_id;
-                    pose_msg.pose = CommonUtils::pose2msg(t_pose, q_pose);
+                    pose_msg.pose.pose = CommonUtils::pose2msg(t_pose, q_pose);
                     pub_pose->publish(pose_msg);
                     // --- POSESTAMPED PUBLISHING END ---
                 }
@@ -427,7 +430,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_livox_mid360_boxi;
     rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan;
     rclcpp_lifecycle::LifecyclePublisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
-    rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
+    rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_pose;
     rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -587,9 +590,9 @@ private:
     void readParameters()
     {
         // Frame ID parameters
-        frame_id = CommonUtils::readParam<std::string>(*this, "frame_id", "base_link");
+        frame_id = CommonUtils::readParam<std::string>(*this, "frame_id", "base_footprint");
         odom_id = CommonUtils::readParam<std::string>(*this, "odom_frame_id", "odom");
-        body_frame_id = CommonUtils::readParam<std::string>(*this, "body_frame_id", "base_link");
+        body_frame_id = CommonUtils::readParam<std::string>(*this, "body_frame_id", "base_footprint");
         footprint_frame_id = CommonUtils::readParam<std::string>(*this, "footprint_frame_id", "base_footprint");
         
         RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s, footprint: %s", 

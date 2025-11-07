@@ -9,6 +9,10 @@
 #include <cmath>
 #include <tf2/convert.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -16,7 +20,6 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
-#include <tf2_ros/transform_broadcaster.h>
 #include <rclcpp/service.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
@@ -40,9 +43,9 @@ class MappingBase
                 rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr) : lidar(lidar_config)
     {
         // Read frame ID parameters
-        frame_id = CommonUtils::readParam<std::string>(nh, "frame_id", "base_link");
+        frame_id = CommonUtils::readParam<std::string>(nh, "frame_id", "base_footprint");
         odom_id = CommonUtils::readParam<std::string>(nh, "odom_frame_id", "odom");
-        body_frame_id = CommonUtils::readParam<std::string>(nh, "body_frame_id", "base_link");
+        body_frame_id = CommonUtils::readParam<std::string>(nh, "body_frame_id", "base_footprint");
         footprint_frame_id = CommonUtils::readParam<std::string>(nh, "footprint_frame_id", "base_footprint");
         
         // Phase 2: Explicit QoS profile for visualization (reliable for RViz compatibility)
@@ -144,7 +147,8 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
   public:
   OusterBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config, 
              rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr) 
-      : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
+      : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb),
+        node_handle_(nh)
     {
         // Phase 2: QoS profile and callback group
         auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
@@ -156,16 +160,52 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
         double lidar_time_offset = CommonUtils::readParam<double>(nh, "lidar_time_offset", 0.0);
         time_offset = 1e9*lidar_time_offset;
         
+        // Initialize TF buffer and listener
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(nh->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        have_lidar_transform_ = false;
+        
         // Phase 3: Pre-allocate reusable buffer
         pc_ouster_reusable_.reset(new pcl::PointCloud<ouster_ros::Point>());
     }
 
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
     {
+        // Lookup LiDAR transform if not yet initialized
+        if (!have_lidar_transform_) {
+            try {
+                if (tf_buffer_->canTransform(this->body_frame_id, ouster_msg_in->header.frame_id, 
+                                            rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
+                    lidar_to_baselink_ = tf_buffer_->lookupTransform(this->body_frame_id, ouster_msg_in->header.frame_id, 
+                                                                     rclcpp::Time(0));
+                    have_lidar_transform_ = true;
+                    RCLCPP_INFO(node_handle_->get_logger(), "[Mapping] Got LiDAR transform: %s -> %s", 
+                               ouster_msg_in->header.frame_id.c_str(), this->body_frame_id.c_str());
+                } else {
+                    RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000, 
+                                        "[Mapping] Waiting for LiDAR transform: %s -> %s", 
+                                        ouster_msg_in->header.frame_id.c_str(), this->body_frame_id.c_str());
+                    return;
+                }
+            } catch (tf2::TransformException& ex) {
+                RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000, 
+                                    "[Mapping] LiDAR transform exception: %s", ex.what());
+                return;
+            }
+        }
+        
+        // Transform point cloud to body frame
+        sensor_msgs::msg::PointCloud2::SharedPtr transformed_msg(new sensor_msgs::msg::PointCloud2());
+        if (have_lidar_transform_) {
+            tf2::doTransform(*ouster_msg_in, *transformed_msg, lidar_to_baselink_);
+        } else {
+            transformed_msg = ouster_msg_in;
+        }
+        
         this->pc_last->clear();
         // Phase 3: Use pre-allocated buffer instead of repeated allocation
         pc_ouster_reusable_->clear();
-        pcl::fromROSMsg(*ouster_msg_in, *pc_ouster_reusable_);
+        pcl::fromROSMsg(*transformed_msg, *pc_ouster_reusable_);
         size_t plsize = pc_ouster_reusable_->size();
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
@@ -201,6 +241,13 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
     int64_t time_offset = 0;
     // Phase 3: Pre-allocated reusable buffer
     pcl::PointCloud<ouster_ros::Point>::Ptr pc_ouster_reusable_;
+    
+    // TF transformation
+    rclcpp::Node::SharedPtr node_handle_;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    bool have_lidar_transform_;
+    geometry_msgs::msg::TransformStamped lidar_to_baselink_;
 };
 
 class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
@@ -512,9 +559,9 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         RCLCPP_INFO(this->get_logger(), "Configuring Mapping...");
         
         // Read frame ID parameters
-        frame_id = CommonUtils::readParam<std::string>(*this, "frame_id", "base_link");
+        frame_id = CommonUtils::readParam<std::string>(*this, "frame_id", "base_footprint");
         odom_id = CommonUtils::readParam<std::string>(*this, "odom_frame_id", "odom");
-        body_frame_id = CommonUtils::readParam<std::string>(*this, "body_frame_id", "base_link");
+        body_frame_id = CommonUtils::readParam<std::string>(*this, "body_frame_id", "base_footprint");
         footprint_frame_id = CommonUtils::readParam<std::string>(*this, "footprint_frame_id", "base_footprint");
         
         RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s, footprint: %s", 
