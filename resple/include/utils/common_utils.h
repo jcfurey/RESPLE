@@ -6,6 +6,8 @@
 #include <fstream>
 #include <filesystem>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/point32.hpp>
 #include <omp.h>
 
@@ -256,7 +258,8 @@ public:
 
     static bool time_list(pcl::PointXYZINormal &x, pcl::PointXYZINormal &y) {return (x.intensity < y.intensity);};
 
-    static geometry_msgs::msg::PoseStamped pose2msg(const int64_t t, const Eigen::Vector3d& pos,
+    // Create PoseStamped for path messages (nav_msgs::msg::Path)
+    static geometry_msgs::msg::PoseStamped poseStamped2msg(const int64_t t, const Eigen::Vector3d& pos,
                                               const Eigen::Quaterniond& orient)
     {
         geometry_msgs::msg::PoseStamped msg;
@@ -268,6 +271,24 @@ public:
         msg.pose.orientation.x = orient.x();
         msg.pose.orientation.y = orient.y();
         msg.pose.orientation.z = orient.z();
+        return msg;
+    }
+
+    // Create PoseWithCovarianceStamped for pose topics (for Nav2 compatibility)
+    static geometry_msgs::msg::PoseWithCovarianceStamped pose2msg(const int64_t t, const Eigen::Vector3d& pos,
+                                              const Eigen::Quaterniond& orient)
+    {
+        geometry_msgs::msg::PoseWithCovarianceStamped msg;
+        msg.header.stamp = rclcpp::Time(t);
+        msg.pose.pose.position.x = pos.x();
+        msg.pose.pose.position.y = pos.y();
+        msg.pose.pose.position.z = pos.z();
+        msg.pose.pose.orientation.w = orient.w();
+        msg.pose.pose.orientation.x = orient.x();
+        msg.pose.pose.orientation.y = orient.y();
+        msg.pose.pose.orientation.z = orient.z();
+        // Zero covariance (unknown)
+        std::fill(msg.pose.covariance.begin(), msg.pose.covariance.end(), 0.0);
         return msg;
     }
 

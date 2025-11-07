@@ -16,6 +16,8 @@
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <std_msgs/msg/int64.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -767,25 +769,29 @@ private:
             return;
         }
         nav_msgs::msg::Odometry odom_msg;
-        geometry_msgs::msg::PoseStamped odom_pose = opt_old_path.poses.back();
+        geometry_msgs::msg::PoseStamped path_pose = opt_old_path.poses.back();
         
         // Use the latest spline time for better sync with current_scan
         rclcpp::Time current_time = rclcpp::Time(spline_global.maxTimeNs());
         
-        // Interpolate pose at current time if different from last path pose
-        int64_t pose_stamp_ns = rclcpp::Time(odom_pose.header.stamp).nanoseconds();
+        // Get current pose (interpolate if needed)
+        geometry_msgs::msg::Pose current_pose;
+        int64_t pose_stamp_ns = rclcpp::Time(path_pose.header.stamp).nanoseconds();
         if (std::abs(spline_global.maxTimeNs() - pose_stamp_ns) > 1000000) {  // > 1ms
             Eigen::Vector3d t_current = spline_global.itpPosition(spline_global.maxTimeNs());
             Eigen::Quaterniond q_current;
             spline_global.itpQuaternion(spline_global.maxTimeNs(), &q_current);
-            odom_pose.pose = CommonUtils::pose2msg(t_current, q_current);
-            odom_pose.header.stamp = current_time;
+            current_pose = CommonUtils::pose2msg(t_current, q_current);
+        } else {
+            current_pose = path_pose.pose;
         }
         
         odom_msg.header.stamp = current_time;
         odom_msg.header.frame_id = odom_id;
         odom_msg.child_frame_id = footprint_frame_id;  // Odometry references footprint
-        odom_msg.pose.pose = odom_pose.pose;
+        odom_msg.pose.pose = current_pose;
+        // Zero covariance
+        std::fill(odom_msg.pose.covariance.begin(), odom_msg.pose.covariance.end(), 0.0);
         pub_odom->publish(odom_msg);
         
         geometry_msgs::msg::TransformStamped transformStamped;
@@ -797,15 +803,15 @@ private:
             transformStamped.child_frame_id = footprint_frame_id;
             
             // Project position to ground plane
-            transformStamped.transform.translation.x = odom_pose.pose.position.x;
-            transformStamped.transform.translation.y = odom_pose.pose.position.y;
+            transformStamped.transform.translation.x = current_pose.position.x;
+            transformStamped.transform.translation.y = current_pose.position.y;
             transformStamped.transform.translation.z = 0.0;  // Ground plane
             
             // Extract yaw from quaternion and create yaw-only rotation
-            double qw = odom_pose.pose.orientation.w;
-            double qx = odom_pose.pose.orientation.x;
-            double qy = odom_pose.pose.orientation.y;
-            double qz = odom_pose.pose.orientation.z;
+            double qw = current_pose.orientation.w;
+            double qx = current_pose.orientation.x;
+            double qy = current_pose.orientation.y;
+            double qz = current_pose.orientation.z;
             double yaw = std::atan2(2.0 * (qw*qz + qx*qy), 1.0 - 2.0 * (qy*qy + qz*qz));
             
             transformStamped.transform.rotation.w = std::cos(yaw / 2.0);
@@ -822,7 +828,7 @@ private:
             // Offset is the height and orientation relative to footprint
             transformStamped.transform.translation.x = 0.0;
             transformStamped.transform.translation.y = 0.0;
-            transformStamped.transform.translation.z = odom_pose.pose.position.z;  // Height above ground
+            transformStamped.transform.translation.z = current_pose.position.z;  // Height above ground
             
             // Rotation is the roll/pitch component (yaw already in footprint)
             // Divide out yaw to get roll/pitch only
@@ -840,10 +846,10 @@ private:
             transformStamped.header.stamp = odom_msg.header.stamp;
             transformStamped.header.frame_id = odom_id;
             transformStamped.child_frame_id = body_frame_id;
-            transformStamped.transform.translation.x = odom_pose.pose.position.x;
-            transformStamped.transform.translation.y = odom_pose.pose.position.y;
-            transformStamped.transform.translation.z = odom_pose.pose.position.z;
-            transformStamped.transform.rotation = odom_pose.pose.orientation;
+            transformStamped.transform.translation.x = current_pose.position.x;
+            transformStamped.transform.translation.y = current_pose.position.y;
+            transformStamped.transform.translation.z = current_pose.position.z;
+            transformStamped.transform.rotation = current_pose.orientation;
             br->sendTransform(transformStamped);
         }
         
@@ -890,7 +896,7 @@ private:
             Eigen::Quaterniond orient_interp;
             Eigen::Vector3d t_interp = spline_global.itpPosition(t_ns);
             spline_global.itpQuaternion(t_ns, &orient_interp);
-            opt_old_path.poses.push_back(CommonUtils::pose2msg(t_ns, t_interp, orient_interp));
+            opt_old_path.poses.push_back(CommonUtils::poseStamped2msg(t_ns, t_interp, orient_interp));
             t_ns += 1e8;
         }
         opt_old_path.header.frame_id = odom_id;

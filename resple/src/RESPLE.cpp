@@ -36,8 +36,6 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
-#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "livox_interfaces/msg/custom_msg.hpp"
 #include "livox_ros_driver/msg/custom_msg.hpp"
 #include "livox_ros_driver2/msg/custom_msg.hpp"
@@ -107,7 +105,9 @@ public:
         // Create publishers (inactive until activated)
         pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
         pub_start_time = this->create_publisher<std_msgs::msg::Int64>("start_time", rclcpp::QoS(50).reliable());
-        pub_pose = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("pose", rclcpp::QoS(50).reliable());
+        // Use transient_local durability for pose to match Nav2 expectations and ensure late subscribers get last pose
+        pub_pose = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+            "pose", rclcpp::QoS(1).transient_local().reliable());
         pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -353,18 +353,16 @@ public:
                     pub_est->publish(est_msg);
                     max_spl_knots = spline->numKnots();
 
-                    // --- POSESTAMPED PUBLISHING START ---
+                    // Publish current pose with covariance
                     int64_t pose_time_ns = spline->maxTimeNs();
                     Eigen::Vector3d t_pose = spline->itpPosition(pose_time_ns);
                     Eigen::Quaterniond q_pose;
                     spline->itpQuaternion(pose_time_ns, &q_pose);
 
-                    geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
-                    pose_msg.header.stamp = rclcpp::Time(pose_time_ns);
+                    geometry_msgs::msg::PoseWithCovarianceStamped pose_msg = 
+                        CommonUtils::pose2msg(pose_time_ns, t_pose, q_pose);
                     pose_msg.header.frame_id = odom_id;
-                    pose_msg.pose.pose = CommonUtils::pose2msg(t_pose, q_pose);
                     pub_pose->publish(pose_msg);
-                    // --- POSESTAMPED PUBLISHING END ---
                 }
                 if (max_time_ns >= t_last_map_upd + 1e8) {
                     mapIncremental();
@@ -1148,12 +1146,12 @@ private:
             laser_cloud_world_reusable_->points[i].intensity = pc_world.points[i].curvature;
         }
         
-        // Use loaned message to avoid DDS serialization copy (Phase 3 optimization)
-        auto loaned_msg = pub_cur_scan->borrow_loaned_message();
-        pcl::toROSMsg(*laser_cloud_world_reusable_, loaned_msg.get());
-        loaned_msg.get().header.stamp = rclcpp::Time(spline->maxTimeNs());
-        loaned_msg.get().header.frame_id = odom_id;
-        pub_cur_scan->publish(std::move(loaned_msg));
+        // Standard publishing (compatible with all RMW implementations)
+        sensor_msgs::msg::PointCloud2 cloud_msg;
+        pcl::toROSMsg(*laser_cloud_world_reusable_, cloud_msg);
+        cloud_msg.header.stamp = rclcpp::Time(spline->maxTimeNs());
+        cloud_msg.header.frame_id = odom_id;
+        pub_cur_scan->publish(cloud_msg);
     }
 
     bool initialization()
