@@ -495,6 +495,10 @@ private:
     Parameters param;
     int64_t dt_ns;
     int num_points_upd;
+    
+    // IMU initialization parameters
+    int imu_init_num_samples_ = 50;
+    double imu_init_max_variance_ = 5.0;
 
     
     // Phase 4: SaveMap action server handlers
@@ -658,6 +662,19 @@ private:
         laser_cloud_world_reusable_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         double lidar_time_offset = CommonUtils::readParam<double>(*this, "lidar_time_offset", 0.0);
         time_offset = 1e9*lidar_time_offset;
+        
+        // Read IMU initialization parameters
+        imu_init_num_samples_ = CommonUtils::readParam<int>(*this, "imu_init_num_samples", 50);
+        imu_init_max_variance_ = CommonUtils::readParam<double>(*this, "imu_init_max_variance", 5.0);
+        if (imu_init_num_samples_ < 10) {
+            RCLCPP_WARN(this->get_logger(),
+                "imu_init_num_samples value %d is very low, using minimum of 10",
+                imu_init_num_samples_);
+            imu_init_num_samples_ = 10;
+        }
+        RCLCPP_INFO(this->get_logger(),
+            "IMU initialization: samples=%d, max_variance=%.2f",
+            imu_init_num_samples_, imu_init_max_variance_);
     }
 
     void initFilter(int64_t start_t_ns, Eigen::Vector3d t_init = Eigen::Vector3d::Zero(), Eigen::Quaterniond q_init = Eigen::Quaterniond::Identity())
@@ -1156,25 +1173,61 @@ private:
         if (!if_init_filter) {
             Eigen::Quaterniond q_WI = Eigen::Quaterniond::Identity();
             if (!if_lidar_only) {
-                Eigen::Vector3d gravity_sum(0, 0, 0);
                 m_buff.lock();
                 int buff_size = imu_buff.size();
-                int n_imu = std::min(15, buff_size);
+                
+                // Wait for sufficient IMU samples
+                if (buff_size < imu_init_num_samples_) {
+                    m_buff.unlock();
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                        "Waiting for %d IMU samples for initialization (current: %d)",
+                        imu_init_num_samples_, buff_size);
+                    return false;
+                }
+                
+                // Compute mean and variance of accelerometer readings
+                Eigen::Vector3d gravity_sum(0, 0, 0);
+                int n_imu = std::min(imu_init_num_samples_, buff_size);
                 for (int i = 0; i < n_imu; i++) {
                     gravity_sum += imu_buff.at(i).accel;
                 }
+                Eigen::Vector3d gravity_mean = gravity_sum / n_imu;
+                
+                // Check variance to ensure IMU is stationary
+                double accel_variance = 0.0;
+                for (int i = 0; i < n_imu; i++) {
+                    Eigen::Vector3d diff = imu_buff.at(i).accel - gravity_mean;
+                    accel_variance += diff.squaredNorm();
+                }
+                accel_variance /= n_imu;
+                
+                if (accel_variance > imu_init_max_variance_) {
+                    m_buff.unlock();
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                        "IMU readings too noisy for initialization (variance: %.4f > %.4f). "
+                        "Ensure robot is stationary or increase imu_init_max_variance parameter.",
+                        accel_variance, imu_init_max_variance_);
+                    return false;
+                }
+                
+                // Clean up old IMU data
                 while (!imu_buff.empty() && imu_buff.front().time_ns < start_t_ns) {
                     imu_buff.pop_front();
                 }
                 m_buff.unlock();
-                gravity_sum /= n_imu;
-                Eigen::Vector3d gravity_ave = gravity_sum.normalized() * 9.81;
+                
+                // Initialize orientation from gravity
+                Eigen::Vector3d gravity_ave = gravity_mean.normalized() * 9.81;
                 Eigen::Matrix3d R0 = CommonUtils::g2R(gravity_ave);
                 double yaw = CommonUtils::R2ypr(R0).x();
                 R0 = CommonUtils::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
                 Eigen::Quaterniond q0(R0);
                 q_WI = Quater::positify(q0);
                 gravity = q_WI * gravity_ave;
+                
+                RCLCPP_INFO(this->get_logger(),
+                    "IMU initialization successful (samples: %d, variance: %.4f)",
+                    n_imu, accel_variance);
             }
             initFilter(start_t_ns, Eigen::Vector3d(0, 0, 0), q_WI);
             if_init_filter = true;
