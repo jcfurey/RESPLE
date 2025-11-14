@@ -700,7 +700,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     }
 
     void process() {
-        rclcpp::Rate rate(20);
+        rclcpp::Rate rate(10);
         int64_t num_knot = 0;
         while (processing_active_ && rclcpp::ok()) {
             if (if_init_succeed && spline_global.numKnots() > num_knot) {
