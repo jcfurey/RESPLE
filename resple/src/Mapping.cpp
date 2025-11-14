@@ -1,37 +1,45 @@
-#include <pcl_conversions/pcl_conversions.h>
-#include <pcl/io/pcd_io.h>
-#include <pcl/features/normal_3d.h>
-#include <pcl/filters/voxel_grid.h>
 #include <thread>
 #include <iostream>
 #include <queue>
 #include <string>
 #include <cmath>
+#include <atomic>
+
+#include <rclcpp/qos.hpp>
+#include <rclcpp/service.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/common/transforms.h>
+
+#include <Eigen/src/Geometry/Transform.h>
 #include <tf2/convert.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.hpp>
 #include <tf2_ros/buffer.hpp>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
+
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/path.hpp>
-#include <geometry_msgs/msg/transform_stamped.hpp>
-#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <std_msgs/msg/int64.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
-#include <rclcpp/service.hpp>
 #include <std_srvs/srv/empty.hpp>
-#include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <lifecycle_msgs/msg/transition.hpp>
-#include <atomic>
 #include "livox_ros_driver/msg/custom_msg.hpp"
 #include "livox_ros_driver2/msg/custom_msg.hpp"
 #include "livox_interfaces/msg/custom_msg.hpp"
 #include "estimate_msgs/msg/calib.hpp"
 #include "estimate_msgs/msg/estimate.hpp"
+
 #include "SplineState.h"
 
 template<typename PointType>
@@ -42,21 +50,44 @@ class MappingBase
     std::mutex mtx;
     LidarConfig lidar;
     MappingBase(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config, 
-                rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr) : lidar(lidar_config)
+                rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr) 
+                : lidar(lidar_config)
+                , node_handle_(nh)
+                , lidar_qos(rclcpp::SensorDataQoS().keep_last(100).best_effort())
     {
+        if (sensor_cb) sub_opt.callback_group = sensor_cb;
+
         // Read frame ID parameters
-        frame_id = CommonUtils::readParam<std::string>(nh, "frame_id", "base_footprint");
-        odom_id = CommonUtils::readParam<std::string>(nh, "odom_frame_id", "odom");
-        body_frame_id = CommonUtils::readParam<std::string>(nh, "body_frame_id", "base_footprint");
-        footprint_frame_id = CommonUtils::readParam<std::string>(nh, "footprint_frame_id", "base_footprint");
-        
-        // Phase 2: Explicit QoS profile for visualization (reliable for RViz compatibility)
+        frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
+        odom_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "odom_frame_id", "odom");
+
+        RCLCPP_INFO(nh->get_logger(), "Frame IDs - odom: %s, body: %s", 
+                    odom_id.c_str(), frame_id.c_str());        
+
+        // Initialize TF buffer and listener
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(nh->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        have_lidar_transform_ = false;
+        have_imu_transform_ = false;
+        lidar_to_baselink_ = Eigen::Affine3d::Identity();
+        imu_to_baselink_ = Eigen::Affine3d::Identity();
+
         pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("global_map", 
-            rclcpp::QoS(2).reliable());
+            rclcpp::QoS(2).best_effort());
         ds_filter_each_scan.setLeafSize(0.2, 0.2, 0.2);
         pc_last.reset(new typename pcl::PointCloud<PointType>());
         pc_last_ds.reset(new typename pcl::PointCloud<PointType>());
         pc.reset(new typename pcl::PointCloud<PointType>());
+    }
+
+    Eigen::Affine3d getLidarToBaselink()
+    {
+        return lidar_to_baselink_;
+    }
+
+    Eigen::Affine3d getImuToBaselink()
+    {
+        return imu_to_baselink_;
     }
 
     void processScan(SplineState* spl, const int64_t spl_window_st_ns)
@@ -85,11 +116,43 @@ class MappingBase
     void publishMap(const typename pcl::PointCloud<PointType>::Ptr& pcs,
                          const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher) const
     {
-        // Note: Loaned messages not used here due to compatibility with PCL toROSMsg
         sensor_msgs::msg::PointCloud2 msgs;
         pcl::toROSMsg(*pcs, msgs);
         msgs.header.frame_id = odom_id;
         publisher->publish(msgs);
+    }
+
+    bool updateTransform(std::string source_frame_id)
+    {
+        if (!have_lidar_transform_) {
+            try {
+                geometry_msgs::msg::TransformStamped transform; 
+                if (tf_buffer_->canTransform(this->frame_id, source_frame_id, 
+                                                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
+                        transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id, 
+                                                                        rclcpp::Time(0));
+                        lidar_to_baselink_ = tf2::transformToEigen(transform);
+                        have_lidar_transform_ = true;
+                        Eigen::Translation3d translation(lidar.t_lb);
+                        Eigen::Affine3d imu_to_lidar = translation * lidar.q_lb;
+                        imu_to_baselink_ = lidar_to_baselink_ * imu_to_lidar;
+                        have_imu_transform_ = true;                        
+                        RCLCPP_INFO(node_handle_->get_logger(), "[Mapping] Got LiDAR transform: %s -> %s", 
+                                source_frame_id.c_str(), this->frame_id.c_str());
+                    } else {
+                        RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000, 
+                                            "[Mapping] Waiting for LiDAR transform: %s -> %s", 
+                                            source_frame_id.c_str(), this->frame_id.c_str());
+                        return false;
+                    }
+            } catch (tf2::TransformException& ex) {
+                RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000, 
+                                    "[Mapping] LiDAR transform exception: %s", ex.what());
+                return false;
+            }
+        }
+
+        return true;
     }
 
   private:
@@ -119,7 +182,7 @@ class MappingBase
         int64_t time_begin = rclcpp::Time(pc_in.header.stamp).nanoseconds();
         pc->clear();
         pc_out->points.resize(pc_in.size());
-        // Phase 3: Parallelize point transformation (conservative 5 threads)
+        // Parallelize point transformation (conservative 5 threads)
         #pragma omp parallel for num_threads(5)
         for (size_t i = 0; i < pc_in.size(); i++) {
             const PointType& pt = pc_in.points[i];
@@ -131,16 +194,25 @@ class MappingBase
     }
 
   protected:
+    rclcpp::QoS lidar_qos;
+    rclcpp::SubscriptionOptions sub_opt;    
     Eigen::aligned_deque<typename pcl::PointCloud<PointType>> pc_L_buff;
     typename pcl::PointCloud<PointType>::Ptr pc_last;
     typename pcl::PointCloud<PointType>::Ptr pc_last_ds;
     pcl::VoxelGrid<pcl::PointXYZINormal> ds_filter_each_scan;
-    std::string frame_id;
-    std::string odom_id;
-    std::string body_frame_id;
-    std::string footprint_frame_id;
-    typename pcl::PointCloud<PointType>::Ptr pc;
+    std::string frame_id = "base_link";
+    std::string odom_id = "odom";
+    
+    // TF transformation
+    rclcpp::Node::SharedPtr node_handle_;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    bool have_lidar_transform_;
+    bool have_imu_transform_;
+    Eigen::Affine3d lidar_to_baselink_;
+    Eigen::Affine3d imu_to_baselink_;
 
+    typename pcl::PointCloud<PointType>::Ptr pc;
 };
 
 
@@ -149,75 +221,32 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
   public:
   OusterBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config, 
              rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr) 
-      : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb),
-        node_handle_(nh)
+      : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
-        // Phase 2: QoS profile and callback group
-        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
-        rclcpp::SubscriptionOptions sub_opt;
-        if (sensor_cb) sub_opt.callback_group = sensor_cb;
-        
         pc_subscription_ouster = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
             this->lidar.topic, lidar_qos, std::bind(&OusterBuff::ousterLidarCallback, this, std::placeholders::_1), sub_opt);
-        double lidar_time_offset = CommonUtils::readParam<double>(nh, "lidar_time_offset", 0.0);
+        double lidar_time_offset = CommonUtils::readParam<double>(nh->get_node_parameters_interface(), "lidar_time_offset", 0.0);
         time_offset = 1e9*lidar_time_offset;
-        
-        // Initialize TF buffer and listener
-        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(nh->get_clock());
-        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-        have_lidar_transform_ = false;
-        
-        // Phase 3: Pre-allocate reusable buffer
-        pc_ouster_reusable_.reset(new pcl::PointCloud<ouster_ros::Point>());
     }
 
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
     {
         // Lookup LiDAR transform if not yet initialized
-        if (!have_lidar_transform_) {
-            try {
-                if (tf_buffer_->canTransform(this->body_frame_id, ouster_msg_in->header.frame_id, 
-                                            rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
-                    lidar_to_baselink_ = tf_buffer_->lookupTransform(this->body_frame_id, ouster_msg_in->header.frame_id, 
-                                                                     rclcpp::Time(0));
-                    have_lidar_transform_ = true;
-                    RCLCPP_INFO(node_handle_->get_logger(), "[Mapping] Got LiDAR transform: %s -> %s", 
-                               ouster_msg_in->header.frame_id.c_str(), this->body_frame_id.c_str());
-                } else {
-                    RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000, 
-                                        "[Mapping] Waiting for LiDAR transform: %s -> %s", 
-                                        ouster_msg_in->header.frame_id.c_str(), this->body_frame_id.c_str());
-                    return;
-                }
-            } catch (tf2::TransformException& ex) {
-                RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000, 
-                                    "[Mapping] LiDAR transform exception: %s", ex.what());
-                return;
-            }
-        }
-        
-        // Transform point cloud to body frame
-        sensor_msgs::msg::PointCloud2::SharedPtr transformed_msg(new sensor_msgs::msg::PointCloud2());
-        if (have_lidar_transform_) {
-            tf2::doTransform(*ouster_msg_in, *transformed_msg, lidar_to_baselink_);
-        } else {
-            transformed_msg = ouster_msg_in;
-        }
+        if(!updateTransform(ouster_msg_in->header.frame_id)) return;
         
         this->pc_last->clear();
-        // Phase 3: Use pre-allocated buffer instead of repeated allocation
-        pc_ouster_reusable_->clear();
-        pcl::fromROSMsg(*transformed_msg, *pc_ouster_reusable_);
-        size_t plsize = pc_ouster_reusable_->size();
+        pcl::PointCloud<ouster_ros::Point>::Ptr pc_last_ouster(new pcl::PointCloud<ouster_ros::Point>());
+        pcl::fromROSMsg(*ouster_msg_in, *pc_last_ouster);
+        size_t plsize = pc_last_ouster->size();
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
         for (uint i = 1; i < plsize; i++) {
-            pt.x = pc_ouster_reusable_->points[i].x;
-            pt.y = pc_ouster_reusable_->points[i].y;
-            pt.z = pc_ouster_reusable_->points[i].z;
-            pt.intensity = float (pc_ouster_reusable_->points[i].t) / float (1e6); // unit: ms
-            pt.curvature = 0.1 * pc_ouster_reusable_->points[i].intensity;
+            pt.x = pc_last_ouster->points[i].x;
+            pt.y = pc_last_ouster->points[i].y;
+            pt.z = pc_last_ouster->points[i].z;
+            pt.intensity = float (pc_last_ouster->points[i].t) / float (1e6); // unit: ms
+            pt.curvature = 0.1 * pc_last_ouster->points[i].intensity;
 
             if (pt.intensity >= 0) {
                 this->pc_last->points.push_back(pt);
@@ -228,6 +257,10 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
+
+        // Transform point cloud to body frame
+        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
@@ -241,15 +274,6 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
   private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_ouster;
     int64_t time_offset = 0;
-    // Phase 3: Pre-allocated reusable buffer
-    pcl::PointCloud<ouster_ros::Point>::Ptr pc_ouster_reusable_;
-    
-    // TF transformation
-    rclcpp::Node::SharedPtr node_handle_;
-    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-    bool have_lidar_transform_;
-    geometry_msgs::msg::TransformStamped lidar_to_baselink_;
 };
 
 class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
@@ -259,17 +283,15 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
                 rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
       : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
-        // Phase 2: QoS profile and callback group
-        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
-        rclcpp::SubscriptionOptions sub_opt;
-        if (sensor_cb) sub_opt.callback_group = sensor_cb;
-        
         pc_subscription_livox = nh->create_subscription<livox_ros_driver::msg::CustomMsg>(
             this->lidar.topic, lidar_qos, std::bind(&Mid70AviaBuff::livoxLidarCallback, this, std::placeholders::_1), sub_opt);
     }
 
     void livoxLidarCallback(const livox_ros_driver::msg::CustomMsg::SharedPtr livox_msg_in)
     {
+        // Lookup LiDAR transform if not yet initialized
+        if(!updateTransform(livox_msg_in->header.frame_id)) return;
+        
         this->pc_last->clear();
         int plsize = livox_msg_in->point_num;
         if (plsize == 0) return;
@@ -290,6 +312,10 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
+ 
+        // Transform point cloud to body frame
+        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
@@ -311,17 +337,15 @@ public:
                rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
         : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
-        // Phase 2: QoS profile and callback group
-        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
-        rclcpp::SubscriptionOptions sub_opt;
-        if (sensor_cb) sub_opt.callback_group = sensor_cb;
-        
         pc_subscription_livox = nh->create_subscription<livox_ros_driver2::msg::CustomMsg>(
             this->lidar.topic, lidar_qos, std::bind(&HAP360Buff::livoxLidarCallback, this, std::placeholders::_1), sub_opt);
     }
 
     void livoxLidarCallback(livox_ros_driver2::msg::CustomMsg::SharedPtr livox_msg_in)
     {
+        // Lookup LiDAR transform if not yet initialized
+        if(!updateTransform(livox_msg_in->header.frame_id)) return;
+        
         this->pc_last->clear();
         int plsize = livox_msg_in->point_num;
         if (plsize == 0) return;
@@ -342,6 +366,10 @@ public:
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
+
+        // Transform point cloud to body frame
+        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
@@ -363,17 +391,15 @@ public:
                    rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
         : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
-        // Phase 2: QoS profile and callback group
-        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
-        rclcpp::SubscriptionOptions sub_opt;
-        if (sensor_cb) sub_opt.callback_group = sensor_cb;
-        
         pc_subscription_livox = nh->create_subscription<livox_interfaces::msg::CustomMsg>(
             this->lidar.topic, lidar_qos, std::bind(&AviaRespleBuff::livoxLidarCallback, this, std::placeholders::_1), sub_opt);
     }
 
     void livoxLidarCallback(livox_interfaces::msg::CustomMsg::SharedPtr livox_msg_in)
     {
+        // Lookup LiDAR transform if not yet initialized
+        if(!updateTransform(livox_msg_in->header.frame_id)) return;
+                
         this->pc_last->clear();
         int plsize = livox_msg_in->point_num;
         if (plsize == 0) return;
@@ -394,6 +420,10 @@ public:
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
+
+        // Transform point cloud to body frame
+        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
@@ -415,39 +445,33 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
             rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
       : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
-        // Phase 2: QoS profile and callback group
-        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
-        rclcpp::SubscriptionOptions sub_opt;
-        if (sensor_cb) sub_opt.callback_group = sensor_cb;
-        
         pc_subscription_hesai = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
             this->lidar.topic, lidar_qos, std::bind(&HesaiBuff::hesaiLidarCallback, this, std::placeholders::_1), sub_opt);
-        
-        // Phase 3: Pre-allocate reusable buffer
-        pc_hesai_reusable_.reset(new pcl::PointCloud<hesai_ros::Point>());
     }
 
     void hesaiLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr hesai_msg_in)
     {
+        // Lookup LiDAR transform if not yet initialized
+        if(!updateTransform(hesai_msg_in->header.frame_id)) return;
+                
         this->pc_last->clear();
-        // Phase 3: Use pre-allocated buffer
-        pc_hesai_reusable_->clear();
-        pcl::fromROSMsg(*hesai_msg_in, *pc_hesai_reusable_);
-        size_t plsize = pc_hesai_reusable_->size();
+        pcl::PointCloud<hesai_ros::Point>::Ptr pc_last_hesai(new pcl::PointCloud<hesai_ros::Point>());
+        pcl::fromROSMsg(*hesai_msg_in, *pc_last_hesai);
+        size_t plsize = pc_last_hesai->size();
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(hesai_msg_in->header.stamp);
         pcl::PointXYZINormal pt;
         for (uint i = 0; i < plsize; i++) {
-            pt.x = pc_hesai_reusable_->points[i].x;
-            pt.y = pc_hesai_reusable_->points[i].y;
-            pt.z = pc_hesai_reusable_->points[i].z;
+            pt.x = pc_last_hesai->points[i].x;
+            pt.y = pc_last_hesai->points[i].y;
+            pt.z = pc_last_hesai->points[i].z;
             double timestamp_s;
-            double timestamp_ns = std::modf(pc_hesai_reusable_->points[i].timestamp, &timestamp_s);
+            double timestamp_ns = std::modf(pc_last_hesai->points[i].timestamp, &timestamp_s);
             rclcpp::Time timestamp_ros(static_cast<int32_t>(timestamp_s), static_cast<int32_t>(timestamp_ns * 1.0e9),
                 rcl_clock_type_t::RCL_ROS_TIME);
             pt.intensity = (timestamp_ros - timestamp_begin).seconds() * 1.0e3;
-            pt.curvature = pc_hesai_reusable_->points[i].intensity;
+            pt.curvature = pc_last_hesai->points[i].intensity;
 
             if (pt.intensity >= 0) {
                 this->pc_last->points.push_back(pt);
@@ -458,6 +482,10 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
+
+        // Transform point cloud to body frame
+        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
@@ -470,8 +498,6 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
 
   private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_hesai;
-    // Phase 3: Pre-allocated reusable buffer
-    pcl::PointCloud<hesai_ros::Point>::Ptr pc_hesai_reusable_;
 };
 
 class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
@@ -481,37 +507,31 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
                  rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
       : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
     {
-        // Phase 2: QoS profile and callback group
-        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
-        rclcpp::SubscriptionOptions sub_opt;
-        if (sensor_cb) sub_opt.callback_group = sensor_cb;
-        
         pc_subscription_mid360 = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
             this->lidar.topic, lidar_qos, std::bind(&Mid360BoxiBuff::mid360BoxiCallback, this, std::placeholders::_1), sub_opt);
-        
-        // Phase 3: Pre-allocate reusable buffer
-        pc_mid360_reusable_.reset(new pcl::PointCloud<livox_mid360_boxi::Point>());
     }
 
     void mid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
     {
+        // Lookup LiDAR transform if not yet initialized
+        if(!updateTransform(livox_msg_in->header.frame_id)) return;
+        
         this->pc_last->clear();
-        // Phase 3: Use pre-allocated buffer
-        pc_mid360_reusable_->clear();
-        pcl::fromROSMsg(*livox_msg_in, *pc_mid360_reusable_);
-        size_t plsize = pc_mid360_reusable_->size();
+        pcl::PointCloud<livox_mid360_boxi::Point>::Ptr pc_last_livox(new pcl::PointCloud<livox_mid360_boxi::Point>());
+        pcl::fromROSMsg(*livox_msg_in, *pc_last_livox);
+        size_t plsize = pc_last_livox->size();
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(livox_msg_in->header.stamp);
         pcl::PointXYZINormal pt;
         for (uint i = 0; i < plsize; i++) {
-            pt.x = pc_mid360_reusable_->points[i].x;
-            pt.y = pc_mid360_reusable_->points[i].y;
-            pt.z = pc_mid360_reusable_->points[i].z;
-            rclcpp::Time timestamp_ros(static_cast<int64_t>(pc_mid360_reusable_->points[i].timestamp),
+            pt.x = pc_last_livox->points[i].x;
+            pt.y = pc_last_livox->points[i].y;
+            pt.z = pc_last_livox->points[i].z;
+            rclcpp::Time timestamp_ros(static_cast<int64_t>(pc_last_livox->points[i].timestamp),
                 rcl_clock_type_t::RCL_ROS_TIME);
             pt.intensity = (timestamp_ros - timestamp_begin).seconds() * 1.0e3;
-            pt.curvature = pc_mid360_reusable_->points[i].intensity;
+            pt.curvature = pc_last_livox->points[i].intensity;
 
             if (pt.intensity >= 0) {
                 this->pc_last->points.push_back(pt);
@@ -522,6 +542,10 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
+
+        // Transform point cloud to body frame
+        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
@@ -534,8 +558,6 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
 
   private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_mid360;
-    // Phase 3: Pre-allocated reusable buffer
-    pcl::PointCloud<livox_mid360_boxi::Point>::Ptr pc_mid360_reusable_;
 };
 
 class Mapping : public rclcpp_lifecycle::LifecycleNode
@@ -554,28 +576,28 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         opt_old_path.header.frame_id = odom_id;
     }
     
-    // Phase 4: Lifecycle callbacks
+    // Lifecycle callbacks
     rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
     on_configure(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Configuring Mapping...");
         
         // Read frame ID parameters
-        frame_id = CommonUtils::readParam<std::string>(*this, "frame_id", "base_footprint");
-        odom_id = CommonUtils::readParam<std::string>(*this, "odom_frame_id", "odom");
-        body_frame_id = CommonUtils::readParam<std::string>(*this, "body_frame_id", "base_footprint");
-        footprint_frame_id = CommonUtils::readParam<std::string>(*this, "footprint_frame_id", "base_footprint");
-        
-        RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s, footprint: %s", 
-                    odom_id.c_str(), body_frame_id.c_str(), footprint_frame_id.c_str());
-        
+        frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_link");
+        odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom_frame_id", "odom");
+
+        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf", true);
+    
+        std::vector<double> cov_var = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
+        cov_pose << cov_var.at(0), cov_var.at(1), cov_var.at(2), cov_var.at(3), cov_var.at(4), cov_var.at(5);        
+
         // Create publishers (inactive until activated)
-        auto reliable_qos = rclcpp::QoS(100).reliable();
-        pub_path = this->create_publisher<nav_msgs::msg::Path>("traj_path", reliable_qos);
+        pub_path = this->create_publisher<nav_msgs::msg::Path>("traj_path", 
+            rclcpp::QoS(20).best_effort());
         pub_knots = this->create_publisher<sensor_msgs::msg::PointCloud>("active_control_points", 
-            rclcpp::QoS(20).reliable());
+            rclcpp::QoS(20).best_effort());
         pub_odom = this->create_publisher<nav_msgs::msg::Odometry>("odometry", 
-            rclcpp::QoS(500).reliable());
+            rclcpp::QoS(500).best_effort());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
         
         RCLCPP_INFO(this->get_logger(), "Mapping configured successfully");
@@ -712,14 +734,14 @@ private:
     rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud>::SharedPtr pub_knots;
     rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr pub_path;
     
-    // Phase 4: Lifecycle management
+    // Lifecycle management
     std::atomic<bool> processing_active_;
     std::thread processing_thread_;
     std::vector<MappingBase<pcl::PointXYZINormal>*> vis_maps;
     std::string frame_id;
     std::string odom_id;
-    std::string body_frame_id;
-    std::string footprint_frame_id;
+    Eigen::Vector<double, 6> cov_pose;
+    bool publish_tf;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     bool if_init_succeed = false;
     std::mutex m_spline;
@@ -769,115 +791,72 @@ private:
             return;
         }
         nav_msgs::msg::Odometry odom_msg;
-        geometry_msgs::msg::PoseStamped path_pose = opt_old_path.poses.back();
+        geometry_msgs::msg::PoseStamped odom_pose = opt_old_path.poses.back();
         
         // Use the latest spline time for better sync with current_scan
-        rclcpp::Time current_time = rclcpp::Time(spline_global.maxTimeNs());
+        // rclcpp::Time current_time = rclcpp::Time(spline_global.maxTimeNs());
+        // odom_msg.header.stamp = current_time;
         
-        // Get current pose (interpolate if needed)
-        geometry_msgs::msg::Pose current_pose;
-        int64_t pose_stamp_ns = rclcpp::Time(path_pose.header.stamp).nanoseconds();
-        if (std::abs(spline_global.maxTimeNs() - pose_stamp_ns) > 1000000) {  // > 1ms
-            Eigen::Vector3d t_current = spline_global.itpPosition(spline_global.maxTimeNs());
-            Eigen::Quaterniond q_current;
-            spline_global.itpQuaternion(spline_global.maxTimeNs(), &q_current);
-            current_pose = CommonUtils::pose2msg(t_current, q_current);
-        } else {
-            current_pose = path_pose.pose;
-        }
-        
-        odom_msg.header.stamp = current_time;
+        odom_msg.header.stamp = rclcpp::Time(odom_pose.header.stamp);
         odom_msg.header.frame_id = odom_id;
-        odom_msg.child_frame_id = footprint_frame_id;  // Odometry references footprint
-        odom_msg.pose.pose = current_pose;
-        // Zero covariance
-        std::fill(odom_msg.pose.covariance.begin(), odom_msg.pose.covariance.end(), 0.0);
-        pub_odom->publish(odom_msg);
+        odom_msg.child_frame_id = frame_id;
+        odom_msg.pose.pose = odom_pose.pose;
         
-        geometry_msgs::msg::TransformStamped transformStamped;
+        // Covariance
+        odom_msg.pose.covariance[0]  =  cov_pose[0];
+        odom_msg.pose.covariance[7]  =  cov_pose[1];
+        odom_msg.pose.covariance[14] =  cov_pose[2];
+        odom_msg.pose.covariance[21] =  cov_pose[3];
+        odom_msg.pose.covariance[28] =  cov_pose[4];
+        odom_msg.pose.covariance[35] =  cov_pose[5];        
+        pub_odom->publish(odom_msg);      
         
-        // Publish odom -> base_footprint (ground-projected, yaw-only for navigation)
-        if (body_frame_id != footprint_frame_id) {
+        if(publish_tf)
+        {
+            geometry_msgs::msg::TransformStamped transformStamped;
             transformStamped.header.stamp = odom_msg.header.stamp;
             transformStamped.header.frame_id = odom_id;
-            transformStamped.child_frame_id = footprint_frame_id;
-            
-            // Project position to ground plane
-            transformStamped.transform.translation.x = current_pose.position.x;
-            transformStamped.transform.translation.y = current_pose.position.y;
-            transformStamped.transform.translation.z = 0.0;  // Ground plane
-            
-            // Extract yaw from quaternion and create yaw-only rotation
-            double qw = current_pose.orientation.w;
-            double qx = current_pose.orientation.x;
-            double qy = current_pose.orientation.y;
-            double qz = current_pose.orientation.z;
-            double yaw = std::atan2(2.0 * (qw*qz + qx*qy), 1.0 - 2.0 * (qy*qy + qz*qz));
-            
-            transformStamped.transform.rotation.w = std::cos(yaw / 2.0);
-            transformStamped.transform.rotation.x = 0;
-            transformStamped.transform.rotation.y = 0;
-            transformStamped.transform.rotation.z = std::sin(yaw / 2.0);
+            transformStamped.child_frame_id = frame_id;
+            transformStamped.transform.translation.x = odom_pose.pose.position.x;
+            transformStamped.transform.translation.y = odom_pose.pose.position.y;
+            transformStamped.transform.translation.z = odom_pose.pose.position.z;
+            transformStamped.transform.rotation = odom_pose.pose.orientation;
             br->sendTransform(transformStamped);
             
-            // Publish base_footprint -> base_link (full 6-DoF, elevation + roll/pitch)
+            // Publish base_link -> imu transform
             transformStamped.header.stamp = odom_msg.header.stamp;
-            transformStamped.header.frame_id = footprint_frame_id;
-            transformStamped.child_frame_id = body_frame_id;
-            
-            // Offset is the height and orientation relative to footprint
-            transformStamped.transform.translation.x = 0.0;
-            transformStamped.transform.translation.y = 0.0;
-            transformStamped.transform.translation.z = current_pose.position.z;  // Height above ground
-            
-            // Rotation is the roll/pitch component (yaw already in footprint)
-            // Divide out yaw to get roll/pitch only
-            Eigen::Quaterniond qfull(qw, qx, qy, qz);
-            Eigen::Quaterniond qyaw(std::cos(yaw / 2.0), 0, 0, std::sin(yaw / 2.0));
-            Eigen::Quaterniond qrollpitch = qyaw.inverse() * qfull;
-            
-            transformStamped.transform.rotation.w = qrollpitch.w();
-            transformStamped.transform.rotation.x = qrollpitch.x();
-            transformStamped.transform.rotation.y = qrollpitch.y();
-            transformStamped.transform.rotation.z = qrollpitch.z();
+            transformStamped.header.frame_id = frame_id;
+            transformStamped.child_frame_id = "imu";
+            Eigen::Affine3d imu_to_baselink = vis_maps[0]->getImuToBaselink();
+            Eigen::Vector3d t_imu(imu_to_baselink.inverse().translation());
+            transformStamped.transform.translation.x = t_imu.x();
+            transformStamped.transform.translation.y = t_imu.y();
+            transformStamped.transform.translation.z = t_imu.z();
+            Eigen::Matrix3d r_imu = imu_to_baselink.inverse().rotation();
+            Eigen::Quaterniond q_imu(r_imu);            
+            transformStamped.transform.rotation.w = q_imu.w();
+            transformStamped.transform.rotation.x = q_imu.x();
+            transformStamped.transform.rotation.y = q_imu.y();
+            transformStamped.transform.rotation.z = q_imu.z();
             br->sendTransform(transformStamped);
-        } else {
-            // If footprint == body, just publish odom -> body_frame
+
+            // Publish base_link -> lidar transform
             transformStamped.header.stamp = odom_msg.header.stamp;
-            transformStamped.header.frame_id = odom_id;
-            transformStamped.child_frame_id = body_frame_id;
-            transformStamped.transform.translation.x = current_pose.position.x;
-            transformStamped.transform.translation.y = current_pose.position.y;
-            transformStamped.transform.translation.z = current_pose.position.z;
-            transformStamped.transform.rotation = current_pose.orientation;
+            transformStamped.header.frame_id = frame_id;
+            transformStamped.child_frame_id = "lidar";
+            Eigen::Affine3d lidar_to_baselink = vis_maps[0]->getLidarToBaselink();
+            Eigen::Vector3d t_lidar(lidar_to_baselink.inverse().translation());            
+            transformStamped.transform.translation.x = t_lidar.x();
+            transformStamped.transform.translation.y = t_lidar.y();
+            transformStamped.transform.translation.z = t_lidar.z();
+            Eigen::Matrix3d r_lidar = lidar_to_baselink.inverse().rotation();            
+            Eigen::Quaterniond q_lidar(r_lidar);               
+            transformStamped.transform.rotation.w = q_lidar.w();
+            transformStamped.transform.rotation.x = q_lidar.x();
+            transformStamped.transform.rotation.y = q_lidar.y();
+            transformStamped.transform.rotation.z = q_lidar.z();
             br->sendTransform(transformStamped);
         }
-        
-        // Publish base_link -> imu transform (identity for now, could use extrinsics)
-        transformStamped.header.stamp = odom_msg.header.stamp;
-        transformStamped.header.frame_id = body_frame_id;
-        transformStamped.child_frame_id = "imu";
-        transformStamped.transform.translation.x = 0;
-        transformStamped.transform.translation.y = 0;
-        transformStamped.transform.translation.z = 0;
-        transformStamped.transform.rotation.w = 1;
-        transformStamped.transform.rotation.x = 0;
-        transformStamped.transform.rotation.y = 0;
-        transformStamped.transform.rotation.z = 0;
-        br->sendTransform(transformStamped);
-
-        // Publish base_link -> lidar transform (identity for now, could use extrinsics)
-        transformStamped.header.stamp = odom_msg.header.stamp;
-        transformStamped.header.frame_id = body_frame_id;
-        transformStamped.child_frame_id = "lidar";
-        transformStamped.transform.translation.x = 0;
-        transformStamped.transform.translation.y = 0;
-        transformStamped.transform.translation.z = 0;
-        transformStamped.transform.rotation.w = 1;
-        transformStamped.transform.rotation.x = 0;
-        transformStamped.transform.rotation.y = 0;
-        transformStamped.transform.rotation.z = 0;
-        br->sendTransform(transformStamped);
     }
 
     void startCallBack(const std_msgs::msg::Int64::SharedPtr start_time_msg)
@@ -896,7 +875,7 @@ private:
             Eigen::Quaterniond orient_interp;
             Eigen::Vector3d t_interp = spline_global.itpPosition(t_ns);
             spline_global.itpQuaternion(t_ns, &orient_interp);
-            opt_old_path.poses.push_back(CommonUtils::poseStamped2msg(t_ns, t_interp, orient_interp));
+            opt_old_path.poses.push_back(CommonUtils::pose2msg(t_ns, t_interp, orient_interp));
             t_ns += 1e8;
         }
         opt_old_path.header.frame_id = odom_id;
@@ -909,7 +888,7 @@ private:
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
     
-    // Phase 4: Create temporary node for parameter loading (use unique name)
+    // Create temporary node for parameter loading (use unique name)
     rclcpp::NodeOptions temp_options;
     temp_options.arguments({"--ros-args", "-r", "__node:=MappingInit"});
     auto temp_nh = rclcpp::Node::make_shared("MappingInit", temp_options);
@@ -918,13 +897,13 @@ int main(int argc, char** argv) {
     auto lidar_names = temp_nh->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
     assert(temp_nh->get_parameter({"lidars"}, lidar_names));
     if (lidar_names.empty()) {
-        lidars.emplace_back(temp_nh, "");
+        lidars.emplace_back(temp_nh->get_node_parameters_interface(), "");
     } else {
         for (const auto& lidar_name : lidar_names) {
-            lidars.emplace_back(temp_nh, lidar_name + ".");
+            lidars.emplace_back(temp_nh->get_node_parameters_interface(), lidar_name + ".");
         }
     }
-    // Phase 2: Create callback group for sensor processing
+    // Create callback group for sensor processing
     auto sensor_cb_group = temp_nh->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     
     std::vector<MappingBase<pcl::PointXYZINormal>*> buffs;
@@ -946,7 +925,7 @@ int main(int argc, char** argv) {
         }
     }
     
-    // Phase 4: Lifecycle node initialization
+    // Lifecycle node initialization
     rclcpp::NodeOptions options;
     auto node = std::make_shared<Mapping>(options, buffs);
     RCLCPP_INFO(node->get_logger(), "Mapping LifecycleNode created");

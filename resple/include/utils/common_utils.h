@@ -1,7 +1,6 @@
 #pragma once
 
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <eigen3/Eigen/Dense>
 #include <fstream>
 #include <filesystem>
@@ -30,7 +29,7 @@ struct ImuData {
 
     ImuData(const ImuData& other) : time_ns(other.time_ns), gyro(other.gyro), accel(other.accel),
     H(other.H), imu_itp(other.imu_itp) {
-    }
+    }          
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
@@ -50,7 +49,7 @@ namespace ouster_ros {
         uint32_t t;
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     }EIGEN_ALIGN16;
-}
+}  
 
 POINT_CLOUD_REGISTER_POINT_STRUCT(ouster_ros::Point,
     (float, x, x)
@@ -101,40 +100,26 @@ namespace livox_mid360_boxi {
 class CommonUtils
 {
 public:
-    // Overload for rclcpp::Node& (direct node reference)
     template <typename T>
-    static T readParam(rclcpp::Node& n, std::string name)
+    static T readParam(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_params, const std::string& name, const T& alternative)
     {
         T ans;
-        if (!n.has_parameter(name)) {
-            n.declare_parameter<T>(name);
+        if (!node_params->has_parameter(name)) {
+            rclcpp::ParameterValue default_parameter_value(alternative);  
+            rcl_interfaces::msg::ParameterDescriptor descriptor;          
+            node_params->declare_parameter(name, default_parameter_value, descriptor, false);
         }
-        if (!n.get_parameter(name, ans)) {
-            RCLCPP_FATAL_STREAM(n.get_logger(), "Failed to load " << name);
-            exit(1);
-        }
+        ans = node_params->get_parameter(name).get_parameter_value().get<T>();
         return ans;
     }
 
     template <typename T>
-    static T readParam(rclcpp::Node& n, std::string name, const T& alternative)
-    {
-        T ans;
-        if (!n.has_parameter(name)) {
-            n.declare_parameter<T>(name, alternative);
-        }
-        n.get_parameter_or(name, ans, alternative);
-        return ans;
-    }
-
-    // Overload for rclcpp::Node::SharedPtr& (backward compatibility)
-    template <typename T>
-    static T readParam(rclcpp::Node::SharedPtr &n, std::string name)
+    static T readParam(const rclcpp::Node::SharedPtr &n, std::string name)
     {
         T ans;
         if (!n->has_parameter(name)) {
             n->declare_parameter<T>(name);
-        }
+        }        
         if (!n->get_parameter(name, ans)) {
             RCLCPP_FATAL_STREAM(n->get_logger(), "Failed to load " << name);
             exit(1);
@@ -143,7 +128,7 @@ public:
     }
 
     template <typename T>
-    static T readParam(rclcpp::Node::SharedPtr &n, std::string name, const T& alternative)
+    static T readParam(const rclcpp::Node::SharedPtr &n, std::string name, const T& alternative)
     {
         T ans;
         if (!n->has_parameter(name)) {
@@ -153,49 +138,17 @@ public:
         return ans;
     }
     
-    // Phase 4: Overloads for LifecycleNode
-    template <typename T>
-    static T readParam(rclcpp_lifecycle::LifecycleNode& n, std::string name)
+    static Eigen::Vector3d readVector3d(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_params, const std::string& name)
     {
-        T ans;
-        if (!n.has_parameter(name)) {
-            n.declare_parameter<T>(name);
-        }
-        if (!n.get_parameter(name, ans)) {
-            RCLCPP_FATAL_STREAM(n.get_logger(), "Failed to load " << name);
-            exit(1);
-        }
-        return ans;
-    }
-
-    template <typename T>
-    static T readParam(rclcpp_lifecycle::LifecycleNode& n, std::string name, const T& alternative)
-    {
-        T ans;
-        if (!n.has_parameter(name)) {
-            n.declare_parameter<T>(name, alternative);
-        }
-        n.get_parameter_or(name, ans, alternative);
-        return ans;
-    }
-
-    static Eigen::Vector3d readVector3d(rclcpp::Node& n, const std::string& name)
-    {
-        std::vector<double> v = CommonUtils::readParam<std::vector<double>>(n, name);
+        std::vector<double> v = CommonUtils::readParam<std::vector<double>>(node_params, name, {0.0, 0.0, 0.0});
         return Eigen::Vector3d(v[0], v[1], v[2]);
-    }
+    } 
 
     static Eigen::Vector3d readVector3d(rclcpp::Node::SharedPtr &n, const std::string& name)
     {
         std::vector<double> v = CommonUtils::readParam<std::vector<double>>(n, name);
         return Eigen::Vector3d(v[0], v[1], v[2]);
-    }
-    
-    static Eigen::Vector3d readVector3d(rclcpp_lifecycle::LifecycleNode& n, const std::string& name)
-    {
-        std::vector<double> v = CommonUtils::readParam<std::vector<double>>(n, name);
-        return Eigen::Vector3d(v[0], v[1], v[2]);
-    }
+    }          
 
     static Eigen::Vector3d R2ypr(const Eigen::Matrix3d &R)
     {
@@ -212,7 +165,7 @@ public:
         ypr(2) = r;
 
         return ypr / M_PI * 180.0;
-    }
+    }      
 
     template <typename Derived>
     static Eigen::Matrix<typename Derived::Scalar, 3, 3> ypr2R(const Eigen::MatrixBase<Derived> &ypr)
@@ -250,48 +203,15 @@ public:
         double yaw = CommonUtils::R2ypr(R0).x();
         R0 = CommonUtils::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
         return R0;
-    }
+    }    
 
     static int64_t ms2ns(const float t_ms) {
         return (t_ms * float(1e6));
-    }
+    }    
 
     static bool time_list(pcl::PointXYZINormal &x, pcl::PointXYZINormal &y) {return (x.intensity < y.intensity);};
 
-    // Create PoseStamped for path messages (nav_msgs::msg::Path)
-    static geometry_msgs::msg::PoseStamped poseStamped2msg(const int64_t t, const Eigen::Vector3d& pos,
-                                              const Eigen::Quaterniond& orient)
-    {
-        geometry_msgs::msg::PoseStamped msg;
-        msg.header.stamp = rclcpp::Time(t);
-        msg.pose.position.x = pos.x();
-        msg.pose.position.y = pos.y();
-        msg.pose.position.z = pos.z();
-        msg.pose.orientation.w = orient.w();
-        msg.pose.orientation.x = orient.x();
-        msg.pose.orientation.y = orient.y();
-        msg.pose.orientation.z = orient.z();
-        return msg;
-    }
-
-    // Create PoseWithCovarianceStamped for pose topics (for Nav2 compatibility)
-    static geometry_msgs::msg::PoseWithCovarianceStamped pose2msg(const int64_t t, const Eigen::Vector3d& pos,
-                                              const Eigen::Quaterniond& orient)
-    {
-        geometry_msgs::msg::PoseWithCovarianceStamped msg;
-        msg.header.stamp = rclcpp::Time(t);
-        msg.pose.pose.position.x = pos.x();
-        msg.pose.pose.position.y = pos.y();
-        msg.pose.pose.position.z = pos.z();
-        msg.pose.pose.orientation.w = orient.w();
-        msg.pose.pose.orientation.x = orient.x();
-        msg.pose.pose.orientation.y = orient.y();
-        msg.pose.pose.orientation.z = orient.z();
-        // Zero covariance (unknown)
-        std::fill(msg.pose.covariance.begin(), msg.pose.covariance.end(), 0.0);
-        return msg;
-    }
-
+    // Create Pose
     static geometry_msgs::msg::Pose pose2msg(const Eigen::Vector3d& pos,
                                              const Eigen::Quaterniond& orient)
     {
@@ -306,6 +226,34 @@ public:
         return msg;
     }
 
+    // Create PoseStamped for path messages (nav_msgs::msg::Path)
+    static geometry_msgs::msg::PoseStamped pose2msg(const int64_t t, const Eigen::Vector3d& pos,
+                                              const Eigen::Quaterniond& orient)
+    {
+        geometry_msgs::msg::PoseStamped msg;
+        msg.header.stamp = rclcpp::Time(t);
+        msg.pose = pose2msg(pos, orient);
+        
+        return msg;
+    }
+
+    // Create PoseWithCovarianceStamped for pose topics (for Nav2 compatibility)
+    static geometry_msgs::msg::PoseWithCovarianceStamped pose2msg(const int64_t t, const Eigen::Vector3d& pos,
+                                              const Eigen::Quaterniond& orient, Eigen::Vector<double, 6>& cov)
+    {
+        geometry_msgs::msg::PoseWithCovarianceStamped msg;
+        msg.header.stamp = rclcpp::Time(t);
+        msg.pose.pose = pose2msg(pos, orient);
+
+        msg.pose.covariance[0] = cov[0];
+        msg.pose.covariance[7] = cov[1];
+        msg.pose.covariance[14]= cov[2];
+        msg.pose.covariance[21]= cov[3];
+        msg.pose.covariance[28]= cov[4];
+        msg.pose.covariance[35]= cov[5];
+        return msg;
+    }    
+
     static geometry_msgs::msg::Point32 getPointMsg(const Eigen::Vector3d& p)
     {
         geometry_msgs::msg::Point32 p_msg;
@@ -313,7 +261,7 @@ public:
         p_msg.y = p.y();
         p_msg.z = p.z();
         return p_msg;
-    }
+    }    
 
     template<typename T>
     static bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const Eigen::aligned_vector<pcl::PointXYZINormal> &point, const T &threshold)
@@ -343,7 +291,7 @@ public:
             }
         }
         return true;
-    }
+    }            
 };
 
 struct LidarConfig {
@@ -359,47 +307,18 @@ struct LidarConfig {
 
     LidarConfig() = default;
 
-    LidarConfig(rclcpp::Node& nh, const std::string& prefix) {
+    LidarConfig(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_params, const std::string& prefix) {
         std::cout << "Creating LidarConfig with prefix: \"" << prefix << "\"" << std::endl;
-        topic = CommonUtils::readParam<std::string>(nh, prefix + "topic_lidar");
-        type = CommonUtils::readParam<std::string>(nh, prefix + "lidar_type");
-        scan_line = CommonUtils::readParam<int>(nh, prefix + "scan_line");
-        blind = CommonUtils::readParam<float>(nh, prefix + "blind", 0.5f);
-        std::vector<double> q_lb_v = CommonUtils::readParam<std::vector<double>>(nh, prefix + "q_lb");
+        topic = CommonUtils::readParam<std::string>(node_params, prefix + "topic_lidar", "");
+        type = CommonUtils::readParam<std::string>(node_params, prefix + "lidar_type", "");
+        scan_line = CommonUtils::readParam<int>(node_params, prefix + "scan_line", 0);
+        blind = CommonUtils::readParam<float>(node_params, prefix + "blind", 0.5f);
+        std::vector<double> q_lb_v = CommonUtils::readParam<std::vector<double>>(node_params, prefix + "q_lb", {1.0, 0.0, 0.0, 0.0});
         q_lb = Eigen::Quaterniond(q_lb_v.at(0), q_lb_v.at(1), q_lb_v.at(2), q_lb_v.at(3));
-        t_lb = CommonUtils::readVector3d(nh, prefix + "t_lb");
+        t_lb = CommonUtils::readVector3d(node_params, prefix + "t_lb");
         q_bl = q_lb.inverse();
         t_bl = q_lb.inverse() * (- t_lb);
-        w_pt = CommonUtils::readParam<double>(nh, prefix + "w_pt");
-    }
-
-    LidarConfig(rclcpp::Node::SharedPtr& nh, const std::string& prefix) {
-        std::cout << "Creating LidarConfig with prefix: \"" << prefix << "\"" << std::endl;
-        topic = CommonUtils::readParam<std::string>(nh, prefix + "topic_lidar");
-        type = CommonUtils::readParam<std::string>(nh, prefix + "lidar_type");
-        scan_line = CommonUtils::readParam<int>(nh, prefix + "scan_line");
-        blind = CommonUtils::readParam<float>(nh, prefix + "blind", 0.5f);
-        std::vector<double> q_lb_v = CommonUtils::readParam<std::vector<double>>(nh, prefix + "q_lb");
-        q_lb = Eigen::Quaterniond(q_lb_v.at(0), q_lb_v.at(1), q_lb_v.at(2), q_lb_v.at(3));
-        t_lb = CommonUtils::readVector3d(nh, prefix + "t_lb");
-        q_bl = q_lb.inverse();
-        t_bl = q_lb.inverse() * (- t_lb);
-        w_pt = CommonUtils::readParam<double>(nh, prefix + "w_pt");
-    }
-    
-    // Phase 4: Constructor for LifecycleNode
-    LidarConfig(rclcpp_lifecycle::LifecycleNode& nh, const std::string& prefix) {
-        std::cout << "Creating LidarConfig with prefix: \"" << prefix << "\"" << std::endl;
-        topic = CommonUtils::readParam<std::string>(nh, prefix + "topic_lidar");
-        type = CommonUtils::readParam<std::string>(nh, prefix + "lidar_type");
-        scan_line = CommonUtils::readParam<int>(nh, prefix + "scan_line");
-        blind = CommonUtils::readParam<float>(nh, prefix + "blind", 0.5f);
-        std::vector<double> q_lb_v = CommonUtils::readParam<std::vector<double>>(nh, prefix + "q_lb");
-        q_lb = Eigen::Quaterniond(q_lb_v.at(0), q_lb_v.at(1), q_lb_v.at(2), q_lb_v.at(3));
-        t_lb = CommonUtils::readVector3d(nh, prefix + "t_lb");
-        q_bl = q_lb.inverse();
-        t_bl = q_lb.inverse() * (- t_lb);
-        w_pt = CommonUtils::readParam<double>(nh, prefix + "w_pt");
+        w_pt = CommonUtils::readParam<double>(node_params, prefix + "w_pt", 0.0);
     }
 };
 
@@ -427,12 +346,12 @@ struct PointData {
     double zp = 0;
     Eigen::Matrix<double, 1, 24> H = Eigen::Matrix<double, 1, 24>::Zero();
     Eigen::Quaterniond q_bl;
-    Eigen::Vector3d t_bl;
+    Eigen::Vector3d t_bl;    
     double var_pt;
 
     PointData() {};
     PointData(const pcl::PointXYZINormal& pt_in, int64_t fr_start_time, const Eigen::Quaterniond& q_bl_in,
-        const Eigen::Vector3d& t_bl_in, double w_pt) : pt(pt_in), pt_b(Eigen::Vector3d(pt_in.x, pt_in.y, pt_in.z)),
+        const Eigen::Vector3d& t_bl_in, double w_pt) : pt(pt_in), pt_b(Eigen::Vector3d(pt_in.x, pt_in.y, pt_in.z)), 
         q_bl(q_bl_in), t_bl(t_bl_in) {
         time_ns = fr_start_time + CommonUtils::ms2ns(pt_in.intensity);
         if_valid = false;
@@ -440,15 +359,15 @@ struct PointData {
         var_pt = w_pt;
     }
 
-    PointData(const PointData& other) : time_ns(other.time_ns), pt(other.pt),
-        pt_b(other.pt_b), pt_w(other.pt_w),
-        if_valid(other.if_valid), dist(other.dist),
-        nearest_points(other.nearest_points),
+    PointData(const PointData& other) : time_ns(other.time_ns), pt(other.pt), 
+        pt_b(other.pt_b), pt_w(other.pt_w), 
+        if_valid(other.if_valid), dist(other.dist), 
+        nearest_points(other.nearest_points), 
         zp(other.zp), H(other.H), q_bl(other.q_bl), t_bl(other.t_bl), var_pt(other.var_pt) {
-    }
+    }        
 
     PointData& operator=(const PointData& other) {
-        if (this != &other) {
+        if (this != &other) { 
             this->time_ns = other.time_ns;
             this->pt = other.pt;
             this->pt_b = other.pt_b;
@@ -459,10 +378,12 @@ struct PointData {
             this->zp = other.zp;
             this->H = other.H;
             this->q_bl = other.q_bl;
-            this->t_bl = other.t_bl;
-            this->var_pt = other.var_pt;
+            this->t_bl = other.t_bl;   
+            this->var_pt = other.var_pt;         
         }
         return *this;
-    }
+    }    
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
+
+

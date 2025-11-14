@@ -89,8 +89,8 @@ ament_target_dependencies(${PROJECT_NAME}
 	estimate_msgs
 	pcl_conversions
 	tf2_ros
-	tf2_geometry_msgs
 	tf2_eigen
+	tf2_geometry_msgs
 	tf2_sensor_msgs
 	diagnostic_updater
 	rclcpp_action
