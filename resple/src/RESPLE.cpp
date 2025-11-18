@@ -360,21 +360,7 @@ public:
                     pub_est->publish(est_msg);  
                     max_spl_knots = spline->numKnots();       
 
-                    // Publish current pose
-                    int64_t pose_time_ns = spline->maxTimeNs();
-                    Eigen::Vector3d t_pose = spline->itpPosition(pose_time_ns);
-                    Eigen::Quaterniond q_pose;
-                    spline->itpQuaternion(pose_time_ns, &q_pose);
-
-                    geometry_msgs::msg::PoseStamped pose_msg = 
-                        CommonUtils::pose2msg(pose_time_ns, t_pose, q_pose);
-                    pose_msg.header.frame_id = odom_id;
-                    pub_pose->publish(pose_msg);                        
-
-                    geometry_msgs::msg::PoseWithCovarianceStamped pose_cov_msg = 
-                        CommonUtils::pose2msg(pose_time_ns, t_pose, q_pose, cov_pose);
-                    pose_cov_msg.header.frame_id = odom_id;
-                    pub_pose_cov->publish(pose_cov_msg);
+                   
                 }
                 if (max_time_ns >= t_last_map_upd + 1e8) {
                     mapIncremental();
@@ -1215,11 +1201,27 @@ private:
         }
         
         // Standard publishing (compatible with all RMW implementations)
+        int64_t pose_time_ns = spline->maxTimeNs();
         sensor_msgs::msg::PointCloud2 cloud_msg;
         pcl::toROSMsg(*laser_cloud_world_reusable_, cloud_msg);
-        cloud_msg.header.stamp = rclcpp::Time(spline->maxTimeNs());
+        cloud_msg.header.stamp = rclcpp::Time(pose_time_ns);
         cloud_msg.header.frame_id = odom_id;
         pub_cur_scan->publish(cloud_msg);
+
+        // Publish current pose
+        Eigen::Vector3d t_pose = spline->itpPosition(pose_time_ns);
+        Eigen::Quaterniond q_pose;
+        spline->itpQuaternion(pose_time_ns, &q_pose);
+
+        geometry_msgs::msg::PoseStamped pose_msg = 
+        CommonUtils::pose2msg(pose_time_ns, t_pose, q_pose);
+        pose_msg.header.frame_id = odom_id;
+        pub_pose->publish(pose_msg);                        
+
+        geometry_msgs::msg::PoseWithCovarianceStamped pose_cov_msg = 
+            CommonUtils::pose2msg(pose_time_ns, t_pose, q_pose, cov_pose);
+        pose_cov_msg.header.frame_id = odom_id;
+        pub_pose_cov->publish(pose_cov_msg);
     }
 
     bool initialization()
