@@ -59,10 +59,10 @@ class MappingBase
 
         // Read frame ID parameters
         frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
-        odom_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "odom_frame_id", "odom");
+        map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map_frame_id", "map");
 
         RCLCPP_INFO(nh->get_logger(), "Frame IDs - odom: %s, body: %s", 
-                    odom_id.c_str(), frame_id.c_str());        
+                    map_id.c_str(), frame_id.c_str());        
 
         // Initialize TF buffer and listener
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(nh->get_clock());
@@ -118,7 +118,7 @@ class MappingBase
     {
         sensor_msgs::msg::PointCloud2 msgs;
         pcl::toROSMsg(*pcs, msgs);
-        msgs.header.frame_id = odom_id;
+        msgs.header.frame_id = map_id;
         publisher->publish(msgs);
     }
 
@@ -201,7 +201,7 @@ class MappingBase
     typename pcl::PointCloud<PointType>::Ptr pc_last_ds;
     pcl::VoxelGrid<pcl::PointXYZINormal> ds_filter_each_scan;
     std::string frame_id = "base_link";
-    std::string odom_id = "odom";
+    std::string map_id = "odom";
     
     // TF transformation
     rclcpp::Node::SharedPtr node_handle_;
@@ -573,7 +573,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     {
         RCLCPP_INFO(this->get_logger(), "Mapping LifecycleNode created (unconfigured state)");
         spl_window_st_ns = 0;
-        opt_old_path.header.frame_id = odom_id;
+        opt_old_path.header.frame_id = map_id;
     }
     
     // Lifecycle callbacks
@@ -584,7 +584,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         
         // Read frame ID parameters
         frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_link");
-        odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom_frame_id", "odom");
+        map_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "map_frame_id", "map");
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf", true);
     
@@ -743,7 +743,7 @@ private:
     std::thread processing_thread_;
     std::vector<MappingBase<pcl::PointXYZINormal>*> vis_maps;
     std::string frame_id;
-    std::string odom_id;
+    std::string map_id;
     Eigen::Vector<double, 6> cov_pose;
     Eigen::Vector<double, 6> cov_twist;
     bool publish_tf;
@@ -754,7 +754,7 @@ private:
     void displayControlPoints()
     {
         sensor_msgs::msg::PointCloud points_msg;
-        points_msg.header.frame_id = odom_id;
+        points_msg.header.frame_id = map_id;
         points_msg.header.stamp = rclcpp::Time(spline_global.maxTimeNs());
         for (int64_t i = spline_global.numKnots() - 4; i < spline_global.numKnots(); i++) {
             points_msg.points.push_back(CommonUtils::getPointMsg(spline_global.getKnotPos(i)));
@@ -804,7 +804,8 @@ private:
         // odom_msg.header.stamp = current_time;
         
         odom_msg.header.stamp = rclcpp::Time(odom_pose_current.header.stamp);
-        odom_msg.header.frame_id = odom_id;
+        odom_msg.header.frame_id = map_id;
+
         odom_msg.child_frame_id = frame_id;
         odom_msg.pose.pose = odom_pose_current.pose;
         
@@ -859,7 +860,7 @@ private:
         {
             geometry_msgs::msg::TransformStamped transformStamped;
             transformStamped.header.stamp = odom_msg.header.stamp;
-            transformStamped.header.frame_id = odom_id;
+            transformStamped.header.frame_id = map_id;
             transformStamped.child_frame_id = frame_id;
             transformStamped.transform.translation.x = odom_pose_current.pose.position.x;
             transformStamped.transform.translation.y = odom_pose_current.pose.position.y;
@@ -925,7 +926,7 @@ private:
             opt_old_path.poses.push_back(CommonUtils::pose2msg(t_ns, t_interp, orient_interp));
             t_ns += 1e8;
         }
-        opt_old_path.header.frame_id = odom_id;
+        opt_old_path.header.frame_id = map_id;
         opt_old_path.header.stamp = rclcpp::Time(spline_global.maxTimeNs());
         pub_path->publish(opt_old_path);
     }
