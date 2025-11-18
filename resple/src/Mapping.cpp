@@ -821,9 +821,6 @@ private:
         odom_msg.twist.twist.linear.x = (odom_pose_current.pose.position.x - odom_pose_last.pose.position.x)/dt;
         odom_msg.twist.twist.linear.y = (odom_pose_current.pose.position.y - odom_pose_last.pose.position.y)/dt;
         odom_msg.twist.twist.linear.z = (odom_pose_current.pose.position.z - odom_pose_last.pose.position.z)/dt;
-        odom_msg.twist.twist.angular.x = 0.0;
-        odom_msg.twist.twist.angular.y = 0.0;
-        odom_msg.twist.twist.angular.z = 0.0;
 
         double roll_current, pitch_current, yaw_current;
         tf2::Quaternion q_current(
@@ -858,6 +855,7 @@ private:
         
         if(publish_tf)
         {
+            // Publish odom transforms
             geometry_msgs::msg::TransformStamped transformStamped;
             transformStamped.header.stamp = odom_msg.header.stamp;
             transformStamped.header.frame_id = map_id;
@@ -865,9 +863,7 @@ private:
             transformStamped.transform.translation.x = odom_pose_current.pose.position.x;
             transformStamped.transform.translation.y = odom_pose_current.pose.position.y;
             transformStamped.transform.translation.z = odom_pose_current.pose.position.z;
-            transformStamped.transform.rotation.x = odom_pose_current.pose.position.x;
-            transformStamped.transform.rotation.y = odom_pose_current.pose.position.y;
-            transformStamped.transform.rotation.z = odom_pose_current.pose.position.z;
+            transformStamped.transform.rotation = odom_pose_current.pose.orientation;
 
             br->sendTransform(transformStamped);
             

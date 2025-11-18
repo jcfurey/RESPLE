@@ -1222,6 +1222,18 @@ private:
             CommonUtils::pose2msg(pose_time_ns, t_pose, q_pose, cov_pose);
         pose_cov_msg.header.frame_id = odom_id;
         pub_pose_cov->publish(pose_cov_msg);
+
+        // // Publish odom transforms
+        // geometry_msgs::msg::TransformStamped transformStamped;
+        // transformStamped.header.stamp = pose_msg.header.stamp;
+        // transformStamped.header.frame_id = odom_id;
+        // transformStamped.child_frame_id = frame_id;
+        // transformStamped.transform.translation.x = pose_msg.pose.position.x;
+        // transformStamped.transform.translation.y = pose_msg.pose.position.y;
+        // transformStamped.transform.translation.z = pose_msg.pose.position.z;
+        // transformStamped.transform.rotation = pose_msg.pose.orientation;
+
+        // br->sendTransform(transformStamped);
     }
 
     bool initialization()
