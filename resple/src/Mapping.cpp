@@ -588,8 +588,12 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf", true);
     
-        std::vector<double> cov_var = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
-        cov_pose << cov_var.at(0), cov_var.at(1), cov_var.at(2), cov_var.at(3), cov_var.at(4), cov_var.at(5);        
+        std::vector<double> cov_varp = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
+        cov_pose << cov_varp.at(0), cov_varp.at(1), cov_varp.at(2), cov_varp.at(3), cov_varp.at(4), cov_varp.at(5);        
+
+        std::vector<double> cov_vart = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_twist", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
+        cov_twist << cov_vart.at(0), cov_vart.at(1), cov_vart.at(2), cov_vart.at(3), cov_vart.at(4), cov_vart.at(5);        
+
 
         // Create publishers (inactive until activated)
         pub_path = this->create_publisher<nav_msgs::msg::Path>("traj_path", 
@@ -741,6 +745,7 @@ private:
     std::string frame_id;
     std::string odom_id;
     Eigen::Vector<double, 6> cov_pose;
+    Eigen::Vector<double, 6> cov_twist;
     bool publish_tf;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     bool if_init_succeed = false;
@@ -791,16 +796,17 @@ private:
             return;
         }
         nav_msgs::msg::Odometry odom_msg;
-        geometry_msgs::msg::PoseStamped odom_pose = opt_old_path.poses.back();
+        geometry_msgs::msg::PoseStamped odom_pose_current = opt_old_path.poses.rbegin()[0];
+        geometry_msgs::msg::PoseStamped odom_pose_last = opt_old_path.poses.rbegin()[1];
         
         // Use the latest spline time for better sync with current_scan
         // rclcpp::Time current_time = rclcpp::Time(spline_global.maxTimeNs());
         // odom_msg.header.stamp = current_time;
         
-        odom_msg.header.stamp = rclcpp::Time(odom_pose.header.stamp);
+        odom_msg.header.stamp = rclcpp::Time(odom_pose_current.header.stamp);
         odom_msg.header.frame_id = odom_id;
         odom_msg.child_frame_id = frame_id;
-        odom_msg.pose.pose = odom_pose.pose;
+        odom_msg.pose.pose = odom_pose_current.pose;
         
         // Covariance
         odom_msg.pose.covariance[0]  =  cov_pose[0];
@@ -808,7 +814,45 @@ private:
         odom_msg.pose.covariance[14] =  cov_pose[2];
         odom_msg.pose.covariance[21] =  cov_pose[3];
         odom_msg.pose.covariance[28] =  cov_pose[4];
-        odom_msg.pose.covariance[35] =  cov_pose[5];        
+        odom_msg.pose.covariance[35] =  cov_pose[5];
+        
+        double dt = (rclcpp::Time(odom_pose_current.header.stamp) - rclcpp::Time(odom_pose_last.header.stamp)).seconds();
+        odom_msg.twist.twist.linear.x = (odom_pose_current.pose.position.x - odom_pose_last.pose.position.x)/dt;
+        odom_msg.twist.twist.linear.y = (odom_pose_current.pose.position.y - odom_pose_last.pose.position.y)/dt;
+        odom_msg.twist.twist.linear.z = (odom_pose_current.pose.position.z - odom_pose_last.pose.position.z)/dt;
+        odom_msg.twist.twist.angular.x = 0.0;
+        odom_msg.twist.twist.angular.y = 0.0;
+        odom_msg.twist.twist.angular.z = 0.0;
+
+        double roll_current, pitch_current, yaw_current;
+        tf2::Quaternion q_current(
+            odom_pose_current.pose.orientation.x,
+            odom_pose_current.pose.orientation.y,
+            odom_pose_current.pose.orientation.z,
+            odom_pose_current.pose.orientation.w);
+        tf2::Matrix3x3 m_current(q_current);
+        m_current.getRPY(roll_current, pitch_current, yaw_current);
+
+        double roll_last, pitch_last, yaw_last;
+        tf2::Quaternion q_last(
+            odom_pose_last.pose.orientation.x,
+            odom_pose_last.pose.orientation.y,
+            odom_pose_last.pose.orientation.z,
+            odom_pose_last.pose.orientation.w);
+        tf2::Matrix3x3 m_last(q_last);
+        m_last.getRPY(roll_last, pitch_last, yaw_last);
+
+        odom_msg.twist.twist.angular.x = (roll_current - roll_last)/dt;
+        odom_msg.twist.twist.angular.y = (pitch_current - pitch_last)/dt;
+        odom_msg.twist.twist.angular.z = (yaw_current - yaw_last)/dt;
+
+        odom_msg.twist.covariance[0]  =  cov_twist[0];
+        odom_msg.twist.covariance[7]  =  cov_twist[1];
+        odom_msg.twist.covariance[14] =  cov_twist[2];
+        odom_msg.twist.covariance[21] =  cov_twist[3];
+        odom_msg.twist.covariance[28] =  cov_twist[4];
+        odom_msg.twist.covariance[35] =  cov_twist[5];        
+
         pub_odom->publish(odom_msg);      
         
         if(publish_tf)
@@ -817,10 +861,13 @@ private:
             transformStamped.header.stamp = odom_msg.header.stamp;
             transformStamped.header.frame_id = odom_id;
             transformStamped.child_frame_id = frame_id;
-            transformStamped.transform.translation.x = odom_pose.pose.position.x;
-            transformStamped.transform.translation.y = odom_pose.pose.position.y;
-            transformStamped.transform.translation.z = odom_pose.pose.position.z;
-            transformStamped.transform.rotation = odom_pose.pose.orientation;
+            transformStamped.transform.translation.x = odom_pose_current.pose.position.x;
+            transformStamped.transform.translation.y = odom_pose_current.pose.position.y;
+            transformStamped.transform.translation.z = odom_pose_current.pose.position.z;
+            transformStamped.transform.rotation.x = odom_pose_current.pose.position.x;
+            transformStamped.transform.rotation.y = odom_pose_current.pose.position.y;
+            transformStamped.transform.rotation.z = odom_pose_current.pose.position.z;
+
             br->sendTransform(transformStamped);
             
             // Publish base_link -> imu transform
