@@ -15,15 +15,6 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/common/transforms.h>
 
-#include <Eigen/src/Geometry/Transform.h>
-#include <tf2/convert.hpp>
-#include <tf2_eigen/tf2_eigen.hpp>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-#include <tf2_ros/transform_broadcaster.h>
-#include <tf2_ros/transform_listener.hpp>
-#include <tf2_ros/buffer.hpp>
-#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
-
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -39,6 +30,15 @@
 #include "livox_interfaces/msg/custom_msg.hpp"
 #include "estimate_msgs/msg/calib.hpp"
 #include "estimate_msgs/msg/estimate.hpp"
+
+#include <Eigen/src/Geometry/Transform.h>
+#include <tf2/convert.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.hpp>
 
 #include "SplineState.h"
 
@@ -61,7 +61,7 @@ class MappingBase
         frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
         map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map_frame_id", "map");
 
-        RCLCPP_INFO(nh->get_logger(), "Frame IDs - odom: %s, body: %s", 
+        RCLCPP_INFO(nh->get_logger(), "Frame IDs -  map: %s, body: %s", 
                     map_id.c_str(), frame_id.c_str());        
 
         // Initialize TF buffer and listener
@@ -201,7 +201,7 @@ class MappingBase
     typename pcl::PointCloud<PointType>::Ptr pc_last_ds;
     pcl::VoxelGrid<pcl::PointXYZINormal> ds_filter_each_scan;
     std::string frame_id = "base_link";
-    std::string map_id = "odom";
+    std::string map_id = "map";
     
     // TF transformation
     rclcpp::Node::SharedPtr node_handle_;
@@ -581,9 +581,14 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     on_configure(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Configuring Mapping...");
-        
+
+        // Initialize TF buffer and listener
+        tf_buffer = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
+
         // Read frame ID parameters
         frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_link");
+        odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom_frame_id", "odom");
         map_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "map_frame_id", "map");
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf", true);
@@ -738,11 +743,15 @@ private:
     rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud>::SharedPtr pub_knots;
     rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr pub_path;
     
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener;
+
     // Lifecycle management
     std::atomic<bool> processing_active_;
     std::thread processing_thread_;
     std::vector<MappingBase<pcl::PointXYZINormal>*> vis_maps;
     std::string frame_id;
+    std::string odom_id;
     std::string map_id;
     Eigen::Vector<double, 6> cov_pose;
     Eigen::Vector<double, 6> cov_twist;
@@ -853,53 +862,82 @@ private:
 
         pub_odom->publish(odom_msg);      
         
+        // Publish map transforms        
         if(publish_tf)
         {
-            // Publish odom transforms
-            geometry_msgs::msg::TransformStamped transformStamped;
-            transformStamped.header.stamp = odom_msg.header.stamp;
-            transformStamped.header.frame_id = map_id;
-            transformStamped.child_frame_id = frame_id;
-            transformStamped.transform.translation.x = odom_pose_current.pose.position.x;
-            transformStamped.transform.translation.y = odom_pose_current.pose.position.y;
-            transformStamped.transform.translation.z = odom_pose_current.pose.position.z;
-            transformStamped.transform.rotation = odom_pose_current.pose.orientation;
+            // Calculate desired frame to map transform            
+            geometry_msgs::msg::TransformStamped baselink_to_map;
+            baselink_to_map.header.stamp = odom_msg.header.stamp;
+            baselink_to_map.header.frame_id = map_id;
+            baselink_to_map.child_frame_id = frame_id;
+            baselink_to_map.transform.translation.x = odom_pose_current.pose.position.x;
+            baselink_to_map.transform.translation.y = odom_pose_current.pose.position.y;
+            baselink_to_map.transform.translation.z = odom_pose_current.pose.position.z;
+            baselink_to_map.transform.rotation = odom_pose_current.pose.orientation;
 
-            br->sendTransform(transformStamped);
+            // Get frame to odom transform
+            geometry_msgs::msg::TransformStamped odom_to_baselink;             
+            try {
+                
+                if (tf_buffer->canTransform(this->frame_id, this->odom_id, 
+                                            odom_msg.header.stamp, rclcpp::Duration::from_seconds(0.1))) {
+                        odom_to_baselink = tf_buffer->lookupTransform(this->frame_id, this->odom_id, odom_msg.header.stamp);
+                    } else {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                                            "[Mapping] Waiting for odom transform: %s -> %s", 
+                                            this->frame_id.c_str(), this->odom_id.c_str());
+                    }
+            } catch (tf2::TransformException& ex) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                                    "[Mapping] LiDAR transform exception: %s", ex.what());
+            }
+
+            // Subtract baselink_to_odom transform from baselink_to_map transform to get odom_to_map transform
+            tf2::Transform odom_to_baselink_tf, baselink_to_map_tf, odom_to_map_tf;
+            tf2::fromMsg(odom_to_baselink.transform, odom_to_baselink_tf);
+            tf2::fromMsg(baselink_to_map.transform, baselink_to_map_tf);            
+            odom_to_map_tf  = baselink_to_map_tf * odom_to_baselink_tf;
+            geometry_msgs::msg::TransformStamped odom_to_map;
+            tf2::toMsg(odom_to_map_tf, odom_to_map.transform);
+            odom_to_map.header.stamp = odom_msg.header.stamp;
+            odom_to_map.header.frame_id = map_id;
+            odom_to_map.child_frame_id = odom_id;
+            br->sendTransform(odom_to_map);
             
-            // Publish base_link -> imu transform
-            transformStamped.header.stamp = odom_msg.header.stamp;
-            transformStamped.header.frame_id = frame_id;
-            transformStamped.child_frame_id = "imu";
-            Eigen::Affine3d imu_to_baselink = vis_maps[0]->getImuToBaselink();
-            Eigen::Vector3d t_imu(imu_to_baselink.inverse().translation());
-            transformStamped.transform.translation.x = t_imu.x();
-            transformStamped.transform.translation.y = t_imu.y();
-            transformStamped.transform.translation.z = t_imu.z();
-            Eigen::Matrix3d r_imu = imu_to_baselink.inverse().rotation();
-            Eigen::Quaterniond q_imu(r_imu);            
-            transformStamped.transform.rotation.w = q_imu.w();
-            transformStamped.transform.rotation.x = q_imu.x();
-            transformStamped.transform.rotation.y = q_imu.y();
-            transformStamped.transform.rotation.z = q_imu.z();
-            br->sendTransform(transformStamped);
+            // // Publish base_link -> imu transform
+            // geometry_msgs::msg::TransformStamped transformStamped;            
+            // transformStamped.header.stamp = odom_msg.header.stamp;
+            // transformStamped.header.frame_id = frame_id;
+            // transformStamped.child_frame_id = "imu";
+            // Eigen::Affine3d imu_to_baselink = vis_maps[0]->getImuToBaselink();
+            // Eigen::Vector3d t_imu(imu_to_baselink.inverse().translation());
+            // transformStamped.transform.translation.x = t_imu.x();
+            // transformStamped.transform.translation.y = t_imu.y();
+            // transformStamped.transform.translation.z = t_imu.z();
+            // Eigen::Matrix3d r_imu = imu_to_baselink.inverse().rotation();
+            // Eigen::Quaterniond q_imu(r_imu);            
+            // transformStamped.transform.rotation.w = q_imu.w();
+            // transformStamped.transform.rotation.x = q_imu.x();
+            // transformStamped.transform.rotation.y = q_imu.y();
+            // transformStamped.transform.rotation.z = q_imu.z();
+            // br->sendTransform(transformStamped);
 
-            // Publish base_link -> lidar transform
-            transformStamped.header.stamp = odom_msg.header.stamp;
-            transformStamped.header.frame_id = frame_id;
-            transformStamped.child_frame_id = "lidar";
-            Eigen::Affine3d lidar_to_baselink = vis_maps[0]->getLidarToBaselink();
-            Eigen::Vector3d t_lidar(lidar_to_baselink.inverse().translation());            
-            transformStamped.transform.translation.x = t_lidar.x();
-            transformStamped.transform.translation.y = t_lidar.y();
-            transformStamped.transform.translation.z = t_lidar.z();
-            Eigen::Matrix3d r_lidar = lidar_to_baselink.inverse().rotation();            
-            Eigen::Quaterniond q_lidar(r_lidar);               
-            transformStamped.transform.rotation.w = q_lidar.w();
-            transformStamped.transform.rotation.x = q_lidar.x();
-            transformStamped.transform.rotation.y = q_lidar.y();
-            transformStamped.transform.rotation.z = q_lidar.z();
-            br->sendTransform(transformStamped);
+            // // Publish base_link -> lidar transform
+            // transformStamped.header.stamp = odom_msg.header.stamp;
+            // transformStamped.header.frame_id = frame_id;
+            // transformStamped.child_frame_id = "lidar";
+            // Eigen::Affine3d lidar_to_baselink = vis_maps[0]->getLidarToBaselink();
+            // Eigen::Vector3d t_lidar(lidar_to_baselink.inverse().translation());            
+            // transformStamped.transform.translation.x = t_lidar.x();
+            // transformStamped.transform.translation.y = t_lidar.y();
+            // transformStamped.transform.translation.z = t_lidar.z();
+            // Eigen::Matrix3d r_lidar = lidar_to_baselink.inverse().rotation();            
+            // Eigen::Quaterniond q_lidar(r_lidar);               
+            // transformStamped.transform.rotation.w = q_lidar.w();
+            // transformStamped.transform.rotation.x = q_lidar.x();
+            // transformStamped.transform.rotation.y = q_lidar.y();
+            // transformStamped.transform.rotation.z = q_lidar.z();
+            // br->sendTransform(transformStamped);
         }
     }
 
