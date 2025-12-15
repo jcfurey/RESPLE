@@ -436,6 +436,7 @@ private:
     Eigen::Affine3d lidar_to_baselink_;
     geometry_msgs::msg::TransformStamped imu_to_baselink_;
     
+    bool publish_tf;
     std::string frame_id;
     std::string odom_id;
 
@@ -589,6 +590,7 @@ private:
     void readParameters()
     {
         // Frame ID parameters
+        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf", true);        
         frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_footprint");
         odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom_frame_id", "odom");
         
@@ -1223,17 +1225,20 @@ private:
         pose_cov_msg.header.frame_id = odom_id;
         pub_pose_cov->publish(pose_cov_msg);
 
-        // // Publish odom transforms
-        // geometry_msgs::msg::TransformStamped transformStamped;
-        // transformStamped.header.stamp = pose_msg.header.stamp;
-        // transformStamped.header.frame_id = odom_id;
-        // transformStamped.child_frame_id = frame_id;
-        // transformStamped.transform.translation.x = pose_msg.pose.position.x;
-        // transformStamped.transform.translation.y = pose_msg.pose.position.y;
-        // transformStamped.transform.translation.z = pose_msg.pose.position.z;
-        // transformStamped.transform.rotation = pose_msg.pose.orientation;
+        // Publish odom transforms
+        if(publish_tf)
+        {        
+            geometry_msgs::msg::TransformStamped transformStamped;
+            transformStamped.header.stamp = pose_msg.header.stamp;
+            transformStamped.header.frame_id = odom_id;
+            transformStamped.child_frame_id = frame_id;
+            transformStamped.transform.translation.x = pose_msg.pose.position.x;
+            transformStamped.transform.translation.y = pose_msg.pose.position.y;
+            transformStamped.transform.translation.z = pose_msg.pose.position.z;
+            transformStamped.transform.rotation = pose_msg.pose.orientation;
 
-        // br->sendTransform(transformStamped);
+            br->sendTransform(transformStamped);
+        }
     }
 
     bool initialization()
