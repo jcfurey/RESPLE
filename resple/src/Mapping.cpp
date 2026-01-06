@@ -863,7 +863,7 @@ private:
         pub_odom->publish(odom_msg);      
         
         // Publish map transforms        
-        if(publish_tf)
+        // if(publish_tf)
         {
             // Calculate desired frame to map transform            
             geometry_msgs::msg::TransformStamped baselink_to_map;
