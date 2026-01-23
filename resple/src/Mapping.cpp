@@ -591,7 +591,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom_frame_id", "odom");
         map_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "map_frame_id", "map");
 
-        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf", true);
+        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf_map", true);
     
         std::vector<double> cov_varp = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
         cov_pose << cov_varp.at(0), cov_varp.at(1), cov_varp.at(2), cov_varp.at(3), cov_varp.at(4), cov_varp.at(5);        
@@ -863,7 +863,7 @@ private:
         pub_odom->publish(odom_msg);      
         
         // Publish map transforms        
-        // if(publish_tf)
+        if(publish_tf)
         {
             // Calculate desired frame to map transform            
             geometry_msgs::msg::TransformStamped baselink_to_map;
