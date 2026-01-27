@@ -592,6 +592,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         map_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "map_frame_id", "map");
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf_map", true);
+        invert_tf  = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "invert_tf", false);        
     
         std::vector<double> cov_varp = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
         cov_pose << cov_varp.at(0), cov_varp.at(1), cov_varp.at(2), cov_varp.at(3), cov_varp.at(4), cov_varp.at(5);        
@@ -755,7 +756,7 @@ private:
     std::string map_id;
     Eigen::Vector<double, 6> cov_pose;
     Eigen::Vector<double, 6> cov_twist;
-    bool publish_tf;
+    bool publish_tf, invert_tf;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     bool if_init_succeed = false;
     std::mutex m_spline;
@@ -897,11 +898,19 @@ private:
             tf2::fromMsg(odom_to_baselink.transform, odom_to_baselink_tf);
             tf2::fromMsg(baselink_to_map.transform, baselink_to_map_tf);            
             odom_to_map_tf  = baselink_to_map_tf * odom_to_baselink_tf;
+            if(invert_tf){
+                odom_to_map_tf = odom_to_map_tf.inverse();    
+            }
             geometry_msgs::msg::TransformStamped odom_to_map;
             tf2::toMsg(odom_to_map_tf, odom_to_map.transform);
             odom_to_map.header.stamp = odom_msg.header.stamp;
-            odom_to_map.header.frame_id = map_id;
-            odom_to_map.child_frame_id = odom_id;
+            if(invert_tf){            
+                odom_to_map.header.frame_id = odom_id;
+                odom_to_map.child_frame_id  = map_id;
+            } else {
+                odom_to_map.header.frame_id = map_id;
+                odom_to_map.child_frame_id  = odom_id;
+            }
             br->sendTransform(odom_to_map);
             
             // // Publish base_link -> imu transform
