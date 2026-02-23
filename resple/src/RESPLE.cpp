@@ -436,7 +436,7 @@ private:
     Eigen::Affine3d lidar_to_baselink_;
     geometry_msgs::msg::TransformStamped imu_to_baselink_;
     
-    bool publish_tf;
+    bool publish_tf, invert_tf;
     std::string frame_id;
     std::string odom_id;
 
@@ -590,7 +590,8 @@ private:
     void readParameters()
     {
         // Frame ID parameters
-        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf", true);        
+        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf", true);   
+        invert_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "invert_tf", true);
         frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_footprint");
         odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom_frame_id", "odom");
         
@@ -1229,13 +1230,26 @@ private:
         if(publish_tf)
         {        
             geometry_msgs::msg::TransformStamped transformStamped;
-            transformStamped.header.stamp = pose_msg.header.stamp;
-            transformStamped.header.frame_id = odom_id;
-            transformStamped.child_frame_id = frame_id;
             transformStamped.transform.translation.x = pose_msg.pose.position.x;
             transformStamped.transform.translation.y = pose_msg.pose.position.y;
             transformStamped.transform.translation.z = pose_msg.pose.position.z;
             transformStamped.transform.rotation = pose_msg.pose.orientation;
+
+            tf2::Transform transform_tf;
+            tf2::fromMsg(transformStamped.transform, transform_tf);
+            if(invert_tf){
+                transform_tf = transform_tf.inverse(); 
+              }
+            tf2::toMsg(transform_tf, transformStamped.transform);
+
+            transformStamped.header.stamp = pose_msg.header.stamp;
+            if(invert_tf){            
+                transformStamped.header.frame_id = frame_id;
+                transformStamped.child_frame_id  = odom_id;
+            } else {
+                transformStamped.header.frame_id = odom_id;
+                transformStamped.child_frame_id  = frame_id;
+            }
 
             br->sendTransform(transformStamped);
         }
