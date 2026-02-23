@@ -92,6 +92,7 @@ class MappingBase
 
     void processScan(SplineState* spl, const int64_t spl_window_st_ns)
     {
+        // RCLCPP_INFO(node_handle_->get_logger(), "processScan");
         int64_t t_end_ns = 0;
         rclcpp::Rate rate(20);
         while (!pc_L_buff.empty()) {
@@ -116,6 +117,7 @@ class MappingBase
     void publishMap(const typename pcl::PointCloud<PointType>::Ptr& pcs,
                          const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher) const
     {
+        // RCLCPP_INFO(node_handle_->get_logger(), "publishMap");
         sensor_msgs::msg::PointCloud2 msgs;
         pcl::toROSMsg(*pcs, msgs);
         msgs.header.frame_id = map_id;
@@ -592,7 +594,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         map_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "map_frame_id", "map");
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf_map", true);
-        invert_tf  = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "invert_tf", false);        
+        invert_tf  = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "invert_tf_map", false);        
     
         std::vector<double> cov_varp = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
         cov_pose << cov_varp.at(0), cov_varp.at(1), cov_varp.at(2), cov_varp.at(3), cov_varp.at(4), cov_varp.at(5);        
@@ -710,6 +712,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     }
 
     void process() {
+        // RCLCPP_INFO(this->get_logger(), "process");    
         rclcpp::Rate rate(10);
         int64_t num_knot = 0;
         while (processing_active_ && rclcpp::ok()) {
@@ -777,6 +780,8 @@ private:
         if (!if_init_succeed) {
             return;
         }
+        // RCLCPP_INFO(this->get_logger(), "getEstCallback");    
+        
         estimate_msgs::msg::Spline spline_msg = est_msg->spline;
         SplineState spline_w;
 
@@ -802,7 +807,8 @@ private:
 
     void pubOdom()
     {
-        if (opt_old_path.poses.empty()) {
+        // RCLCPP_INFO(this->get_logger(), "pubOdom");    
+        if (opt_old_path.poses.size() < 2) {
             return;
         }
         nav_msgs::msg::Odometry odom_msg;
@@ -828,9 +834,13 @@ private:
         odom_msg.pose.covariance[35] =  cov_pose[5];
         
         double dt = (rclcpp::Time(odom_pose_current.header.stamp) - rclcpp::Time(odom_pose_last.header.stamp)).seconds();
-        odom_msg.twist.twist.linear.x = (odom_pose_current.pose.position.x - odom_pose_last.pose.position.x)/dt;
-        odom_msg.twist.twist.linear.y = (odom_pose_current.pose.position.y - odom_pose_last.pose.position.y)/dt;
-        odom_msg.twist.twist.linear.z = (odom_pose_current.pose.position.z - odom_pose_last.pose.position.z)/dt;
+        if(dt < 1e-10) {
+            RCLCPP_INFO(this->get_logger(), "dt too small!");    
+        } else{
+            odom_msg.twist.twist.linear.x = (odom_pose_current.pose.position.x - odom_pose_last.pose.position.x)/dt;
+            odom_msg.twist.twist.linear.y = (odom_pose_current.pose.position.y - odom_pose_last.pose.position.y)/dt;
+            odom_msg.twist.twist.linear.z = (odom_pose_current.pose.position.z - odom_pose_last.pose.position.z)/dt;
+        }
 
         double roll_current, pitch_current, yaw_current;
         tf2::Quaternion q_current(
@@ -958,6 +968,7 @@ private:
     }
 
     void publishPath() {
+        // RCLCPP_INFO(this->get_logger(), "publishPath");            
         if (!if_init_succeed || spline_global.numKnots() <= 4) {
             return;
         }
