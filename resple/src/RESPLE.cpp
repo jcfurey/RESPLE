@@ -590,10 +590,10 @@ private:
     void readParameters()
     {
         // Frame ID parameters
-        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_tf", true);   
-        invert_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "invert_tf", true);
+        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "odom/publish_tf", true);   
+        invert_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "odom/invert_tf", true);
         frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_footprint");
-        odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom_frame_id", "odom");
+        odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom/frame_id", "odom");
         
         RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s", 
                     odom_id.c_str(), frame_id.c_str());

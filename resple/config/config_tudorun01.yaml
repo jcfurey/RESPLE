@@ -1,8 +1,14 @@
 /**:
   ros__parameters:
     # Frame IDs for TF tree
-    odom_frame_id: odom              # Odom (odometry frame_id) frame
+    odom/frame_id: odom              # Odom (odometry frame_id) frame
+    map/frame_id: map                # Odom (odometry frame_id) frame    
     frame_id: base_link              # Robot (odometry child_frame_id) frame
+
+    odom/publish_tf: True
+    odm/invert_tf: False
+    map/publish_tf: True
+    map/invert_tf: False
 
     cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]     # diagonal of covariance published in odom msgs
     cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
