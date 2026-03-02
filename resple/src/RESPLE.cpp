@@ -1217,13 +1217,11 @@ private:
         spline->itpQuaternion(pose_time_ns, &q_pose);
 
         geometry_msgs::msg::PoseStamped pose_msg = 
-        CommonUtils::pose2msg(pose_time_ns, t_pose, q_pose);
-        pose_msg.header.frame_id = odom_id;
+        CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose);
         pub_pose->publish(pose_msg);                        
 
         geometry_msgs::msg::PoseWithCovarianceStamped pose_cov_msg = 
-            CommonUtils::pose2msg(pose_time_ns, t_pose, q_pose, cov_pose);
-        pose_cov_msg.header.frame_id = odom_id;
+            CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose, cov_pose);
         pub_pose_cov->publish(pose_cov_msg);
 
         // Publish odom transforms

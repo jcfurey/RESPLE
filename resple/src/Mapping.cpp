@@ -977,7 +977,7 @@ private:
             Eigen::Quaterniond orient_interp;
             Eigen::Vector3d t_interp = spline_global.itpPosition(t_ns);
             spline_global.itpQuaternion(t_ns, &orient_interp);
-            opt_old_path.poses.push_back(CommonUtils::pose2msg(t_ns, t_interp, orient_interp));
+            opt_old_path.poses.push_back(CommonUtils::pose2msg(map_id, t_ns, t_interp, orient_interp));
             t_ns += 1e8;
         }
         opt_old_path.header.frame_id = map_id;

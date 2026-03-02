@@ -227,10 +227,12 @@ public:
     }
 
     // Create PoseStamped for path messages (nav_msgs::msg::Path)
-    static geometry_msgs::msg::PoseStamped pose2msg(const int64_t t, const Eigen::Vector3d& pos,
-                                              const Eigen::Quaterniond& orient)
+    static geometry_msgs::msg::PoseStamped pose2msg(const std::string& frame_id, 
+                                                    const int64_t t, const Eigen::Vector3d& pos,
+                                                    const Eigen::Quaterniond& orient)
     {
         geometry_msgs::msg::PoseStamped msg;
+        msg.header.frame_id = frame_id, 
         msg.header.stamp = rclcpp::Time(t);
         msg.pose = pose2msg(pos, orient);
         
@@ -238,10 +240,12 @@ public:
     }
 
     // Create PoseWithCovarianceStamped for pose topics (for Nav2 compatibility)
-    static geometry_msgs::msg::PoseWithCovarianceStamped pose2msg(const int64_t t, const Eigen::Vector3d& pos,
-                                              const Eigen::Quaterniond& orient, Eigen::Vector<double, 6>& cov)
+    static geometry_msgs::msg::PoseWithCovarianceStamped pose2msg(const std::string& frame_id, 
+                                                                  const int64_t t, const Eigen::Vector3d& pos,
+                                                                  const Eigen::Quaterniond& orient, Eigen::Vector<double, 6>& cov)
     {
         geometry_msgs::msg::PoseWithCovarianceStamped msg;
+        msg.header.frame_id = frame_id;
         msg.header.stamp = rclcpp::Time(t);
         msg.pose.pose = pose2msg(pos, orient);
 
