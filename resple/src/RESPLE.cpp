@@ -461,6 +461,7 @@ private:
         std::deque<int64_t> t_buff;
         std::mutex mtx_pc;
         Eigen::aligned_deque<PointData> pt_buff;
+        std::atomic<int64_t> last_t_ns{0};
     };
     std::map<std::string, LidarData> lidars_data;    
     Eigen::aligned_deque<PointData> pt_meas;    
@@ -793,12 +794,13 @@ private:
         imu->angular_velocity.y = ang_vel_transformed[1];
         imu->angular_velocity.z = ang_vel_transformed[2];
 
-        // Transform linear acceleration (accounting for centripetal acceleration)
+        // Transform linear acceleration (accounting for centripetal acceleration).
+        // r = translation from base_link origin to IMU sensor; correction is ω×(ω×r).
         Eigen::Vector3d lin_accel(imu_raw->linear_acceleration.x,
                                   imu_raw->linear_acceleration.y,
                                   imu_raw->linear_acceleration.z);
         Eigen::Vector3d lin_accel_transformed = transform_eigen.rotation() * lin_accel
-                                               + ang_vel_transformed.cross(ang_vel_transformed.cross(-transform_eigen.translation()));
+                                               + ang_vel_transformed.cross(ang_vel_transformed.cross(transform_eigen.translation()));
 
         imu->linear_acceleration.x = lin_accel_transformed[0];
         imu->linear_acceleration.y = lin_accel_transformed[1];
@@ -809,15 +811,12 @@ private:
     
     void getImuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg)
     {
-        // Lookup IMU transform if not yet initialized
-        if(!updateImuTransform(imu_msg->header.frame_id)) return;
-        
         m_buff.lock();
-        if (have_imu_transform_) {
+        if (updateImuTransform(imu_msg->header.frame_id)) {
             sensor_msgs::msg::Imu::SharedPtr transformed_imu = transformImu(imu_msg, imu_to_baselink_);
             imu_int_buff.push_back(transformed_imu);
         } else {
-            // If no transform available, pass through (assumes IMU already in base_link frame)
+            // Pass through raw if transform not yet available (assumes IMU already in base_link frame)
             imu_int_buff.push_back(imu_msg);
         }
         m_buff.unlock();
@@ -899,7 +898,8 @@ private:
         if (plsize == 0) return;
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds() - time_offset;
-        static int64_t last_t_ns = time_begin;
+        LidarData& lidar_buffs = lidars_data.at(name);
+        int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
         pcl::PointXYZINormal pt;
         float blind = lidar.blind;
@@ -921,12 +921,11 @@ private:
         // Transform point cloud to body frame
         pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_);
 
-        LidarData& lidar_buffs = lidars_data.at(name);
         lidar_buffs.mtx_pc.lock();
         lidar_buffs.pc_buff.push_back(pc_last->points);
         lidar_buffs.t_buff.push_back(time_begin);
         lidar_buffs.mtx_pc.unlock();
-        last_t_ns = time_begin + max_ofs_ns;
+        lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
     }
 
     void livoxLidarCallback(const livox_ros_driver::msg::CustomMsg::SharedPtr livox_msg_in)
@@ -941,7 +940,8 @@ private:
         if (plsize == 0) return;
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        static int64_t last_t_ns = time_begin;
+        LidarData& lidar_buffs = lidars_data.at(name);
+        int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
         int valid_point_num = 0;
         pcl::PointXYZINormal pt_pre;
@@ -973,15 +973,14 @@ private:
         }
 
         // Transform point cloud to body frame
-        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());      
+        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        LidarData& lidar_buffs = lidars_data.at(name);
         lidar_buffs.mtx_pc.lock();
         lidar_buffs.pc_buff.push_back(pc_transformed->points);
         lidar_buffs.t_buff.push_back(time_begin);
         lidar_buffs.mtx_pc.unlock();
-        last_t_ns = time_begin + max_ofs_ns;
+        lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
     }
 
     void livoxLidar2Callback(const livox_ros_driver2::msg::CustomMsg::SharedPtr livox_msg_in)
@@ -996,7 +995,8 @@ private:
         if (plsize == 0) return;
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        static int64_t last_t_ns = time_begin;
+        LidarData& lidar_buffs = lidars_data.at(name);
+        int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
         int valid_point_num = 0;
         pcl::PointXYZINormal pt_pre;
@@ -1027,15 +1027,14 @@ private:
         }
 
         // Transform point cloud to body frame
-        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());  
+        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        LidarData& lidar_buffs = lidars_data.at(name);
         lidar_buffs.mtx_pc.lock();
         lidar_buffs.pc_buff.push_back(pc_transformed->points);
         lidar_buffs.t_buff.push_back(time_begin);
         lidar_buffs.mtx_pc.unlock();
-        last_t_ns = time_begin + max_ofs_ns;
+        lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
     }
 
      void livoxAVIACallback(const livox_interfaces::msg::CustomMsg::SharedPtr livox_msg_in)
@@ -1050,7 +1049,8 @@ private:
         if (plsize == 0) return;
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        static int64_t last_t_ns = time_begin;
+        LidarData& lidar_buffs = lidars_data.at(name);
+        int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
         int valid_point_num = 0;
         pcl::PointXYZINormal pt_pre;
@@ -1082,15 +1082,14 @@ private:
         }
 
         // Transform point cloud to body frame
-        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>()); 
+        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        LidarData& lidar_buffs = lidars_data.at(name);
         lidar_buffs.mtx_pc.lock();
         lidar_buffs.pc_buff.push_back(pc_transformed->points);
         lidar_buffs.t_buff.push_back(time_begin);
         lidar_buffs.mtx_pc.unlock();
-        last_t_ns = time_begin + max_ofs_ns;
+        lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
      }
 
     void hesaiLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr hesai_msg_in)
@@ -1108,7 +1107,8 @@ private:
         pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(hesai_msg_in->header.stamp);
         int64_t time_begin = timestamp_begin.nanoseconds();
-        static int64_t last_t_ns = time_begin;
+        LidarData& lidar_buffs_hesai = lidars_data.at(name);
+        int64_t last_t_ns = lidar_buffs_hesai.last_t_ns.load();
         int64_t max_ofs_ns = 0;
         pcl::PointXYZINormal pt;
         float blind = lidar.blind;
@@ -1132,15 +1132,14 @@ private:
         }
 
         // Transform point cloud to body frame
-        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());      
+        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        LidarData& lidar_buffs = lidars_data.at(name);
-        lidar_buffs.mtx_pc.lock();
-        lidar_buffs.pc_buff.push_back(pc_transformed->points);
-        lidar_buffs.t_buff.push_back(time_begin);
-        lidar_buffs.mtx_pc.unlock();
-        last_t_ns = time_begin + max_ofs_ns;
+        lidar_buffs_hesai.mtx_pc.lock();
+        lidar_buffs_hesai.pc_buff.push_back(pc_transformed->points);
+        lidar_buffs_hesai.t_buff.push_back(time_begin);
+        lidar_buffs_hesai.mtx_pc.unlock();
+        lidar_buffs_hesai.last_t_ns.store(time_begin + max_ofs_ns);
 	}
 
     void livoxMid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
@@ -1158,7 +1157,8 @@ private:
         pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(livox_msg_in->header.stamp);
         int64_t time_begin = timestamp_begin.nanoseconds();
-        static int64_t last_t_ns = time_begin;
+        LidarData& lidar_buffs_boxi = lidars_data.at(name);
+        int64_t last_t_ns = lidar_buffs_boxi.last_t_ns.load();
         int64_t max_ofs_ns = 0;
         pcl::PointXYZINormal pt;
         float blind = lidar.blind;
@@ -1180,15 +1180,14 @@ private:
         }
 
         // Transform point cloud to body frame
-        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());    
+        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        LidarData& lidar_buffs = lidars_data.at(name);
-        lidar_buffs.mtx_pc.lock();
-        lidar_buffs.pc_buff.push_back(pc_transformed->points);
-        lidar_buffs.t_buff.push_back(time_begin);
-        lidar_buffs.mtx_pc.unlock();
-        last_t_ns = time_begin + max_ofs_ns;
+        lidar_buffs_boxi.mtx_pc.lock();
+        lidar_buffs_boxi.pc_buff.push_back(pc_transformed->points);
+        lidar_buffs_boxi.t_buff.push_back(time_begin);
+        lidar_buffs_boxi.mtx_pc.unlock();
+        lidar_buffs_boxi.last_t_ns.store(time_begin + max_ofs_ns);
 	}
 
     void publishFrameWorld()
