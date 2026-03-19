@@ -60,6 +60,7 @@ class MappingBase
         // Read frame ID parameters
         frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
         map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map_frame_id", "map");
+        num_threads_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "num_threads", 5);
 
         RCLCPP_INFO(nh->get_logger(), "Frame IDs -  map: %s, body: %s", 
                     map_id.c_str(), frame_id.c_str());        
@@ -184,8 +185,7 @@ class MappingBase
         int64_t time_begin = rclcpp::Time(pc_in.header.stamp).nanoseconds();
         pc->clear();
         pc_out->points.resize(pc_in.size());
-        // Parallelize point transformation (conservative 5 threads)
-        #pragma omp parallel for num_threads(5)
+        #pragma omp parallel for num_threads(num_threads_)
         for (size_t i = 0; i < pc_in.size(); i++) {
             const PointType& pt = pc_in.points[i];
             int64_t t_ns = int64_t(pt.intensity * float(1e6)) + time_begin;
@@ -204,6 +204,7 @@ class MappingBase
     pcl::VoxelGrid<pcl::PointXYZINormal> ds_filter_each_scan;
     std::string frame_id = "base_link";
     std::string map_id = "map";
+    int num_threads_ = 5;
     
     // TF transformation
     rclcpp::Node::SharedPtr node_handle_;

@@ -1568,10 +1568,10 @@ int main(int argc, char *argv[])
         node->cleanup();
         node->shutdown();
     } else {
-        // Context already shut down (Ctrl+C), just stop processing
-        RCLCPP_WARN(node->get_logger(), "Context invalid, forcing shutdown...");
-        // Manually trigger deactivation to stop thread
-        node->on_deactivate(node->get_current_state());
+        // Context already shut down (Ctrl+C); call on_shutdown directly to stop
+        // the processing thread since the executor is no longer spinning and
+        // lifecycle transitions cannot be driven through the state machine.
+        node->on_shutdown(node->get_current_state());
     }
     exec.remove_node(node->get_node_base_interface());
     rclcpp::shutdown();
