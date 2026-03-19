@@ -270,12 +270,14 @@ public:
     template<typename T>
     static bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const Eigen::aligned_vector<pcl::PointXYZINormal> &point, const T &threshold)
     {
-        Eigen::Matrix<T, 5, 3> A;
-        Eigen::Matrix<T, 5, 1> b;
+        const int num_pts = static_cast<int>(point.size());
+        if (num_pts < 3) { return false; }
+        Eigen::Matrix<T, Eigen::Dynamic, 3> A(num_pts, 3);
+        Eigen::Matrix<T, Eigen::Dynamic, 1> b(num_pts, 1);
         A.setZero();
         b.setOnes();
         b *= -1.0f;
-        for (int j = 0; j < 5; j++)
+        for (int j = 0; j < num_pts; j++)
         {
             A(j,0) = point[j].x;
             A(j,1) = point[j].y;
@@ -287,7 +289,7 @@ public:
         pca_result(1) = normvec(1) / n;
         pca_result(2) = normvec(2) / n;
         pca_result(3) = 1.0 / n;
-        for (int j = 0; j < 5; j++)
+        for (int j = 0; j < num_pts; j++)
         {
             if (fabs(pca_result(0) * point[j].x + pca_result(1) * point[j].y + pca_result(2) * point[j].z + pca_result(3)) > threshold)
             {
@@ -295,7 +297,7 @@ public:
             }
         }
         return true;
-    }            
+    }
 };
 
 struct LidarConfig {

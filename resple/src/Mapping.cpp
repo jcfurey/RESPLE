@@ -184,15 +184,26 @@ class MappingBase
     {
         int64_t time_begin = rclcpp::Time(pc_in.header.stamp).nanoseconds();
         pc->clear();
-        pc_out->points.resize(pc_in.size());
+        const size_t n = pc_in.size();
+        pc_out->points.resize(n);
+        std::vector<uint8_t> valid(n, 0);
         #pragma omp parallel for num_threads(num_threads_)
-        for (size_t i = 0; i < pc_in.size(); i++) {
+        for (size_t i = 0; i < n; i++) {
             const PointType& pt = pc_in.points[i];
             int64_t t_ns = int64_t(pt.intensity * float(1e6)) + time_begin;
             if (t_ns >= spl->minTimeNs() && t_ns <= spl->maxTimeNs()) {
                 pc_out->points[i] = transformPoint(t_ns, spl, pt);
+                valid[i] = 1;
             }
         }
+        // Compact: remove slots where the timestamp was out of range
+        size_t write_idx = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (valid[i]) {
+                pc_out->points[write_idx++] = pc_out->points[i];
+            }
+        }
+        pc_out->points.resize(write_idx);
     }
 
   protected:
@@ -471,7 +482,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
             pt.z = pc_last_hesai->points[i].z;
             double timestamp_s;
             double timestamp_ns = std::modf(pc_last_hesai->points[i].timestamp, &timestamp_s);
-            rclcpp::Time timestamp_ros(static_cast<int32_t>(timestamp_s), static_cast<int32_t>(timestamp_ns * 1.0e9),
+            rclcpp::Time timestamp_ros(static_cast<uint32_t>(timestamp_s), static_cast<uint32_t>(timestamp_ns * 1.0e9),
                 rcl_clock_type_t::RCL_ROS_TIME);
             pt.intensity = (timestamp_ros - timestamp_begin).seconds() * 1.0e3;
             pt.curvature = pc_last_hesai->points[i].intensity;
@@ -680,6 +691,8 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         
         // Clear data
         opt_old_path.poses.clear();
+        path_t_ns_ = 0;
+        if_init_succeed = false;
         
         RCLCPP_INFO(this->get_logger(), "Mapping cleaned up successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -763,6 +776,7 @@ private:
     bool publish_tf, invert_tf;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     bool if_init_succeed = false;
+    int64_t path_t_ns_ = 0;
     std::mutex m_spline;
 
     void displayControlPoints()
@@ -793,7 +807,7 @@ private:
             spline_w.addOneStateKnot(pos, quat_del);
         }
         Eigen::Quaterniond q_idle0 = Eigen::Quaterniond(spline_msg.start_q.w, spline_msg.start_q.x, spline_msg.start_q.y, spline_msg.start_q.z);
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 3 && i < (int)spline_msg.idles.size(); i++) {
             estimate_msgs::msg::Knot idle = spline_msg.idles[i];
             Eigen::Vector3d t_idle(idle.position.x, idle.position.y, idle.position.z);
             Eigen::Vector3d quat_idle(idle.orientation_del.x, idle.orientation_del.y, idle.orientation_del.z);
@@ -861,9 +875,11 @@ private:
         tf2::Matrix3x3 m_last(q_last);
         m_last.getRPY(roll_last, pitch_last, yaw_last);
 
-        odom_msg.twist.twist.angular.x = (roll_current - roll_last)/dt;
-        odom_msg.twist.twist.angular.y = (pitch_current - pitch_last)/dt;
-        odom_msg.twist.twist.angular.z = (yaw_current - yaw_last)/dt;
+        if(dt >= 1e-10) {
+            odom_msg.twist.twist.angular.x = (roll_current - roll_last)/dt;
+            odom_msg.twist.twist.angular.y = (pitch_current - pitch_last)/dt;
+            odom_msg.twist.twist.angular.z = (yaw_current - yaw_last)/dt;
+        }
 
         odom_msg.twist.covariance[0]  =  cov_twist[0];
         odom_msg.twist.covariance[7]  =  cov_twist[1];
@@ -888,41 +904,44 @@ private:
             baselink_to_map.transform.rotation = odom_pose_current.pose.orientation;
 
             // Get frame to odom transform
-            geometry_msgs::msg::TransformStamped odom_to_baselink;             
+            geometry_msgs::msg::TransformStamped odom_to_baselink;
+            bool got_odom_transform = false;
             try {
-                
-                if (tf_buffer->canTransform(this->frame_id, this->odom_id, 
+                if (tf_buffer->canTransform(this->frame_id, this->odom_id,
                                             odom_msg.header.stamp, rclcpp::Duration::from_seconds(0.1))) {
-                        odom_to_baselink = tf_buffer->lookupTransform(this->frame_id, this->odom_id, odom_msg.header.stamp);
-                    } else {
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
-                                            "[Mapping] Waiting for odom transform: %s -> %s", 
-                                            this->frame_id.c_str(), this->odom_id.c_str());
-                    }
+                    odom_to_baselink = tf_buffer->lookupTransform(this->frame_id, this->odom_id, odom_msg.header.stamp);
+                    got_odom_transform = true;
+                } else {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                        "[Mapping] Waiting for odom transform: %s -> %s",
+                                        this->frame_id.c_str(), this->odom_id.c_str());
+                }
             } catch (tf2::TransformException& ex) {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                     "[Mapping] LiDAR transform exception: %s", ex.what());
             }
 
             // Subtract baselink_to_odom transform from baselink_to_map transform to get odom_to_map transform
-            tf2::Transform odom_to_baselink_tf, baselink_to_map_tf, odom_to_map_tf;
-            tf2::fromMsg(odom_to_baselink.transform, odom_to_baselink_tf);
-            tf2::fromMsg(baselink_to_map.transform, baselink_to_map_tf);            
-            odom_to_map_tf  = baselink_to_map_tf * odom_to_baselink_tf;
-            if(invert_tf){
-                odom_to_map_tf = odom_to_map_tf.inverse();    
+            if (got_odom_transform) {
+                tf2::Transform odom_to_baselink_tf, baselink_to_map_tf, odom_to_map_tf;
+                tf2::fromMsg(odom_to_baselink.transform, odom_to_baselink_tf);
+                tf2::fromMsg(baselink_to_map.transform, baselink_to_map_tf);
+                odom_to_map_tf  = baselink_to_map_tf * odom_to_baselink_tf;
+                if(invert_tf){
+                    odom_to_map_tf = odom_to_map_tf.inverse();
+                }
+                geometry_msgs::msg::TransformStamped odom_to_map;
+                tf2::toMsg(odom_to_map_tf, odom_to_map.transform);
+                odom_to_map.header.stamp = odom_msg.header.stamp;
+                if(invert_tf){
+                    odom_to_map.header.frame_id = odom_id;
+                    odom_to_map.child_frame_id  = map_id;
+                } else {
+                    odom_to_map.header.frame_id = map_id;
+                    odom_to_map.child_frame_id  = odom_id;
+                }
+                br->sendTransform(odom_to_map);
             }
-            geometry_msgs::msg::TransformStamped odom_to_map;
-            tf2::toMsg(odom_to_map_tf, odom_to_map.transform);
-            odom_to_map.header.stamp = odom_msg.header.stamp;
-            if(invert_tf){            
-                odom_to_map.header.frame_id = odom_id;
-                odom_to_map.child_frame_id  = map_id;
-            } else {
-                odom_to_map.header.frame_id = map_id;
-                odom_to_map.child_frame_id  = odom_id;
-            }
-            br->sendTransform(odom_to_map);
             
             // // Publish base_link -> imu transform
             // geometry_msgs::msg::TransformStamped transformStamped;            
@@ -964,7 +983,7 @@ private:
     void startCallBack(const std_msgs::msg::Int64::SharedPtr start_time_msg)
     {
         int64_t bag_start_time = start_time_msg->data;
-        spline_global.init(0, 0, bag_start_time, 0);
+        spline_global.init(1, 0, bag_start_time, 0);  // dt=1 placeholder; overridden by getEstCallback
         if_init_succeed = true;
     }
 
@@ -973,13 +992,15 @@ private:
         if (!if_init_succeed || spline_global.numKnots() <= 4) {
             return;
         }
-        static int64_t t_ns = spline_global.minTimeNs();
-        while (t_ns < std::min(spl_window_st_ns, spline_global.maxTimeNs())) {
+        if (path_t_ns_ == 0) {
+            path_t_ns_ = spline_global.minTimeNs();
+        }
+        while (path_t_ns_ < std::min(spl_window_st_ns, spline_global.maxTimeNs())) {
             Eigen::Quaterniond orient_interp;
-            Eigen::Vector3d t_interp = spline_global.itpPosition(t_ns);
-            spline_global.itpQuaternion(t_ns, &orient_interp);
-            opt_old_path.poses.push_back(CommonUtils::pose2msg(map_id, t_ns, t_interp, orient_interp));
-            t_ns += 1e8;
+            Eigen::Vector3d t_interp = spline_global.itpPosition(path_t_ns_);
+            spline_global.itpQuaternion(path_t_ns_, &orient_interp);
+            opt_old_path.poses.push_back(CommonUtils::pose2msg(map_id, path_t_ns_, t_interp, orient_interp));
+            path_t_ns_ += 1e8;
         }
         opt_old_path.header.frame_id = map_id;
         opt_old_path.header.stamp = rclcpp::Time(spline_global.maxTimeNs());
@@ -1055,8 +1076,8 @@ int main(int argc, char** argv) {
     } else {
         // Context already shut down (Ctrl+C), just stop processing
         RCLCPP_WARN(node->get_logger(), "Context invalid, forcing shutdown...");
-        // Manually trigger deactivation to stop thread
-        node->on_deactivate(node->get_current_state());
+        // Manually trigger shutdown to stop thread
+        node->on_shutdown(node->get_current_state());
     }
     exec.remove_node(node->get_node_base_interface());
     exec.remove_node(temp_nh);

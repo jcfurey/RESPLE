@@ -476,6 +476,7 @@ private:
     Eigen::aligned_deque<ImuData> imu_meas;
     Eigen::aligned_vector<sensor_msgs::msg::Imu::SharedPtr> imu_int_buff;    
     std::mutex m_buff;
+    std::mutex mtx_map_;
     bool acc_ratio;
     Eigen::Vector3d cov_ba;
     Eigen::Vector3d cov_bg;
@@ -539,10 +540,13 @@ private:
             feedback->status = "Extracting points from map...";
             feedback->progress = 10.0;
             goal_handle->publish_feedback(feedback);
-            
+
             pcl::PointCloud<pcl::PointXYZINormal>::Ptr map_cloud(new pcl::PointCloud<pcl::PointXYZINormal>());
-            ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
-            map_cloud->points = ikdtree.PCL_Storage;
+            {
+                std::lock_guard<std::mutex> map_lock(mtx_map_);
+                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                map_cloud->points = ikdtree.PCL_Storage;
+            }
             map_cloud->width = map_cloud->points.size();
             map_cloud->height = 1;
             map_cloud->is_dense = false;
@@ -1123,7 +1127,7 @@ private:
                 pt.z = pc_last_hesai->points[i].z;
                 double timestamp_s;
                 double timestamp_ns = std::modf(pc_last_hesai->points[i].timestamp, &timestamp_s);
-                rclcpp::Time timestamp_ros(static_cast<int32_t>(timestamp_s), static_cast<int32_t>(timestamp_ns * 1.0e9),
+                rclcpp::Time timestamp_ros(static_cast<uint32_t>(timestamp_s), static_cast<uint32_t>(timestamp_ns * 1.0e9),
                     rcl_clock_type_t::RCL_ROS_TIME);
                 pt.intensity = (timestamp_ros - timestamp_begin).seconds() * 1.0e3;
                 pt.curvature = pc_last_hesai->points[i].intensity;
@@ -1376,7 +1380,10 @@ private:
                     lidar_data.pt_buff.pop_front();
                 }
             }
-            ikdtree.Build(pc_world.points);
+            {
+                std::lock_guard<std::mutex> map_lock(mtx_map_);
+                ikdtree.Build(pc_world.points);
+            }
             pc_world.clear();
             if_init_map = true;
         }
@@ -1498,6 +1505,7 @@ private:
         LocalMap_Points = New_LocalMap_Points;
 
         if(cub_needrm.size() > 0) {
+            std::lock_guard<std::mutex> map_lock(mtx_map_);
             ikdtree.Delete_Point_Boxes(cub_needrm);
         }
     }
@@ -1534,8 +1542,11 @@ private:
                 PointNoNeedDownsample.emplace_back(point);
             }
         }
-        ikdtree.Add_Points(PointToAdd, true);
-        ikdtree.Add_Points(PointNoNeedDownsample, false);
+        {
+            std::lock_guard<std::mutex> map_lock(mtx_map_);
+            ikdtree.Add_Points(PointToAdd, true);
+            ikdtree.Add_Points(PointNoNeedDownsample, false);
+        }
     }
 
 };
