@@ -241,6 +241,9 @@ public:
         pt_meas.clear();
         pc_world.clear();
         accum_nearest_points.clear();
+        if_init_filter = false;
+        if_init_map = false;
+        localmap_initialized_ = false;
         
         // Reset publishers
         pub_est.reset();
@@ -456,6 +459,7 @@ private:
     const float MOV_THRESHOLD = 1.5f;
     float det_range = 100.0;
     bool if_init_map = false;
+    bool localmap_initialized_ = false;
     struct LidarData {
         Eigen::aligned_deque<Eigen::aligned_vector<pcl::PointXYZINormal>> pc_buff;
         std::deque<int64_t> t_buff;
@@ -1381,23 +1385,19 @@ private:
 
     bool collectMeasurements()
     {
-        rclcpp::Rate rate(20);
         int64_t pt_min_time = std::numeric_limits<int64_t>::max();
         int64_t pt_max_time = std::numeric_limits<int64_t>::max();
         for (const auto& [lidar_name, lidar_data] : lidars_data) {
             if (lidar_data.pt_buff.empty()) {
-                rate.sleep();
                 return false;
             }
             pt_min_time = std::min(pt_min_time, lidar_data.pt_buff.front().time_ns);
             pt_max_time = std::min(pt_max_time, lidar_data.pt_buff.back().time_ns);
         }
         if (pt_max_time <= spline->maxTimeNs() + dt_ns) {
-            rate.sleep();
             return false;
         }
         if (!if_lidar_only && (imu_buff.empty() || imu_buff.back().time_ns <= spline->maxTimeNs())) {
-            rate.sleep();
             return false;
         }
         int64_t max_time_ns = std::min(spline->maxTimeNs(), pt_min_time + dt_ns);
@@ -1452,7 +1452,6 @@ private:
 
     void lasermapFovSegment()
     {
-        static bool Localmap_Initialized = false;
         cub_needrm.shrink_to_fit();
         Eigen::Vector3d pos_lidar_min(std::numeric_limits<double>::max(), std::numeric_limits<double>::max(),
             std::numeric_limits<double>::max());
@@ -1463,12 +1462,12 @@ private:
             pos_lidar_min = pos_lidar_min.array().min(pos_lidar.array()).matrix();
             pos_lidar_max = pos_lidar_max.array().max(pos_lidar.array()).matrix();
         }
-        if (!Localmap_Initialized){
+        if (!localmap_initialized_){
             for (int i = 0; i < 3; i++){
                 LocalMap_Points.vertex_min[i] = pos_lidar_min(i) - cube_len / 2.0;
                 LocalMap_Points.vertex_max[i] = pos_lidar_max(i) + cube_len / 2.0;
             }
-            Localmap_Initialized = true;
+            localmap_initialized_ = true;
             return;
         }
         float dist_to_map_edge[3][2];
