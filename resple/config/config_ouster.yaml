@@ -32,9 +32,10 @@
 
     ds_scan_voxel: 0.1
     point_filter_num: 3
+    num_threads: 5
     nn_thresh: 0.5
     coeff_cov: 3.0
-    num_nn: 8
+    num_match_points: 8    # was num_nn (old name, silently ignored by code)
 
     ds_lm_voxel: 0.1
     cube_len: 1000.0

@@ -17,14 +17,6 @@
     topic_imu: /gt_box/livox/imu
     acc_ratio: true  
     lidars: ["hesai"]
-    livox:
-      topic_lidar: /gt_box/livox/lidar 
-      lidar_type: Mid360Boxi
-      scan_line: 4
-      blind: 0.5
-      q_lb: [0.999976, 0.000002, 0.000670, 0.006906]
-      t_lb: [0.010345, 0.022305, -0.033211]
-      w_pt: 0.01
     hesai:
       topic_lidar: /gt_box/hesai/points 
       lidar_type: Hesai
@@ -40,9 +32,10 @@
     
     ds_scan_voxel: 0.2
     point_filter_num: 2
+    num_threads: 5
     nn_thresh: 0.5
     coeff_cov: 10.0
-    num_nn: 5
+    num_match_points: 5    # was num_nn (old name, silently ignored by code)
 
     ds_lm_voxel: 0.2
     cube_len: 1000.0
