@@ -781,6 +781,7 @@ private:
 
     void displayControlPoints()
     {
+        if (spline_global.numKnots() < 4) { return; }
         sensor_msgs::msg::PointCloud points_msg;
         points_msg.header.frame_id = map_id;
         points_msg.header.stamp = rclcpp::Time(spline_global.maxTimeNs());

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <iostream>
 #include "SplineState.h"
 #include "Association.h"
 
@@ -342,7 +343,12 @@ class Estimator
         Eigen::Matrix<double, XSIZE, 1> RCPs_post;
         Eigen::MatrixXd I_X = Eigen::MatrixXd::Identity(XSIZE, XSIZE); 
         if (num_pts > XSIZE) {
-            Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp_inv = cov_prop.llt().solve(I_X);
+            auto llt_prop = cov_prop.llt();
+            if (llt_prop.info() != Eigen::Success) {
+                std::cerr << "[Estimator] cov_prop LLT decomposition failed, skipping update\n";
+                return;
+            }
+            Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp_inv = llt_prop.solve(I_X);
             Eigen::Matrix<double, XSIZE, RSIZE> HT_R_inv;
             HT_R_inv.noalias() = (H.transpose().array().rowwise() * R_inv.transpose().array()).matrix();
             Eigen::Matrix<double, XSIZE, XSIZE> HT_R_inv_H;
@@ -350,20 +356,30 @@ class Estimator
 
             Eigen::Matrix<double, XSIZE, XSIZE> S = HT_R_inv_H;
             S.noalias() += cov_rcp_inv;
-            Eigen::Matrix<double, XSIZE, XSIZE> S_inv = S.llt().solve(I_X);
+            auto llt_S = S.llt();
+            if (llt_S.info() != Eigen::Success) {
+                std::cerr << "[Estimator] S LLT decomposition failed, skipping update\n";
+                return;
+            }
+            Eigen::Matrix<double, XSIZE, XSIZE> S_inv = llt_S.solve(I_X);
             Eigen::Matrix<double, XSIZE, RSIZE> K;
             K.noalias() = S_inv * HT_R_inv;
 
-            KH.noalias() = S_inv * HT_R_inv_H;     
+            KH.noalias() = S_inv * HT_R_inv_H;
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
-            Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;      
-            RCPs_post.noalias() = getState() + deltax;      
+            Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;
+            RCPs_post.noalias() = getState() + deltax;
         } else {
             Eigen::Matrix<double, RSIZE, RSIZE> R = R_inv.cwiseInverse().asDiagonal();
             Eigen::Matrix<double, RSIZE, RSIZE> S;
             S.noalias() = H * cov_prop * H.transpose() + R;
+            Eigen::FullPivLU<Eigen::Matrix<double, RSIZE, RSIZE>> lu_S(S);
+            if (!lu_S.isInvertible()) {
+                std::cerr << "[Estimator] S matrix singular, skipping update\n";
+                return;
+            }
             Eigen::Matrix<double, XSIZE, RSIZE> K;
-            K.noalias() = cov_prop * H.transpose() * S.inverse();
+            K.noalias() = cov_prop * H.transpose() * lu_S.inverse();
             KH.noalias() = K * H;
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
             Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;

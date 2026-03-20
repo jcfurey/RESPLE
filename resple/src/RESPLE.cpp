@@ -323,10 +323,12 @@ public:
                 continue;
             }
             while (collectMeasurements()) {
+                if (pt_meas.empty() && imu_meas.empty()) { continue; }
                 // Track computation time
                 auto frame_start = std::chrono::high_resolution_clock::now();
-                
-                int64_t max_time_ns = pt_meas.back().time_ns;
+
+                int64_t max_time_ns = !pt_meas.empty() ? pt_meas.back().time_ns
+                                                        : imu_meas.back().time_ns;
                 if (if_lidar_only) {
                     estimator_lo.propRCP(max_time_ns);
                     estimator_lo.updateIEKFLiDAR(pt_meas, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
