@@ -254,8 +254,16 @@ class Estimator
                     innv(idx_offset) = - pt_data.zp;
                     H.row(idx_offset) = Hi;
                     
-                } 
-                mat_cov_inv(idx_offset) = 1/pt_data.var_pt;
+                }
+                // Range-dependent noise: quadratically inflate measurement variance
+                // for close-range points to prevent single-surface degeneracy.
+                // Below range_ref, noise scales as (range_ref/r)^2, so a wall at
+                // 1.5m gets 4x the noise of one at 3m.  This limits how much a
+                // single nearby plane can dominate H^T R^{-1} H.
+                constexpr double range_ref = 3.0;   // full weight above this [m]
+                double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
+                double noise_scale = (r < range_ref) ? (range_ref * range_ref) / (r * r) : 1.0;
+                mat_cov_inv(idx_offset) = 1.0 / (pt_data.var_pt * noise_scale);
                 idx_offset++;
             }
         }        
@@ -296,8 +304,12 @@ class Estimator
                         if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
                             innv(idx_offset) = - pt_data.zp;
                             H.block(idx_offset, 0, 1, 24) = pt_data.H;
-                        } 
-                        mat_cov_inv(idx_offset) = 1/pt_data.var_pt;
+                        }
+                        // Range-dependent noise (see updateLiDAR for rationale)
+                        constexpr double range_ref = 3.0;
+                        double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
+                        double noise_scale = (r < range_ref) ? (range_ref * range_ref) / (r * r) : 1.0;
+                        mat_cov_inv(idx_offset) = 1.0 / (pt_data.var_pt * noise_scale);
                         idx_offset++;
                     }
                     id_pt++;
