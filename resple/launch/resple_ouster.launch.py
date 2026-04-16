@@ -15,6 +15,14 @@ def generate_launch_description():
         'config.rviz')
     return launch.LaunchDescription([
         launch_ros.actions.Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='lidar_tf',
+            arguments=[
+                '--x', '0.0', '--y', '0.0', '--z', '0.0',
+                '--qx', '0.0', '--qy', '0.0', '--qz', '0.0', '--qw', '1.0',
+                '--frame-id', 'base_link', '--child-frame-id', 'os_sensor']),
+        launch_ros.actions.Node(
             package='rviz2',
             executable='rviz2',
             name='rviz2',

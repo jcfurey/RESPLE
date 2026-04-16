@@ -12,12 +12,20 @@ def generate_launch_description():
         get_package_share_directory('resple'),
         'config',
         'config.rviz')        
-    return launch.LaunchDescription([   
+    return launch.LaunchDescription([
+        launch_ros.actions.Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='lidar_tf',
+            arguments=[
+                '--x', '0.011', '--y', '0.02329', '--z', '-0.04412',
+                '--qx', '0.0', '--qy', '0.0', '--qz', '0.0', '--qw', '1.0',
+                '--frame-id', 'base_link', '--child-frame-id', 'livox_frame']),
         launch_ros.actions.Node(
             package='rviz2',
             executable='rviz2',
             name='rviz2',
-            arguments=['-d', config_rviz, '--ros-args', '--log-level', 'WARN']),                  	                
+            arguments=['-d', config_rviz, '--ros-args', '--log-level', 'WARN']),
         launch_ros.actions.Node(
             package='resple',
             executable='RESPLE',

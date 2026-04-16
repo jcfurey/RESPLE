@@ -21,9 +21,11 @@ def generate_launch_description():
         launch_ros.actions.Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            name='static_transform_publisher',
-            output='log',
-            arguments=['0', '0', '0', '0', '0', '0', 'map', 'my_frame', '--ros-args', '--log-level', 'WARN']),                
+            name='lidar_tf',
+            arguments=[
+                '--x', '-0.04165', '--y', '-0.02326', '--z', '0.0284',
+                '--qx', '0.0', '--qy', '0.0', '--qz', '0.0', '--qw', '1.0',
+                '--frame-id', 'base_link', '--child-frame-id', 'livox_frame']),
         launch_ros.actions.Node(
             package='resple',
             executable='RESPLE',

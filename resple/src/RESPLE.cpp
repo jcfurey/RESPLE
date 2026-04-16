@@ -26,6 +26,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/common/transforms.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/console/print.h>
 #include <queue>
 #include <thread>
 #include <mutex>
@@ -1668,6 +1669,7 @@ private:
 
 int main(int argc, char *argv[])
 {
+    pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
     rclcpp::init(argc, argv);
     
     // Phase 4: Lifecycle node initialization

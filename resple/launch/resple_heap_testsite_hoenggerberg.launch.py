@@ -12,12 +12,28 @@ def generate_launch_description():
         get_package_share_directory('resple'),
         'config',
         'config.rviz')        
-    return launch.LaunchDescription([  
+    return launch.LaunchDescription([
+        launch_ros.actions.Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='livox_tf',
+            arguments=[
+                '--x', '0.010345', '--y', '0.022305', '--z', '-0.033211',
+                '--qx', '0.000002', '--qy', '0.000670', '--qz', '0.006906', '--qw', '0.999976',
+                '--frame-id', 'base_link', '--child-frame-id', 'livox_frame']),
+        launch_ros.actions.Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='hesai_tf',
+            arguments=[
+                '--x', '-0.016286160655580', '--y', '-0.010352248240829', '--z', '0.128925315833111',
+                '--qx', '-0.703743110426531', '--qy', '0.710453977622183', '--qz', '-0.000387167175118', '--qw', '0.000793920391926',
+                '--frame-id', 'base_link', '--child-frame-id', 'hesai_lidar']),
         launch_ros.actions.Node(
             package='rviz2',
             executable='rviz2',
             name='rviz2',
-            arguments=['-d', config_rviz, '--ros-args', '--log-level', 'WARN']),                   	      
+            arguments=['-d', config_rviz, '--ros-args', '--log-level', 'WARN']),
         launch_ros.actions.Node(
             package='resple',
             executable='RESPLE',

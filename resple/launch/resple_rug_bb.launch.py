@@ -3,24 +3,24 @@ import launch
 import launch_ros.actions
 from ament_index_python.packages import get_package_share_directory
 
-def generate_launch_description():    
+def generate_launch_description():
     config_yaml_fusion = os.path.join(
         get_package_share_directory('resple'),
         'config',
-        'config_eee02.yaml')
+        'config_rug_bb.yaml')
     config_rviz = os.path.join(
         get_package_share_directory('resple'),
         'config',
-        'config.rviz')        
+        'config.rviz')
     return launch.LaunchDescription([
         launch_ros.actions.Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='lidar_tf',
             arguments=[
-                '--x', '0.05', '--y', '0.0', '--z', '-0.055',
+                '--x', '0.0', '--y', '0.0', '--z', '0.0',
                 '--qx', '0.0', '--qy', '0.0', '--qz', '0.0', '--qw', '1.0',
-                '--frame-id', 'base_link', '--child-frame-id', 'os_sensor']),
+                '--frame-id', 'base_link', '--child-frame-id', 'livox_frame']),
         launch_ros.actions.Node(
             package='rviz2',
             executable='rviz2',
@@ -41,6 +41,5 @@ def generate_launch_description():
             emulate_tty=True,
             output='log',
             parameters=[config_yaml_fusion],
-            arguments=['--ros-args', '--log-level', 'warn'])                
-  ])
-
+            arguments=['--ros-args', '--log-level', 'warn'])
+    ])

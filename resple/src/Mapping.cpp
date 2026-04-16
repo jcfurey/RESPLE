@@ -14,6 +14,7 @@
 #include <pcl/features/normal_3d.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/common/transforms.h>
+#include <pcl/console/print.h>
 
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -1036,6 +1037,7 @@ private:
 };
 
 int main(int argc, char** argv) {
+    pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
     rclcpp::init(argc, argv);
     
     // Create temporary node for parameter loading (use unique name)
