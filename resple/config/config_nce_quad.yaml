@@ -1,26 +1,41 @@
 /**:
   ros__parameters:
+    # Frame IDs for TF tree
+    odom/frame_id: odom              # Odom (odometry frame_id) frame
+    map/frame_id: map                # Odom (odometry frame_id) frame
+    frame_id: base_link              # Robot (odometry child_frame_id) frame
+
+    odom/publish_tf: True
+    odom/invert_tf: False
+    map/publish_tf: True
+    map/invert_tf: False
+
+    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
+    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
+    publish_tf: true
+
     topic_imu: /os_cloud_node/imu
-    acc_ratio: false  
+    acc_ratio: false
     lidars: ["Ouster"]
     Ouster:
       topic_lidar: /os_cloud_node/points
       lidar_type: Ouster
       scan_line: 128
       blind: 0.5
-      q_lb: [1.0, 0.0, 0.0, 0.0]      
-      t_lb: [-0.014, 0.012, 0.015]    
-      w_pt: 0.05 
+      q_lb: [1.0, 0.0, 0.0, 0.0]
+      t_lb: [-0.014, 0.012, 0.015]
+      w_pt: 0.05
     lidar_time_offset: 0.0
 
     knot_hz: 100
-    if_lidar_only: false  
-    
+    if_lidar_only: false
+
     ds_scan_voxel: 0.5
     point_filter_num: 1
+    num_threads: 8
     nn_thresh: 0.5
     coeff_cov: 10.0
-    num_nn: 8
+    num_match_points: 8    # k-NN for plane fit
 
     ds_lm_voxel: 0.5
     cube_len: 1000.0
@@ -33,8 +48,11 @@
     std_sys_pos: 0.2
     std_sys_ort: 0.1
     cov_acc: [1.0,1.0,1.0]
-    cov_gyro: [0.1,0.1,0.1]     
+    cov_gyro: [0.1,0.1,0.1]
     cov_ba: [0.2, 0.2, 0.2]
-    cov_bg: [0.2, 0.2, 0.2]      
+    cov_bg: [0.2, 0.2, 0.2]
     n_iter: 1
     num_points_upd: 300
+
+    imu_init_num_samples: 50     # IMU samples averaged during stationary init
+    imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²

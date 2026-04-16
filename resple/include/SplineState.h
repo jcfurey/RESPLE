@@ -327,10 +327,9 @@ class SplineState
 
     void getSplineMsg(estimate_msgs::msg::Spline& spline_msg, const int start_idx_hint)
     {
-        static int last_start_idx = 0;
         spline_msg.dt = dt_ns;
         int sidx = std::min(std::max((int)(num_knot - 5), 0), start_idx_hint);
-        spline_msg.start_idx = std::min(sidx, last_start_idx+1);
+        spline_msg.start_idx = std::min(sidx, last_start_idx_+1);
         spline_msg.start_t = getKnotTimeNs(num_knot - 5);
         for (size_t i = spline_msg.start_idx; i < (size_t) num_knot; i++) {
             estimate_msgs::msg::Knot knot_msg;
@@ -360,7 +359,7 @@ class SplineState
             spline_msg.start_idx = 0;
 
         } 
-        last_start_idx = std::max((int)spline_msg.start_idx, (int)(num_knot - 5));
+        last_start_idx_ = std::max((int)spline_msg.start_idx, (int)(num_knot - 5));
 
     }    
 
@@ -379,6 +378,7 @@ class SplineState
     int64_t num_knot;
     int64_t start_i;
     int64_t start_t_ns;
+    int last_start_idx_ = 0;
 
     std::array<Eigen::Vector3d, 3> t_idle;
     std::array<Eigen::Vector3d, 3> ort_delta_idle;
