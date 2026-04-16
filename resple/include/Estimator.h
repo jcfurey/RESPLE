@@ -89,8 +89,9 @@ class Estimator
                 converged = true;
             }
             if ((t > n_iter) || (i == max_iter - 1)) {
-                cov_rcp = ( Eigen::MatrixXd::Identity(XSIZE, XSIZE) - KH) * cov_prop;
-                cov_rcp = 0.5*(cov_rcp + cov_rcp.transpose());
+                // Joseph-form posterior was computed inside update(); just copy it out.
+                // Symmetrize defensively to clean up any FP roundoff from the matrix products.
+                cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
                 break;
             }
         }
@@ -137,8 +138,9 @@ class Estimator
                 converged = true;
             }
             if ((t > n_iter) || (i == max_iter - 1)) {
-                cov_rcp = ( Eigen::MatrixXd::Identity(XSIZE, XSIZE) - KH) * cov_prop;
-                cov_rcp = 0.5*(cov_rcp + cov_rcp.transpose());
+                // Joseph-form posterior was computed inside update(); just copy it out.
+                // Symmetrize defensively to clean up any FP roundoff from the matrix products.
+                cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
                 break;
             }
         }
@@ -223,6 +225,10 @@ class Estimator
     Eigen::Vector3d bg = Eigen::Vector3d::Zero();
     Eigen::Vector3d ba = Eigen::Vector3d::Zero();     
     Eigen::Matrix<double, XSIZE, XSIZE> KH;
+    // Joseph-form posterior covariance set by update() each iteration.
+    // P_post = (I - KH) P_prior (I - KH)^T + K R K^T -- numerically PSD-preserving
+    // in floating point, unlike the simpler (I - KH) P_prior form.
+    Eigen::Matrix<double, XSIZE, XSIZE> cov_post_;
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> cov_inv_buf_;
@@ -444,6 +450,14 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
             Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;
             RCPs_post.noalias() = getState() + deltax;
+
+            // Joseph-form posterior covariance: P_post = (I - KH) P (I - KH)^T + K R K^T
+            // R is diagonal with entries 1/R_inv. Scaling K's columns by 1/R_inv gives K*R.
+            Eigen::Matrix<double, XSIZE, XSIZE> I_KH = Eigen::Matrix<double, XSIZE, XSIZE>::Identity() - KH;
+            cov_post_.noalias() = I_KH * cov_prop * I_KH.transpose();
+            Eigen::Matrix<double, XSIZE, RSIZE> KR =
+                (K.array().rowwise() * R_inv.transpose().array().inverse()).matrix();
+            cov_post_.noalias() += KR * K.transpose();
         } else {
             Eigen::Matrix<double, RSIZE, RSIZE> R = R_inv.cwiseInverse().asDiagonal();
             Eigen::Matrix<double, RSIZE, RSIZE> S;
@@ -459,6 +473,13 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
             Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;
             RCPs_post.noalias() = getState() + deltax;
+
+            // Joseph-form posterior covariance: P_post = (I - KH) P (I - KH)^T + K R K^T
+            Eigen::Matrix<double, XSIZE, XSIZE> I_KH = Eigen::Matrix<double, XSIZE, XSIZE>::Identity() - KH;
+            cov_post_.noalias() = I_KH * cov_prop * I_KH.transpose();
+            Eigen::Matrix<double, XSIZE, RSIZE> KR =
+                (K.array().rowwise() * R_inv.transpose().array().inverse()).matrix();
+            cov_post_.noalias() += KR * K.transpose();
         }
         updateState(RCPs_post);
         return true;
