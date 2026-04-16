@@ -17,9 +17,12 @@
   <depend>rclcpp_components</depend>
   <depend>yaml-cpp</depend>
   <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>visualization_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>pcl_conversions</depend>
   <!-- message_runtime is not required for ROS2 packages; removed to match modern ros2 package conventions -->
   <depend>livox_ros_driver</depend>  
   <depend>livox_ros_driver2</depend>
