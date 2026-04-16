@@ -53,7 +53,9 @@ class Estimator
         return state;
     }  
 
-    void updateIEKFLiDAR(Eigen::aligned_deque<PointData>& pt_meas, KD_TREE<pcl::PointXYZINormal>* ikdtree, const double pt_thresh, const double cov_thresh,
+    void updateIEKFLiDAR(Eigen::aligned_deque<PointData>& pt_meas,
+                         std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>>& pt_neighbors,
+                         KD_TREE<pcl::PointXYZINormal>* ikdtree, const double pt_thresh, const double cov_thresh,
                           int num_threads = 5, int num_match_points = 5)
     {
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
@@ -65,7 +67,7 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, num_threads, num_match_points);
+                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, num_threads, num_match_points);
             }
             if (num_tot_eff > 0) {
                 if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
@@ -94,7 +96,9 @@ class Estimator
         }
     }
 
-    void updateIEKFLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, KD_TREE<pcl::PointXYZINormal>* ikdtree, const double pt_thresh,
+    void updateIEKFLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas,
+        std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>>& pt_neighbors,
+        KD_TREE<pcl::PointXYZINormal>* ikdtree, const double pt_thresh,
         Eigen::aligned_deque<ImuData>& imu_meas, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro, const double cov_thresh,
         int num_threads = 5, int num_match_points = 5)
     {
@@ -107,7 +111,7 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, num_threads, num_match_points);
+                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, num_threads, num_match_points);
             }
             bool update_ok = false;
             if (num_tot_eff > 0 && imu_meas.empty()) {

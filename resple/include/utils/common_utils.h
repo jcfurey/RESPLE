@@ -355,7 +355,6 @@ struct PointData {
     Eigen::Vector3d normvec;
     bool if_valid;
     double dist;
-    Eigen::aligned_vector<pcl::PointXYZINormal> nearest_points;
     double zp = 0;
     Eigen::Matrix<double, 1, 24> H = Eigen::Matrix<double, 1, 24>::Zero();
     Eigen::Quaterniond q_bl;
@@ -381,33 +380,6 @@ struct PointData {
         range_sensor = static_cast<float>((pt_b - sensor_origin_body).norm());
     }
 
-    PointData(const PointData& other) : time_ns(other.time_ns), pt(other.pt),
-        pt_b(other.pt_b), pt_w(other.pt_w), normvec(other.normvec),
-        if_valid(other.if_valid), dist(other.dist),
-        nearest_points(other.nearest_points),
-        zp(other.zp), H(other.H), q_bl(other.q_bl), t_bl(other.t_bl), var_pt(other.var_pt),
-        range_sensor(other.range_sensor) {
-    }
-
-    PointData& operator=(const PointData& other) {
-        if (this != &other) {
-            this->time_ns = other.time_ns;
-            this->pt = other.pt;
-            this->pt_b = other.pt_b;
-            this->pt_w = other.pt_w;
-            this->normvec = other.normvec;
-            this->if_valid = other.if_valid;
-            this->nearest_points = other.nearest_points;
-            this->dist = other.dist;
-            this->zp = other.zp;
-            this->H = other.H;
-            this->q_bl = other.q_bl;
-            this->t_bl = other.t_bl;
-            this->var_pt = other.var_pt;
-            this->range_sensor = other.range_sensor;
-        }
-        return *this;
-    }
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 

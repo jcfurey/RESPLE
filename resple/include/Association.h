@@ -24,11 +24,13 @@ public:
         po.curvature = pi.curvature;
     }     
 
-    static void findCorresp(int& effect_num_k, const SplineState* spline, KD_TREE<pcl::PointXYZINormal>* ikdtree, 
-                            Eigen::aligned_deque<PointData>& pt_meas, int num_threads = 5, int num_match_points = 5)
+    static void findCorresp(int& effect_num_k, const SplineState* spline, KD_TREE<pcl::PointXYZINormal>* ikdtree,
+                            Eigen::aligned_deque<PointData>& pt_meas,
+                            std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>>& pt_neighbors,
+                            int num_threads = 5, int num_match_points = 5)
     {
         int num_pt = pt_meas.size();
-        // schedule(static): each thread writes only to its own pt_meas[i], no synchronization needed.
+        // schedule(static): each thread writes only to its own pt_meas[i] / pt_neighbors[i], no synchronization needed.
         #pragma omp parallel num_threads(num_threads)
         {
         // Thread-local scratch buffer reused across iterations to avoid per-point heap allocation.
@@ -43,15 +45,16 @@ public:
             const bool in_active_window = pt_data.time_ns <= spline->maxTimeNs()
                                        && pt_data.time_ns >= spline->maxTimeNs() - 4 * spline->getKnotTimeIntervalNs();
             if (spline->numKnots() != 4 && !in_active_window) {
+                pt_neighbors[i].clear();
                 continue;
             }
             Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
-            pt_data.nearest_points.clear();
-            ikdtree->Nearest_Search(pt_data.pt_w, num_match_points, pt_data.nearest_points, pointSearchSqDis, 2.236);
-            if (pt_data.nearest_points.size() >= (size_t)num_match_points && pointSearchSqDis[num_match_points - 1] < 5) {
-                Eigen::Vector4f pabcd;       
+            pt_neighbors[i].clear();
+            ikdtree->Nearest_Search(pt_data.pt_w, num_match_points, pt_neighbors[i], pointSearchSqDis, 2.236);
+            if (pt_neighbors[i].size() >= (size_t)num_match_points && pointSearchSqDis[num_match_points - 1] < 5) {
+                Eigen::Vector4f pabcd;
                 pabcd.setZero();
-                if (CommonUtils::esti_plane(pabcd, pt_data.nearest_points, 0.1f)) {
+                if (CommonUtils::esti_plane(pabcd, pt_neighbors[i], 0.1f)) {
                     float pd2 = pabcd(0) * pt_data.pt_w.x + pabcd(1) * pt_data.pt_w.y + pabcd(2) * pt_data.pt_w.z + pabcd(3);
                     if (pt_data.range_sensor > 81.0 * pd2 * pd2) {
                         pt_data.if_valid = true;

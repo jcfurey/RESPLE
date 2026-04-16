@@ -356,9 +356,10 @@ public:
 
                 int64_t max_time_ns = !pt_meas.empty() ? pt_meas.back().time_ns
                                                         : imu_meas.back().time_ns;
+                pt_neighbors_.resize(pt_meas.size());
                 if (if_lidar_only) {
                     estimator_lo.propRCP(max_time_ns);
-                    estimator_lo.updateIEKFLiDAR(pt_meas, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
+                    estimator_lo.updateIEKFLiDAR(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
                     total_iekf_iterations_ += estimator_lo.n_iter;
                 } else {
                     if (!imu_meas.empty()) {
@@ -366,20 +367,20 @@ public:
                     }
                     while (!imu_meas.empty() && imu_meas.front().time_ns < spline->maxTimeNs() - spline->getKnotTimeIntervalNs()) {
                         imu_meas.pop_front();
-                    }                         
+                    }
                     estimator_lio.propRCP(max_time_ns);
-                    estimator_lio.updateIEKFLiDARInertial(pt_meas, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
+                    estimator_lio.updateIEKFLiDARInertial(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
                     total_iekf_iterations_ += estimator_lio.n_iter;
                 }
                 #pragma omp parallel for num_threads(num_threads_)
                 for (size_t i = 0; i < pt_meas.size(); i++) {
-                    PointData& pt_data = pt_meas[i];            
+                    PointData& pt_data = pt_meas[i];
                     Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
-                }            
+                }
                 for (size_t i = 0; i < pt_meas.size(); i++) {
                     PointData& pt_data = pt_meas[i];
                     pc_world.points.push_back(pt_data.pt_w);
-                    accum_nearest_points.push_back(pt_data.nearest_points);
+                    accum_nearest_points.push_back(std::move(pt_neighbors_[i]));
                 }
                 pt_meas.clear();
                 if (spline->numKnots() > max_spl_knots) {
@@ -486,6 +487,9 @@ private:
     std::vector<BoxPointType> cub_needrm;
     BoxPointType LocalMap_Points;
     std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> accum_nearest_points;
+    // Per-frame parallel buffer for k-NN results (used to live in PointData::nearest_points).
+    // Sized to pt_meas.size() before each IEKF call; results moved into accum_nearest_points after.
+    std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> pt_neighbors_;
     double cube_len = 2000; 
     const float MOV_THRESHOLD = 1.5f;
     float det_range = 100.0;
