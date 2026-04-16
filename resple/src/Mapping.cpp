@@ -59,7 +59,7 @@ class MappingBase
 
         // Read frame ID parameters
         frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
-        map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map_frame_id", "map");
+        map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map/frame_id", "map");
         num_threads_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "num_threads", 5);
 
         RCLCPP_INFO(nh->get_logger(), "Frame IDs -  map: %s, body: %s", 
@@ -995,41 +995,6 @@ private:
                 }
                 br->sendTransform(odom_to_map);
             }
-            
-            // // Publish base_link -> imu transform
-            // geometry_msgs::msg::TransformStamped transformStamped;            
-            // transformStamped.header.stamp = odom_msg.header.stamp;
-            // transformStamped.header.frame_id = frame_id;
-            // transformStamped.child_frame_id = "imu";
-            // Eigen::Affine3d imu_to_baselink = vis_maps[0]->getImuToBaselink();
-            // Eigen::Vector3d t_imu(imu_to_baselink.inverse().translation());
-            // transformStamped.transform.translation.x = t_imu.x();
-            // transformStamped.transform.translation.y = t_imu.y();
-            // transformStamped.transform.translation.z = t_imu.z();
-            // Eigen::Matrix3d r_imu = imu_to_baselink.inverse().rotation();
-            // Eigen::Quaterniond q_imu(r_imu);            
-            // transformStamped.transform.rotation.w = q_imu.w();
-            // transformStamped.transform.rotation.x = q_imu.x();
-            // transformStamped.transform.rotation.y = q_imu.y();
-            // transformStamped.transform.rotation.z = q_imu.z();
-            // br->sendTransform(transformStamped);
-
-            // // Publish base_link -> lidar transform
-            // transformStamped.header.stamp = odom_msg.header.stamp;
-            // transformStamped.header.frame_id = frame_id;
-            // transformStamped.child_frame_id = "lidar";
-            // Eigen::Affine3d lidar_to_baselink = vis_maps[0]->getLidarToBaselink();
-            // Eigen::Vector3d t_lidar(lidar_to_baselink.inverse().translation());            
-            // transformStamped.transform.translation.x = t_lidar.x();
-            // transformStamped.transform.translation.y = t_lidar.y();
-            // transformStamped.transform.translation.z = t_lidar.z();
-            // Eigen::Matrix3d r_lidar = lidar_to_baselink.inverse().rotation();            
-            // Eigen::Quaterniond q_lidar(r_lidar);               
-            // transformStamped.transform.rotation.w = q_lidar.w();
-            // transformStamped.transform.rotation.x = q_lidar.x();
-            // transformStamped.transform.rotation.y = q_lidar.y();
-            // transformStamped.transform.rotation.z = q_lidar.z();
-            // br->sendTransform(transformStamped);
         }
     }
 

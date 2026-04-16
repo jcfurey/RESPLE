@@ -30,11 +30,11 @@ These four variants have been tested in real-world datasets and our own experime
 }
 ``` 
 ### Dependencies
-Tested with [ROS2 Humble](https://docs.ros.org/en/humble/Installation.html) on Ubuntu 22.04
+Tested with [ROS2 Jazzy](https://docs.ros.org/en/jazzy/Installation.html) on Ubuntu 24.04. (The upstream repository targets ROS2 Humble / Ubuntu 22.04; substitute `humble` for `jazzy` below if using that distro.)
 ```
 sudo apt install libomp-dev libpcl-dev libeigen3-dev
-sudo apt install ros-humble-pcl*
-# Optional: sudo apt install ros-humble-rosbag2-storage-mcap (for playing .mcap file if testing GrandTour dataset)
+sudo apt install ros-jazzy-pcl*
+# Optional: sudo apt install ros-jazzy-rosbag2-storage-mcap (for playing .mcap file if testing GrandTour dataset)
 ```
 
 

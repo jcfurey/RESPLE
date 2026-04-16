@@ -31,7 +31,6 @@
 #include <mutex>
 #include <chrono>
 #include <atomic>
-#include <boost/make_shared.hpp>
 #include <rclcpp/service.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <pcl/filters/voxel_grid.h>
@@ -477,8 +476,7 @@ private:
 
     std::map<std::string, LidarConfig> lidars;
     float ds_lm_voxel;
-    pcl::VoxelGrid<pcl::PointXYZINormal> ds_filter_body;    
-    pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last;
+    pcl::VoxelGrid<pcl::PointXYZINormal> ds_filter_body;
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last_ds;
     pcl::PointCloud<pcl::PointXYZINormal> pc_world;
     int point_filter_num = 1;
@@ -635,9 +633,9 @@ private:
     void readParameters()
     {
         // Frame ID parameters
-        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "odom/publish_tf", true);   
-        invert_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "odom/invert_tf", true);
-        frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_footprint");
+        publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "odom/publish_tf", true);
+        invert_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "odom/invert_tf", false);
+        frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_link");
         odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom/frame_id", "odom");
         
         RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s", 
@@ -697,10 +695,9 @@ private:
         std::vector<double> cov_var = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
         cov_pose << cov_var.at(0), cov_var.at(1), cov_var.at(2), cov_var.at(3), cov_var.at(4), cov_var.at(5);
 
-        pc_last.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
         pc_last_ds.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
-        // num_match_points_ is now initialized in constructor from parameters
-        
+
+
         // Initialize reusable buffers (Phase 3)
         pc_frame_reusable_.reset(new pcl::PointCloud<pcl::PointXYZINormal>());
         laser_cloud_world_reusable_.reset(new pcl::PointCloud<pcl::PointXYZI>());
