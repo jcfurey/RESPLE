@@ -325,6 +325,107 @@ class SplineState
         }
     }  
 
+    // Combined position + quaternion interpolation at the same time.
+    // Shares prepareInterpolation and baseCoeffsWithTime work between the two.
+    // Used in prepLiDAR's hot path (one call per measurement per IEKF iteration).
+    void itpPose(int64_t t_ns,
+                 Eigen::Vector3d* p_out, Jacobian* J_p,
+                 Eigen::Quaterniond* q_out, Jacobian43* J_q) const
+    {
+        int64_t t_ns_rel = t_ns - start_t_ns;
+        int idx_l = floor(double(t_ns_rel) / double(dt_ns));
+        int idx_r = idx_l + 1;
+        int64_t idx0 = std::max(idx_l - 2, 0);
+        double u = (t_ns - start_t_ns - idx_l * dt_ns) / double(dt_ns);
+
+        Eigen::Vector4d p;
+        baseCoeffsWithTime<0>(p, u);
+        const int size_J = std::min(idx_r + 1, 4);
+        const int idx_window = std::max(0, 2 - idx_l);
+        const int n_active = std::min(idx_l + 2, 4);
+
+        // Position interpolation
+        if (p_out || J_p) {
+            std::array<Eigen::Vector3d, 4> cps;
+            for (int i = 0; i < 2 - idx_l; i++) cps[i] = t_idle[i + idx_l + 1];
+            for (int i = 0; i < n_active; i++) cps[i + idx_window] = t_knots[idx0 + i];
+
+            Eigen::Vector4d coeff_p = blending_matrix * p;
+            if (p_out) {
+                *p_out = coeff_p[0]*cps[0] + coeff_p[1]*cps[1] + coeff_p[2]*cps[2] + coeff_p[3]*cps[3];
+            }
+            if (J_p) {
+                J_p->d_val_d_knot.resize(size_J);
+                for (int i = 0; i < size_J; i++) J_p->d_val_d_knot[i] = coeff_p[4 - size_J + i];
+                J_p->start_idx = idx0;
+            }
+        }
+
+        // Quaternion interpolation (shares u, p, idx0, idx_r with above)
+        if (q_out || J_q) {
+            std::array<Eigen::Vector3d, 4> t_delta;
+            for (int i = 0; i < 2 - idx_l; i++) t_delta[i] = ort_delta_idle[i + idx_l + 1];
+            for (int i = 0; i < n_active; i++) t_delta[i + idx_window] = ort_delta[idx0 + i];
+
+            Eigen::Vector4d coeff = cumulative_blending_matrix * p;
+
+            Eigen::Quaterniond cp0;
+            if (idx_r > 3)      cp0 = q_knots[idx0-1];
+            else if (idx_r == 3) cp0 = q_idle[2];
+            else if (idx_r == 2) cp0 = q_idle[1];
+            else if (idx_r == 1) cp0 = q_idle[0];
+            else assert(false);
+
+            Eigen::Vector3d t_delta_scale[4];
+            Eigen::Quaterniond q_delta_scale[4];
+            t_delta_scale[0] = t_delta[0] * coeff[0];
+            t_delta_scale[1] = t_delta[1] * coeff[1];
+            t_delta_scale[2] = t_delta[2] * coeff[2];
+            t_delta_scale[3] = t_delta[3] * coeff[3];
+
+            if (J_q) {
+                Eigen::Matrix<double, 4, 3> dexp_dt[4];
+                Quater::dexp(t_delta_scale[0], q_delta_scale[0], dexp_dt[0]);
+                Quater::dexp(t_delta_scale[1], q_delta_scale[1], dexp_dt[1]);
+                Quater::dexp(t_delta_scale[2], q_delta_scale[2], dexp_dt[2]);
+                Quater::dexp(t_delta_scale[3], q_delta_scale[3], dexp_dt[3]);
+                Eigen::Quaterniond q_r_all[4];
+                q_r_all[3] = Eigen::Quaterniond::Identity();
+                for (int i = 2; i >= 0; i--) q_r_all[i] = q_delta_scale[i+1] * q_r_all[i+1];
+
+                Eigen::Quaterniond q_itps[4];
+                q_itps[0] = cp0 * q_delta_scale[0];
+                q_itps[1] = q_itps[0] * q_delta_scale[1];
+                q_itps[2] = q_itps[1] * q_delta_scale[2];
+                q_itps[3] = q_itps[2] * q_delta_scale[3];
+                q_itps[3].normalize();
+                if (q_out) *q_out = q_itps[3];
+
+                Eigen::Matrix4d Q_l_all[4];
+                Quater::Qleft(cp0, Q_l_all[0]);
+                Quater::Qleft(q_itps[0], Q_l_all[1]);
+                Quater::Qleft(q_itps[1], Q_l_all[2]);
+                Quater::Qleft(q_itps[2], Q_l_all[3]);
+                J_q->d_val_d_knot.resize(size_J);
+                J_q->start_idx = idx0;
+                for (int i = size_J - 1; i >= 0; i--) {
+                    Eigen::Matrix4d Q_r_all;
+                    Quater::Qright(q_r_all[i], Q_r_all);
+                    J_q->d_val_d_knot[i].noalias() = coeff[i] * Q_r_all * Q_l_all[i] * dexp_dt[i];
+                }
+            } else {
+                Quater::exp(t_delta_scale[0], q_delta_scale[0]);
+                Quater::exp(t_delta_scale[1], q_delta_scale[1]);
+                Quater::exp(t_delta_scale[2], q_delta_scale[2]);
+                Quater::exp(t_delta_scale[3], q_delta_scale[3]);
+                Eigen::Quaterniond q_itp = cp0 * q_delta_scale[0] * q_delta_scale[1]
+                                              * q_delta_scale[2] * q_delta_scale[3];
+                q_itp.normalize();
+                *q_out = q_itp;
+            }
+        }
+    }
+
     void getSplineMsg(estimate_msgs::msg::Spline& spline_msg, const int start_idx_hint)
     {
         spline_msg.dt = dt_ns;

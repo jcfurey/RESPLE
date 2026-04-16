@@ -14,8 +14,8 @@ public:
     static void pointBodyToWorld(int64_t t_ns, const SplineState* spline, const PointType& pi, PointType& po, const Eigen::Vector3d& t_bl, const Eigen::Quaterniond& q_bl) 
     {    
         Eigen::Quaterniond q;
-        Eigen::Vector3d pos = spline->itpPosition(t_ns);
-        spline->itpQuaternion(t_ns, &q);
+        Eigen::Vector3d pos;
+        spline->itpPose(t_ns, &pos, nullptr, &q, nullptr);
         Eigen::Vector3f p_body(pi.x, pi.y, pi.z);
         Eigen::Vector3f p_global = q.cast<float>() * (q_bl.cast<float>() * p_body + t_bl.cast<float>()) + pos.cast<float>();
         po.x = p_global(0);
@@ -29,7 +29,12 @@ public:
     {
         int num_pt = pt_meas.size();
         // schedule(static): each thread writes only to its own pt_meas[i], no synchronization needed.
-        #pragma omp parallel for num_threads(num_threads) schedule(static)
+        #pragma omp parallel num_threads(num_threads)
+        {
+        // Thread-local scratch buffer reused across iterations to avoid per-point heap allocation.
+        std::vector<float> pointSearchSqDis;
+        pointSearchSqDis.reserve(num_match_points);
+        #pragma omp for schedule(static) nowait
         for (int i = 0; i < num_pt; i++) {
             PointData& pt_data = pt_meas[i];
             pt_data.if_valid = false;
@@ -41,9 +46,8 @@ public:
                 continue;
             }
             Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
-            std::vector<float> pointSearchSqDis(num_match_points);
             pt_data.nearest_points.clear();
-            ikdtree->Nearest_Search(pt_data.pt_w, num_match_points, pt_data.nearest_points, pointSearchSqDis, 2.236); 
+            ikdtree->Nearest_Search(pt_data.pt_w, num_match_points, pt_data.nearest_points, pointSearchSqDis, 2.236);
             if (pt_data.nearest_points.size() >= (size_t)num_match_points && pointSearchSqDis[num_match_points - 1] < 5) {
                 Eigen::Vector4f pabcd;       
                 pabcd.setZero();
@@ -52,15 +56,17 @@ public:
                     if (pt_data.range_sensor > 81.0 * pd2 * pd2) {
                         pt_data.if_valid = true;
                         pt_data.normvec = Eigen::Vector3d(pabcd[0], pabcd[1], pabcd[2]);
-                        pt_data.dist = pabcd(3);                            
+                        pt_data.dist = pabcd(3);
                     }
                 }
             }
         }
+        }  // end omp parallel
         for (int i = 0; i < num_pt; i++) {
             if (pt_meas[i].if_valid) {
                 effect_num_k++;
-            } 
-        }    
-    }        
+            }
+        }
+    }
+
 };

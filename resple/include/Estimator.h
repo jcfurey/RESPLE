@@ -255,15 +255,15 @@ class Estimator
         imu_data.H = Hi.template leftCols<24>();
     }    
 
-    void prepLiDAR(PointData& pt_data) const    
+    void prepLiDAR(PointData& pt_data) const
     {
-        if (pt_data.if_valid) { 
+        if (pt_data.if_valid) {
             Eigen::Matrix<double, 1, XSIZE> Hi = Eigen::Matrix<double, 1, XSIZE>::Zero();
             Eigen::Quaterniond q_itp;
             Jacobian43 J_ortdel;
             Jacobian J_pos;
-            spl.itpQuaternion(pt_data.time_ns, &q_itp, nullptr, &J_ortdel);
-            Eigen::Vector3d p_itp = spl.itpPosition(pt_data.time_ns, &J_pos);
+            Eigen::Vector3d p_itp;
+            spl.itpPose(pt_data.time_ns, &p_itp, &J_pos, &q_itp, &J_ortdel);
             Eigen::Matrix3d R_IL = pt_data.q_bl.toRotationMatrix();
             Eigen::Vector3d pt_w = q_itp * (R_IL * pt_data.pt_b + pt_data.t_bl) + p_itp;
             pt_data.zp = pt_data.normvec.dot(pt_w) + pt_data.dist;
