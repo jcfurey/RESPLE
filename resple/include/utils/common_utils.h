@@ -272,6 +272,10 @@ public:
     {
         const int num_pts = static_cast<int>(point.size());
         if (num_pts < 3) { return false; }
+        // Solve A x = b where A rows = [x_j, y_j, z_j], b = -1.
+        // Use fixed-size 3x3 normal-equation form (A^T A) x = A^T b with
+        // colPivHouseholderQr which is rank-revealing — handles the
+        // degenerate case (points through origin / collinear) gracefully.
         Eigen::Matrix<T, 3, 3> ATA = Eigen::Matrix<T, 3, 3>::Zero();
         Eigen::Matrix<T, 3, 1> ATb = Eigen::Matrix<T, 3, 1>::Zero();
         for (int j = 0; j < num_pts; j++)
@@ -280,7 +284,8 @@ public:
             ATA.noalias() += row * row.transpose();
             ATb.noalias() -= row;
         }
-        Eigen::Matrix<T, 3, 1> normvec = ATA.ldlt().solve(ATb);
+        Eigen::Matrix<T, 3, 1> normvec = ATA.colPivHouseholderQr().solve(ATb);
+        if (!normvec.allFinite()) { return false; }
         T n = normvec.norm();
         if (n < static_cast<T>(1e-12)) { return false; }
         T n_inv = static_cast<T>(1.0) / n;

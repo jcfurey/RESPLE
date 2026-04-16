@@ -30,7 +30,6 @@
 #include <queue>
 #include <thread>
 #include <mutex>
-#include <future>
 #include <chrono>
 #include <atomic>
 #include <rclcpp/service.hpp>
@@ -212,9 +211,6 @@ public:
             processing_thread_.join();
         }
 
-        if (map_update_future_.valid())
-            map_update_future_.wait();
-
         // Wait for any in-flight SaveMap action
         {
             std::lock_guard<std::mutex> lock(save_map_mutex_);
@@ -248,9 +244,6 @@ public:
     on_cleanup(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Cleaning up RESPLE...");
-
-        if (map_update_future_.valid())
-            map_update_future_.wait();
 
         // Clear buffers and data structures
         lidars.clear();
@@ -402,17 +395,11 @@ public:
                    
                 }
                 if (max_time_ns >= t_last_map_upd + 1e8) {
-                    if (map_update_future_.valid())
-                        map_update_future_.wait();
-                    pc_world_bg_.points.swap(pc_world.points);
-                    accum_nearest_points_bg_.swap(accum_nearest_points);
+                    mapIncremental(pc_world, accum_nearest_points);
+                    publishFrameWorld(pc_world);
+                    lasermapFovSegment();
                     pc_world.clear();
                     accum_nearest_points.clear();
-                    map_update_future_ = std::async(std::launch::async, [this]() {
-                        mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
-                        publishFrameWorld(pc_world_bg_);
-                        lasermapFovSegment();
-                    });
                     t_last_map_upd = max_time_ns;
                 }
                 
@@ -458,11 +445,6 @@ private:
     rclcpp_action::Server<SaveMapAction>::SharedPtr save_map_action_server_;
     std::thread save_map_thread_;
     std::mutex save_map_mutex_;
-
-    // Async map update
-    std::future<void> map_update_future_;
-    pcl::PointCloud<pcl::PointXYZINormal> pc_world_bg_;
-    std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> accum_nearest_points_bg_;
 
     // Pre-allocated reusable buffers (avoid repeated heap allocations)
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame_reusable_;

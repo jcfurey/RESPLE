@@ -39,10 +39,11 @@ if(ENABLE_OPENMP)
 	find_package(OpenMP REQUIRED)
 endif()
 
+# Eigen's BLAS backend (cuBLAS / OpenBLAS) was tried but caused numerical
+# instability in the IEKF Cholesky updates — the Joseph form is marginally
+# stable and BLAS roundoff differences pushed it over the edge. Use Eigen's
+# built-in implementation instead.
 find_package(BLAS QUIET)
-if(BLAS_FOUND)
-	add_definitions(-DEIGEN_USE_BLAS)
-endif()
 
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
@@ -66,9 +67,9 @@ target_compile_options(${PROJECT_NAME} PRIVATE
 	$<$<CONFIG:Debug>:-DEIGEN_INITIALIZE_MATRICES_BY_NAN>
 )
 if(ENABLE_NATIVE_ARCH)
-	target_compile_options(${PROJECT_NAME} PRIVATE -O3 -march=native -ffast-math)
+	target_compile_options(${PROJECT_NAME} PRIVATE -O3 -march=native)
 else()
-	target_compile_options(${PROJECT_NAME} PRIVATE -O3 -ffast-math)
+	target_compile_options(${PROJECT_NAME} PRIVATE -O3)
 endif()
 
 # Executables just wrap the library - no source duplication
