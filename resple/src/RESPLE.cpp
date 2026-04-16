@@ -30,6 +30,7 @@
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <future>
 #include <chrono>
 #include <atomic>
 #include <rclcpp/service.hpp>
@@ -211,6 +212,9 @@ public:
             processing_thread_.join();
         }
 
+        if (map_update_future_.valid())
+            map_update_future_.wait();
+
         // Wait for any in-flight SaveMap action
         {
             std::lock_guard<std::mutex> lock(save_map_mutex_);
@@ -244,7 +248,10 @@ public:
     on_cleanup(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Cleaning up RESPLE...");
-        
+
+        if (map_update_future_.valid())
+            map_update_future_.wait();
+
         // Clear buffers and data structures
         lidars.clear();
         lidars_data.clear();
@@ -395,11 +402,17 @@ public:
                    
                 }
                 if (max_time_ns >= t_last_map_upd + 1e8) {
-                    mapIncremental();
-                    publishFrameWorld();
-                    lasermapFovSegment();
+                    if (map_update_future_.valid())
+                        map_update_future_.wait();
+                    pc_world_bg_.points.swap(pc_world.points);
+                    accum_nearest_points_bg_.swap(accum_nearest_points);
                     pc_world.clear();
                     accum_nearest_points.clear();
+                    map_update_future_ = std::async(std::launch::async, [this]() {
+                        mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
+                        publishFrameWorld(pc_world_bg_);
+                        lasermapFovSegment();
+                    });
                     t_last_map_upd = max_time_ns;
                 }
                 
@@ -445,6 +458,11 @@ private:
     rclcpp_action::Server<SaveMapAction>::SharedPtr save_map_action_server_;
     std::thread save_map_thread_;
     std::mutex save_map_mutex_;
+
+    // Async map update
+    std::future<void> map_update_future_;
+    pcl::PointCloud<pcl::PointXYZINormal> pc_world_bg_;
+    std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> accum_nearest_points_bg_;
 
     // Pre-allocated reusable buffers (avoid repeated heap allocations)
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame_reusable_;
@@ -1256,16 +1274,16 @@ private:
         lidar_buffs_boxi.last_t_ns.store(time_begin + max_ofs_ns);
 	}
 
-    void publishFrameWorld()
+    void publishFrameWorld(pcl::PointCloud<pcl::PointXYZINormal>& pc)
     {
-        int size = pc_world.points.size();
+        int size = pc.points.size();
         laser_cloud_world_reusable_->clear();
         laser_cloud_world_reusable_->points.resize(size);
         for (int i = 0; i < size; i++) {
-            laser_cloud_world_reusable_->points[i].x = pc_world.points[i].x;
-            laser_cloud_world_reusable_->points[i].y = pc_world.points[i].y;
-            laser_cloud_world_reusable_->points[i].z = pc_world.points[i].z;
-            laser_cloud_world_reusable_->points[i].intensity = pc_world.points[i].curvature;
+            laser_cloud_world_reusable_->points[i].x = pc.points[i].x;
+            laser_cloud_world_reusable_->points[i].y = pc.points[i].y;
+            laser_cloud_world_reusable_->points[i].z = pc.points[i].z;
+            laser_cloud_world_reusable_->points[i].intensity = pc.points[i].curvature;
         }
         
         // Standard publishing (compatible with all RMW implementations)
@@ -1626,17 +1644,18 @@ private:
         }
     }
 
-    void mapIncremental()
+    void mapIncremental(pcl::PointCloud<pcl::PointXYZINormal>& pc,
+                        std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>>& nearest_pts)
     {
         Eigen::aligned_vector<pcl::PointXYZINormal> PointToAdd;
         Eigen::aligned_vector<pcl::PointXYZINormal> PointNoNeedDownsample;
-        int feats_down_size = pc_world.points.size();
+        int feats_down_size = pc.points.size();
         PointToAdd.reserve(feats_down_size);
         PointNoNeedDownsample.reserve(feats_down_size);
         for(int i = 0; i < feats_down_size; i++) {
-            const pcl::PointXYZINormal& point = pc_world.points[i];
-            if (!accum_nearest_points[i].empty()) {
-                const Eigen::aligned_vector<pcl::PointXYZINormal> &points_near = accum_nearest_points[i];
+            const pcl::PointXYZINormal& point = pc.points[i];
+            if (!nearest_pts[i].empty()) {
+                const Eigen::aligned_vector<pcl::PointXYZINormal> &points_near = nearest_pts[i];
                 bool need_add = true;
                 pcl::PointXYZINormal downsample_result, mid_point;
 
@@ -1644,7 +1663,7 @@ private:
                 mid_point.y = floor(point.y/ds_lm_voxel)*ds_lm_voxel + 0.5 * ds_lm_voxel;
                 mid_point.z = floor(point.z/ds_lm_voxel)*ds_lm_voxel + 0.5 * ds_lm_voxel;
                 if (fabs(points_near[0].x - mid_point.x) > 0.866 * ds_lm_voxel || fabs(points_near[0].y - mid_point.y) > 0.866 * ds_lm_voxel || fabs(points_near[0].z - mid_point.z) > 0.866 * ds_lm_voxel){
-                    PointNoNeedDownsample.emplace_back(pc_world.points[i]);
+                    PointNoNeedDownsample.emplace_back(pc.points[i]);
                     continue;
                 }
                 for (size_t readd_i = 0; readd_i < points_near.size(); readd_i ++) {
