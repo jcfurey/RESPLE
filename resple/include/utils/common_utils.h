@@ -25,7 +25,7 @@ struct ImuData {
     Eigen::Matrix<double, 6, 1> imu_itp;
     ImuData(){}
     ImuData(const int64_t s, const Eigen::Vector3d& w, const Eigen::Vector3d& a)
-      : time_ns(s), gyro(w), accel(a) {}
+      : time_ns(s), gyro(w), accel(a), H(Eigen::Matrix<double, 6, 24>::Zero()), imu_itp(Eigen::Matrix<double, 6, 1>::Zero()) {}
 
     ImuData(const ImuData& other) : time_ns(other.time_ns), gyro(other.gyro), accel(other.accel),
     H(other.H), imu_itp(other.imu_itp) {
@@ -206,7 +206,7 @@ public:
     }    
 
     static int64_t ms2ns(const float t_ms) {
-        return (t_ms * float(1e6));
+        return static_cast<int64_t>(static_cast<double>(t_ms) * 1e6);
     }    
 
     static bool time_list(pcl::PointXYZINormal &x, pcl::PointXYZINormal &y) {return (x.intensity < y.intensity);};
@@ -285,6 +285,7 @@ public:
         }
         Eigen::Matrix<T, 3, 1> normvec = A.colPivHouseholderQr().solve(b);
         T n = normvec.norm();
+        if (n < static_cast<T>(1e-12)) { return false; }
         pca_result(0) = normvec(0) / n;
         pca_result(1) = normvec(1) / n;
         pca_result(2) = normvec(2) / n;
@@ -310,6 +311,9 @@ struct LidarConfig {
     Eigen::Quaterniond q_bl;
     Eigen::Vector3d t_bl;
     double w_pt;
+    // Sensor origin in body (base_link) frame — populated from TF at runtime,
+    // NOT from YAML.  Used to compute true sensor-frame range for outlier gating.
+    Eigen::Vector3d sensor_origin_body = Eigen::Vector3d::Zero();
 
     LidarConfig() = default;
 
@@ -352,43 +356,55 @@ struct PointData {
     double zp = 0;
     Eigen::Matrix<double, 1, 24> H = Eigen::Matrix<double, 1, 24>::Zero();
     Eigen::Quaterniond q_bl;
-    Eigen::Vector3d t_bl;    
+    Eigen::Vector3d t_bl;
     double var_pt;
+    // True sensor-frame range: distance from the LiDAR origin, NOT from base_link.
+    // pt_b is stored in base_link frame (after the PCL extrinsic transform), so
+    // pt_b.norm() would give the distance from base_link — wrong for the outlier
+    // gate which scales with actual measurement range.
+    float range_sensor = 0.f;
 
     PointData() {};
     PointData(const pcl::PointXYZINormal& pt_in, int64_t fr_start_time, const Eigen::Quaterniond& q_bl_in,
-        const Eigen::Vector3d& t_bl_in, double w_pt) : pt(pt_in), pt_b(Eigen::Vector3d(pt_in.x, pt_in.y, pt_in.z)), 
+        const Eigen::Vector3d& t_bl_in, double w_pt,
+        const Eigen::Vector3d& sensor_origin_body = Eigen::Vector3d::Zero())
+        : pt(pt_in), pt_b(Eigen::Vector3d(pt_in.x, pt_in.y, pt_in.z)),
         q_bl(q_bl_in), t_bl(t_bl_in) {
         time_ns = fr_start_time + CommonUtils::ms2ns(pt_in.intensity);
         if_valid = false;
         dist = 0;
         var_pt = w_pt;
+        normvec = Eigen::Vector3d::Zero();
+        range_sensor = static_cast<float>((pt_b - sensor_origin_body).norm());
     }
 
-    PointData(const PointData& other) : time_ns(other.time_ns), pt(other.pt), 
-        pt_b(other.pt_b), pt_w(other.pt_w), 
-        if_valid(other.if_valid), dist(other.dist), 
-        nearest_points(other.nearest_points), 
-        zp(other.zp), H(other.H), q_bl(other.q_bl), t_bl(other.t_bl), var_pt(other.var_pt) {
-    }        
+    PointData(const PointData& other) : time_ns(other.time_ns), pt(other.pt),
+        pt_b(other.pt_b), pt_w(other.pt_w), normvec(other.normvec),
+        if_valid(other.if_valid), dist(other.dist),
+        nearest_points(other.nearest_points),
+        zp(other.zp), H(other.H), q_bl(other.q_bl), t_bl(other.t_bl), var_pt(other.var_pt),
+        range_sensor(other.range_sensor) {
+    }
 
     PointData& operator=(const PointData& other) {
-        if (this != &other) { 
+        if (this != &other) {
             this->time_ns = other.time_ns;
             this->pt = other.pt;
             this->pt_b = other.pt_b;
             this->pt_w = other.pt_w;
+            this->normvec = other.normvec;
             this->if_valid = other.if_valid;
             this->nearest_points = other.nearest_points;
             this->dist = other.dist;
             this->zp = other.zp;
             this->H = other.H;
             this->q_bl = other.q_bl;
-            this->t_bl = other.t_bl;   
-            this->var_pt = other.var_pt;         
+            this->t_bl = other.t_bl;
+            this->var_pt = other.var_pt;
+            this->range_sensor = other.range_sensor;
         }
         return *this;
-    }    
+    }
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 

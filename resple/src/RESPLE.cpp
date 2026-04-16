@@ -111,7 +111,9 @@ public:
         pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>(
             "pose", rclcpp::QoS(1).transient_local().reliable());
         pub_pose_cov = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-            "pose_cov", rclcpp::QoS(1).transient_local().reliable());            
+            "pose_cov", rclcpp::QoS(1).transient_local().reliable());
+        pub_odom = this->create_publisher<nav_msgs::msg::Odometry>(
+            "odom", rclcpp::QoS(10).reliable());
         pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -139,6 +141,7 @@ public:
         pub_start_time->on_activate();
         pub_pose->on_activate();
         pub_pose_cov->on_activate();
+        pub_odom->on_activate();
         pub_cur_scan->on_activate();
         
         // Setup subscriptions
@@ -147,11 +150,11 @@ public:
         auto imu_qos = rclcpp::SensorDataQoS().keep_last(200).best_effort();
         auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
         
-        if (!if_lidar_only) {
-            std::string imu_type = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "topic_imu", "imu");
-            sub_imu = this->create_subscription<sensor_msgs::msg::Imu>(
-                imu_type, imu_qos, std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1), sensor_sub_opt);
-        }
+        // Always subscribe to IMU for gravity alignment at startup.
+        // In LO mode, the subscription is dropped after initialization completes.
+        std::string imu_type = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "topic_imu", "imu");
+        sub_imu = this->create_subscription<sensor_msgs::msg::Imu>(
+            imu_type, imu_qos, std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1), sensor_sub_opt);
         
         auto lidar_names = this->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
         assert(this->get_parameter("lidars", lidar_names));
@@ -207,12 +210,21 @@ public:
         if (processing_thread_.joinable()) {
             processing_thread_.join();
         }
-        
+
+        // Wait for any in-flight SaveMap action
+        {
+            std::lock_guard<std::mutex> lock(save_map_mutex_);
+            if (save_map_thread_.joinable()) {
+                save_map_thread_.join();
+            }
+        }
+
         // Deactivate publishers
         pub_est->on_deactivate();
         pub_start_time->on_deactivate();
         pub_pose->on_deactivate();
         pub_pose_cov->on_deactivate();
+        pub_odom->on_deactivate();
         pub_cur_scan->on_deactivate();
         
         // Reset subscriptions
@@ -250,6 +262,7 @@ public:
         pub_start_time.reset();
         pub_pose.reset();
         pub_pose_cov.reset();
+        pub_odom.reset();
         pub_cur_scan.reset();
         br.reset();
         
@@ -267,7 +280,15 @@ public:
         if (processing_thread_.joinable()) {
             processing_thread_.join();
         }
-        
+
+        // Wait for any in-flight SaveMap action
+        {
+            std::lock_guard<std::mutex> lock(save_map_mutex_);
+            if (save_map_thread_.joinable()) {
+                save_map_thread_.join();
+            }
+        }
+
         RCLCPP_INFO(this->get_logger(), "RESPLE shutdown complete");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
@@ -281,12 +302,14 @@ public:
             for (auto& [lidar_name, lidar_data] : lidars_data) {
                 while (!lidar_data.t_buff.empty()) {
                     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame(new pcl::PointCloud<pcl::PointXYZINormal>());
-                    lidar_data.mtx_pc.lock();
-                    pc_frame->points = lidar_data.pc_buff.front();
-                    lidar_data.pc_buff.pop_front();
-                    int64_t time_begin = lidar_data.t_buff.front();
-                    lidar_data.t_buff.pop_front();
-                    lidar_data.mtx_pc.unlock();
+                    int64_t time_begin;
+                    {
+                        std::lock_guard<std::mutex> lock(lidar_data.mtx_pc);
+                        pc_frame->points = lidar_data.pc_buff.front();
+                        lidar_data.pc_buff.pop_front();
+                        time_begin = lidar_data.t_buff.front();
+                        lidar_data.t_buff.pop_front();
+                    }
                     std::vector<int> indices;
                     pcl::removeNaNFromPointCloud(*pc_frame, *pc_frame, indices);
                     pc_last_ds->clear();
@@ -296,16 +319,20 @@ public:
                     sort(pc_last_ds->points.begin(), pc_last_ds->points.end(), &CommonUtils::time_list);
                     const LidarConfig& lidar = lidars.at(lidar_name);
                     for (size_t i = 0; i < pc_last_ds->points.size(); i++) {
-                        PointData pt(pc_last_ds->points[i], time_begin, lidar.q_bl, lidar.t_bl, lidar.w_pt);
+                        PointData pt(pc_last_ds->points[i], time_begin, lidar.q_bl, lidar.t_bl, lidar.w_pt, lidar.sensor_origin_body);
                         lidar_data.pt_buff.push_back(pt);
                     }
                 }
             }            
-            if (!if_lidar_only && !imu_int_buff.empty()) {
-                m_buff.lock();
-                Eigen::aligned_vector<sensor_msgs::msg::Imu::SharedPtr> imu_buff_msg = imu_int_buff;
-                imu_int_buff.clear();
-                m_buff.unlock();
+            // Drain IMU buffer: always during init (gravity alignment needs it),
+            // and during ongoing processing in LIO mode.
+            if ((!if_lidar_only || !if_init_filter) && !imu_int_buff.empty()) {
+                Eigen::aligned_vector<sensor_msgs::msg::Imu::SharedPtr> imu_buff_msg;
+                {
+                    std::lock_guard<std::mutex> lock(m_buff);
+                    imu_buff_msg = imu_int_buff;
+                    imu_int_buff.clear();
+                }
                 for (size_t i = 0; i < imu_buff_msg.size(); i++) {
                     const auto imu_msg = imu_buff_msg[i];
                     int64_t t_ns = rclcpp::Time(imu_msg->header.stamp).nanoseconds();
@@ -416,7 +443,9 @@ private:
     using SaveMapAction = estimate_msgs::action::SaveMap;
     using GoalHandleSaveMap = rclcpp_action::ServerGoalHandle<SaveMapAction>;
     rclcpp_action::Server<SaveMapAction>::SharedPtr save_map_action_server_;
-    
+    std::thread save_map_thread_;
+    std::mutex save_map_mutex_;
+
     // Pre-allocated reusable buffers (avoid repeated heap allocations)
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame_reusable_;
     pcl::PointCloud<pcl::PointXYZI>::Ptr laser_cloud_world_reusable_;
@@ -432,6 +461,7 @@ private:
     rclcpp_lifecycle::LifecyclePublisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_pose_cov;
+    rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;
     rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -526,7 +556,11 @@ private:
     void handleSaveMapAccepted(const std::shared_ptr<GoalHandleSaveMap> goal_handle)
     {
         // Execute in separate thread to not block action server
-        std::thread{std::bind(&RESPLE::executeSaveMap, this, std::placeholders::_1), goal_handle}.detach();
+        std::lock_guard<std::mutex> lock(save_map_mutex_);
+        if (save_map_thread_.joinable()) {
+            save_map_thread_.join();
+        }
+        save_map_thread_ = std::thread{std::bind(&RESPLE::executeSaveMap, this, std::placeholders::_1), goal_handle};
     }
     
     void executeSaveMap(const std::shared_ptr<GoalHandleSaveMap> goal_handle)
@@ -756,6 +790,11 @@ private:
                         lidar_to_baselink_ = tf2::transformToEigen(transform);
                         
                         have_lidar_transform_ = true;
+                        // Populate sensor_origin_body for all lidars from the TF-based
+                        // translation — used for true sensor-frame range in outlier gating.
+                        for (auto& [name, lcfg] : lidars) {
+                            lcfg.sensor_origin_body = lidar_to_baselink_.translation();
+                        }
                         RCLCPP_INFO(this->get_logger(), "[RESPLE] Got LiDAR transform: %s -> %s", 
                                 source_frame_id.c_str(), this->frame_id.c_str());
                     } else {
@@ -821,7 +860,19 @@ private:
     
     void getImuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg)
     {
-        m_buff.lock();
+        std::lock_guard<std::mutex> lock(m_buff);
+        if (imu_int_buff.size() >= 2000) {
+            imu_int_buff.erase(imu_int_buff.begin());
+        }
+
+        // Before filter init, accept raw IMU for gravity alignment.
+        // Gravity direction is frame-independent for roll/pitch — the
+        // accelerometer measures g regardless of the sensor's mounting frame.
+        if (!if_init_filter) {
+            imu_int_buff.push_back(imu_msg);
+            return;
+        }
+
         if (updateImuTransform(imu_msg->header.frame_id)) {
             sensor_msgs::msg::Imu::SharedPtr transformed_imu = transformImu(imu_msg, imu_to_baselink_);
             imu_int_buff.push_back(transformed_imu);
@@ -829,7 +880,6 @@ private:
             // Pass through raw if transform not yet available (assumes IMU already in base_link frame)
             imu_int_buff.push_back(imu_msg);
         }
-        m_buff.unlock();
     }
     
     // Diagnostic updater callback
@@ -907,7 +957,9 @@ private:
         size_t plsize = pc_last_ouster->size();
         if (plsize == 0) return;
         pc_last->reserve(plsize);
-        int64_t time_begin = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds() - time_offset;
+        int64_t stamp_ns = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;  // skip early sim-time messages
+        int64_t time_begin = stamp_ns - time_offset;
         LidarData& lidar_buffs = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -931,10 +983,11 @@ private:
         // Transform point cloud to body frame
         pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_);
 
-        lidar_buffs.mtx_pc.lock();
-        lidar_buffs.pc_buff.push_back(pc_last->points);
-        lidar_buffs.t_buff.push_back(time_begin);
-        lidar_buffs.mtx_pc.unlock();
+        {
+            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
+            lidar_buffs.pc_buff.push_back(pc_last->points);
+            lidar_buffs.t_buff.push_back(time_begin);
+        }
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
     }
 
@@ -986,10 +1039,11 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        lidar_buffs.mtx_pc.lock();
-        lidar_buffs.pc_buff.push_back(pc_transformed->points);
-        lidar_buffs.t_buff.push_back(time_begin);
-        lidar_buffs.mtx_pc.unlock();
+        {
+            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
+            lidar_buffs.pc_buff.push_back(pc_transformed->points);
+            lidar_buffs.t_buff.push_back(time_begin);
+        }
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
     }
 
@@ -1040,10 +1094,11 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        lidar_buffs.mtx_pc.lock();
-        lidar_buffs.pc_buff.push_back(pc_transformed->points);
-        lidar_buffs.t_buff.push_back(time_begin);
-        lidar_buffs.mtx_pc.unlock();
+        {
+            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
+            lidar_buffs.pc_buff.push_back(pc_transformed->points);
+            lidar_buffs.t_buff.push_back(time_begin);
+        }
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
     }
 
@@ -1095,10 +1150,11 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        lidar_buffs.mtx_pc.lock();
-        lidar_buffs.pc_buff.push_back(pc_transformed->points);
-        lidar_buffs.t_buff.push_back(time_begin);
-        lidar_buffs.mtx_pc.unlock();
+        {
+            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
+            lidar_buffs.pc_buff.push_back(pc_transformed->points);
+            lidar_buffs.t_buff.push_back(time_begin);
+        }
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
      }
 
@@ -1145,10 +1201,11 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        lidar_buffs_hesai.mtx_pc.lock();
-        lidar_buffs_hesai.pc_buff.push_back(pc_transformed->points);
-        lidar_buffs_hesai.t_buff.push_back(time_begin);
-        lidar_buffs_hesai.mtx_pc.unlock();
+        {
+            std::lock_guard<std::mutex> lock(lidar_buffs_hesai.mtx_pc);
+            lidar_buffs_hesai.pc_buff.push_back(pc_transformed->points);
+            lidar_buffs_hesai.t_buff.push_back(time_begin);
+        }
         lidar_buffs_hesai.last_t_ns.store(time_begin + max_ofs_ns);
 	}
 
@@ -1193,10 +1250,11 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        lidar_buffs_boxi.mtx_pc.lock();
-        lidar_buffs_boxi.pc_buff.push_back(pc_transformed->points);
-        lidar_buffs_boxi.t_buff.push_back(time_begin);
-        lidar_buffs_boxi.mtx_pc.unlock();
+        {
+            std::lock_guard<std::mutex> lock(lidar_buffs_boxi.mtx_pc);
+            lidar_buffs_boxi.pc_buff.push_back(pc_transformed->points);
+            lidar_buffs_boxi.t_buff.push_back(time_begin);
+        }
         lidar_buffs_boxi.last_t_ns.store(time_begin + max_ofs_ns);
 	}
 
@@ -1232,6 +1290,44 @@ private:
         geometry_msgs::msg::PoseWithCovarianceStamped pose_cov_msg = 
             CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose, cov_pose);
         pub_pose_cov->publish(pose_cov_msg);
+
+        // Publish Odometry (pose + twist) for EKF fusion — twist from spline derivative
+        // gives the odom EKF velocity between pose updates, preventing jumpy corrections.
+        {
+            nav_msgs::msg::Odometry odom_msg;
+            odom_msg.header.frame_id = odom_id;
+            odom_msg.header.stamp = rclcpp::Time(pose_time_ns);
+            odom_msg.child_frame_id = frame_id;
+            odom_msg.pose.pose = pose_cov_msg.pose.pose;
+            // Copy full pose covariance from IEKF posterior
+            for (int i = 0; i < 36; ++i)
+                odom_msg.pose.covariance[i] = pose_cov_msg.pose.covariance[i];
+
+            // Velocity from spline first derivative (world frame), rotated to body frame
+            Eigen::Vector3d v_world = spline->itpPosition<1>(pose_time_ns);
+            Eigen::Vector3d v_body = q_pose.inverse() * v_world;
+            odom_msg.twist.twist.linear.x = v_body.x();
+            odom_msg.twist.twist.linear.y = v_body.y();
+            odom_msg.twist.twist.linear.z = v_body.z();
+
+            // Angular velocity from spline orientation derivative
+            Eigen::Vector3d w_body;
+            spline->itpQuaternion(pose_time_ns, nullptr, &w_body);
+            odom_msg.twist.twist.angular.x = w_body.x();
+            odom_msg.twist.twist.angular.y = w_body.y();
+            odom_msg.twist.twist.angular.z = w_body.z();
+
+            // Twist covariance — use position covariance scaled for velocity uncertainty
+            // Diagonal only: vx, vy, vz, wx, wy, wz
+            odom_msg.twist.covariance[0]  = cov_pose[0] * 4.0;  // vx
+            odom_msg.twist.covariance[7]  = cov_pose[1] * 4.0;  // vy
+            odom_msg.twist.covariance[14] = cov_pose[2] * 4.0;  // vz
+            odom_msg.twist.covariance[21] = cov_pose[3] * 4.0;  // wx
+            odom_msg.twist.covariance[28] = cov_pose[4] * 4.0;  // wy
+            odom_msg.twist.covariance[35] = cov_pose[5] * 4.0;  // wz
+
+            pub_odom->publish(odom_msg);
+        }
 
         // Publish odom transforms
         if(publish_tf)
@@ -1278,50 +1374,60 @@ private:
         }
         if (!if_init_filter) {
             Eigen::Quaterniond q_WI = Eigen::Quaterniond::Identity();
-            if (!if_lidar_only) {
-                m_buff.lock();
-                int buff_size = imu_buff.size();
-                
-                // Wait for sufficient IMU samples
-                if (buff_size < imu_init_num_samples_) {
-                    m_buff.unlock();
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                        "Waiting for %d IMU samples for initialization (current: %d)",
-                        imu_init_num_samples_, buff_size);
-                    return false;
-                }
-                
-                // Compute mean and variance of accelerometer readings
-                Eigen::Vector3d gravity_sum(0, 0, 0);
-                int n_imu = std::min(imu_init_num_samples_, buff_size);
-                for (int i = 0; i < n_imu; i++) {
-                    gravity_sum += imu_buff.at(i).accel;
-                }
-                Eigen::Vector3d gravity_mean = gravity_sum / n_imu;
-                
-                // Check variance to ensure IMU is stationary
+
+            // Always use IMU for gravity alignment, even in LO mode.
+            // This ensures the spline starts gravity-aligned (z = up).
+            {
+                int buff_size;
+                int n_imu;
+                Eigen::Vector3d gravity_mean;
                 double accel_variance = 0.0;
-                for (int i = 0; i < n_imu; i++) {
-                    Eigen::Vector3d diff = imu_buff.at(i).accel - gravity_mean;
-                    accel_variance += diff.squaredNorm();
+                {
+                    std::unique_lock<std::mutex> imu_lock(m_buff);
+                    buff_size = imu_buff.size();
+
+                    // Wait for sufficient IMU samples
+                    if (buff_size < imu_init_num_samples_) {
+                        imu_lock.unlock();
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "Waiting for %d IMU samples for gravity alignment (current: %d)",
+                            imu_init_num_samples_, buff_size);
+                        return false;
+                    }
+
+                    // Compute mean and variance of accelerometer readings.
+                    // Use the NEWEST n_imu samples (tail of the buffer) so that spawning
+                    // transients at the front do not permanently block initialization.
+                    Eigen::Vector3d gravity_sum(0, 0, 0);
+                    n_imu = std::min(imu_init_num_samples_, buff_size);
+                    int start_idx = buff_size - n_imu;  // guaranteed >= 0 by the check above
+                    for (int i = 0; i < n_imu; i++) {
+                        gravity_sum += imu_buff.at(start_idx + i).accel;
+                    }
+                    gravity_mean = gravity_sum / n_imu;
+
+                    // Check variance to ensure IMU is stationary
+                    for (int i = 0; i < n_imu; i++) {
+                        Eigen::Vector3d diff = imu_buff.at(start_idx + i).accel - gravity_mean;
+                        accel_variance += diff.squaredNorm();
+                    }
+                    accel_variance /= n_imu;
+
+                    if (accel_variance > imu_init_max_variance_) {
+                        imu_lock.unlock();
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "IMU readings too noisy for initialization (variance: %.4f > %.4f). "
+                            "Ensure robot is stationary or increase imu_init_max_variance parameter.",
+                            accel_variance, imu_init_max_variance_);
+                        return false;
+                    }
+
+                    // Clean up old IMU data
+                    while (!imu_buff.empty() && imu_buff.front().time_ns < start_t_ns) {
+                        imu_buff.pop_front();
+                    }
                 }
-                accel_variance /= n_imu;
-                
-                if (accel_variance > imu_init_max_variance_) {
-                    m_buff.unlock();
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                        "IMU readings too noisy for initialization (variance: %.4f > %.4f). "
-                        "Ensure robot is stationary or increase imu_init_max_variance parameter.",
-                        accel_variance, imu_init_max_variance_);
-                    return false;
-                }
-                
-                // Clean up old IMU data
-                while (!imu_buff.empty() && imu_buff.front().time_ns < start_t_ns) {
-                    imu_buff.pop_front();
-                }
-                m_buff.unlock();
-                
+
                 // Initialize orientation from gravity
                 Eigen::Vector3d gravity_ave = gravity_mean.normalized() * 9.81;
                 Eigen::Matrix3d R0 = CommonUtils::g2R(gravity_ave);
@@ -1330,11 +1436,21 @@ private:
                 Eigen::Quaterniond q0(R0);
                 q_WI = Quater::positify(q0);
                 gravity = q_WI * gravity_ave;
-                
+
                 RCLCPP_INFO(this->get_logger(),
-                    "IMU initialization successful (samples: %d, variance: %.4f)",
-                    n_imu, accel_variance);
+                    "Gravity alignment successful (samples: %d, variance: %.4f, mode: %s)",
+                    n_imu, accel_variance, if_lidar_only ? "LO" : "LIO");
             }
+
+            // In LO mode, drop IMU subscription after gravity init — not needed for IEKF
+            if (if_lidar_only) {
+                sub_imu.reset();
+                std::lock_guard<std::mutex> lock(m_buff);
+                imu_int_buff.clear();
+                imu_buff.clear();
+                RCLCPP_INFO(this->get_logger(), "LO mode: IMU subscription dropped after gravity alignment");
+            }
+
             initFilter(start_t_ns, Eigen::Vector3d(0, 0, 0), q_WI);
             if_init_filter = true;
             std_msgs::msg::Int64 start_time;

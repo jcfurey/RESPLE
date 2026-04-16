@@ -68,7 +68,11 @@ class Estimator
                 Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, num_threads, num_match_points);
             }
             if (num_tot_eff > 0) {
-                updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads);
+                if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
+                    std::cerr << "[Estimator] IEKF LiDAR update failed (numerical), resetting covariance to prior\n";
+                    cov_rcp = cov_prop;
+                    break;
+                }
             } else {
                 break;
             }
@@ -86,7 +90,7 @@ class Estimator
                 cov_rcp = ( Eigen::MatrixXd::Identity(XSIZE, XSIZE) - KH) * cov_prop;
                 cov_rcp = 0.5*(cov_rcp + cov_rcp.transpose());
                 break;
-            }  
+            }
         }
     }
 
@@ -105,11 +109,17 @@ class Estimator
                 num_tot_eff = 0;
                 Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, num_threads, num_match_points);
             }
+            bool update_ok = false;
             if (num_tot_eff > 0 && imu_meas.empty()) {
-                updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads);
+                update_ok = updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads);
             } else if (num_tot_eff > 0) {
-                updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, g, cov_acc, cov_gyro, num_threads);
+                update_ok = updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, g, cov_acc, cov_gyro, num_threads);
             } else {
+                break;
+            }
+            if (!update_ok) {
+                std::cerr << "[Estimator] IEKF LIO update failed (numerical), resetting covariance to prior\n";
+                cov_rcp = cov_prop;
                 break;
             }
             converged = true;
@@ -126,7 +136,7 @@ class Estimator
                 cov_rcp = ( Eigen::MatrixXd::Identity(XSIZE, XSIZE) - KH) * cov_prop;
                 cov_rcp = 0.5*(cov_rcp + cov_rcp.transpose());
                 break;
-            }              
+            }
         }
     }
 
@@ -147,7 +157,59 @@ class Estimator
 
     SplineState* getSpline() {
         return &spl;
-    }     
+    }
+
+    // Returns the full 6×6 IEKF posterior covariance for the interpolated pose at
+    // maxTimeNs(), computed by propagating cov_rcp through the spline Jacobian:
+    //   P_pose = J · cov_rcp · Jᵀ   (J is 6×24)
+    //
+    // Layout: [x, y, z, rx, ry, rz] — orientation in the body-frame right-perturbation
+    // convention (δφ = 2·imag(q⁻¹ ⊗ δq)), matching ROS PoseWithCovarianceStamped.
+    //
+    // This correctly accounts for all four active knots' contributions to the
+    // interpolated orientation (via the cumulative B-spline Jacobian), unlike a
+    // direct block-extract which captures only the last knot's incremental uncertainty.
+    Eigen::Matrix<double, 6, 6> getLastPoseCovariance() const {
+        const int64_t t = spl.maxTimeNs();
+        const int RCP_st_id = static_cast<int>(spl.numKnots()) - 4;
+
+        // ── Position Jacobian (scalar blend coefficients) ──────────────────
+        // At u≈1, blending weights are [0,0,0,1]: only RCP[3] contributes.
+        Jacobian J_pos;
+        spl.itpPosition(t, &J_pos);
+
+        // ── Orientation Jacobian (4×3 per knot) ───────────────────────────
+        // At u≈1, cumulative blending gives coeff=[1,1,1,1]: all four knots
+        // contribute to the interpolated quaternion.
+        Jacobian43 J_q;
+        Eigen::Quaterniond q_out;
+        spl.itpQuaternion(t, &q_out, nullptr, &J_q);
+
+        // G (3×4): maps 4D δq [w,x,y,z] → 3D body-frame rotation vector.
+        // Derived from 2·imag(q_out⁻¹ ⊗ δq) = 2·[rows 1,2,3 of Qleft(q_out⁻¹)] · δq.
+        const double qw = q_out.w(), qx = q_out.x(), qy = q_out.y(), qz = q_out.z();
+        Eigen::Matrix<double, 3, 4> G;
+        G << -qx,  qw,  qz, -qy,
+             -qy, -qz,  qw,  qx,
+             -qz,  qy, -qx,  qw;
+        G *= 2.0;
+
+        // ── Assemble 6×24 Jacobian ─────────────────────────────────────────
+        Eigen::Matrix<double, 6, 24> J = Eigen::Matrix<double, 6, 24>::Zero();
+        for (int i = 0; i < static_cast<int>(J_pos.d_val_d_knot.size()); ++i) {
+            const int j = static_cast<int>(J_pos.start_idx) + i - RCP_st_id;
+            if (j >= 0 && j < 4)
+                J.block<3, 3>(0, j * 6) =
+                    J_pos.d_val_d_knot[i] * Eigen::Matrix3d::Identity();
+        }
+        for (int i = 0; i < static_cast<int>(J_q.d_val_d_knot.size()); ++i) {
+            const int j = static_cast<int>(J_q.start_idx) + i - RCP_st_id;
+            if (j >= 0 && j < 4)
+                J.block<3, 3>(3, j * 6 + 3).noalias() = G * J_q.d_val_d_knot[i];
+        }
+
+        return J * cov_rcp.template topLeftCorner<24, 24>() * J.transpose();
+    }
 
   private:
     SplineState spl;
@@ -267,11 +329,10 @@ class Estimator
                 idx_offset++;
             }
         }        
-        update(innv, mat_cov_inv, H, x_prop, P_prop);
-        return true;
-    }           
+        return update(innv, mat_cov_inv, H, x_prop, P_prop);
+    }
 
-    void updateLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, Eigen::aligned_deque<ImuData>& imu_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
+    bool updateLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, Eigen::aligned_deque<ImuData>& imu_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
         const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const double pt_thresh, const double cov_thresh, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro, int num_threads = 5)
     {
         Eigen::Matrix<double, 6, 1> cov_imu_inv =  Eigen::Matrix<double, 6, 1>(1/cov_acc[0], 1/cov_acc[1], 1/cov_acc[2], 1/cov_gyro[0], 1/cov_gyro[1], 1/cov_gyro[2]);
@@ -344,11 +405,12 @@ class Estimator
                     id_imu++;
             }
         }        
-        update(innv, mat_cov_inv, H, x_prop, P_prop);        
+        return update(innv, mat_cov_inv, H, x_prop, P_prop);
     }
 
+    // Returns false if the update was skipped due to numerical failure.
     template <int RSIZE>
-    void update(const Eigen::Matrix<double, RSIZE, 1>& innov, const Eigen::Matrix<double, RSIZE, 1>& R_inv, const Eigen::Matrix<double, RSIZE, XSIZE>& H, 
+    bool update(const Eigen::Matrix<double, RSIZE, 1>& innov, const Eigen::Matrix<double, RSIZE, 1>& R_inv, const Eigen::Matrix<double, RSIZE, XSIZE>& H,
         const Eigen::Matrix<double, XSIZE, 1>& x_prop, const Eigen::Matrix<double, XSIZE, XSIZE>& cov_prop)
     {
         int num_pts = innov.rows();
@@ -358,7 +420,7 @@ class Estimator
             auto llt_prop = cov_prop.llt();
             if (llt_prop.info() != Eigen::Success) {
                 std::cerr << "[Estimator] cov_prop LLT decomposition failed, skipping update\n";
-                return;
+                return false;
             }
             Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp_inv = llt_prop.solve(I_X);
             Eigen::Matrix<double, XSIZE, RSIZE> HT_R_inv;
@@ -371,7 +433,7 @@ class Estimator
             auto llt_S = S.llt();
             if (llt_S.info() != Eigen::Success) {
                 std::cerr << "[Estimator] S LLT decomposition failed, skipping update\n";
-                return;
+                return false;
             }
             Eigen::Matrix<double, XSIZE, XSIZE> S_inv = llt_S.solve(I_X);
             Eigen::Matrix<double, XSIZE, RSIZE> K;
@@ -388,7 +450,7 @@ class Estimator
             Eigen::FullPivLU<Eigen::Matrix<double, RSIZE, RSIZE>> lu_S(S);
             if (!lu_S.isInvertible()) {
                 std::cerr << "[Estimator] S matrix singular, skipping update\n";
-                return;
+                return false;
             }
             Eigen::Matrix<double, XSIZE, RSIZE> K;
             K.noalias() = cov_prop * H.transpose() * lu_S.inverse();
@@ -397,6 +459,7 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;
             RCPs_post.noalias() = getState() + deltax;
         }
-        updateState(RCPs_post);     
-    }    
+        updateState(RCPs_post);
+        return true;
+    }
 };

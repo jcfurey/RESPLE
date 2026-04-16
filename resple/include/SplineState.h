@@ -23,9 +23,13 @@ class SplineState
 
     SplineState() {};
 
-    void init(int64_t dt_ns_, int num_knot_, int64_t start_t_ns_, int start_i_ = 0, 
+    void init(int64_t dt_ns_, int num_knot_, int64_t start_t_ns_, int start_i_ = 0,
               Eigen::Vector3d t0 = Eigen::Vector3d::Zero(), Eigen::Quaterniond q0 = Eigen::Quaterniond::Identity())
     {
+        if (dt_ns_ <= 0) {
+            std::cerr << "[SplineState] init() called with dt_ns=" << dt_ns_ << " (must be > 0), using dt_ns=1 as placeholder\n";
+            dt_ns_ = 1;
+        }
         if_first = true;
         dt_ns = dt_ns_;
         start_t_ns = start_t_ns_;
@@ -321,11 +325,11 @@ class SplineState
         }
     }  
 
-    void getSplineMsg(estimate_msgs::msg::Spline& spline_msg, const int start_i)
+    void getSplineMsg(estimate_msgs::msg::Spline& spline_msg, const int start_idx_hint)
     {
         static int last_start_idx = 0;
         spline_msg.dt = dt_ns;
-        int sidx = std::min(std::max((int)(num_knot - 5), 0), start_i);
+        int sidx = std::min(std::max((int)(num_knot - 5), 0), start_idx_hint);
         spline_msg.start_idx = std::min(sidx, last_start_idx+1);
         spline_msg.start_t = getKnotTimeNs(num_knot - 5);
         for (size_t i = spline_msg.start_idx; i < (size_t) num_knot; i++) {

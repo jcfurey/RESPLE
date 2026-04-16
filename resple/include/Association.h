@@ -28,11 +28,16 @@ public:
                             Eigen::aligned_deque<PointData>& pt_meas, int num_threads = 5, int num_match_points = 5)
     {
         int num_pt = pt_meas.size();
-        #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
+        // schedule(static): each thread writes only to its own pt_meas[i], no synchronization needed.
+        #pragma omp parallel for num_threads(num_threads) schedule(static)
         for (int i = 0; i < num_pt; i++) {
             PointData& pt_data = pt_meas[i];
             pt_data.if_valid = false;
-            if (!(spline->numKnots() == 4) && !(pt_data.time_ns <= spline->maxTimeNs() && pt_data.time_ns >= spline->maxTimeNs() - 4*spline->getKnotTimeIntervalNs())) {                           
+            // At startup (exactly 4 knots), accept all points. Once the spline
+            // has grown, only accept points within the active 4-knot window.
+            const bool in_active_window = pt_data.time_ns <= spline->maxTimeNs()
+                                       && pt_data.time_ns >= spline->maxTimeNs() - 4 * spline->getKnotTimeIntervalNs();
+            if (spline->numKnots() != 4 && !in_active_window) {
                 continue;
             }
             Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
@@ -44,7 +49,7 @@ public:
                 pabcd.setZero();
                 if (CommonUtils::esti_plane(pabcd, pt_data.nearest_points, 0.1f)) {
                     float pd2 = pabcd(0) * pt_data.pt_w.x + pabcd(1) * pt_data.pt_w.y + pabcd(2) * pt_data.pt_w.z + pabcd(3);
-                    if (pt_data.pt_b.norm() > 81.0 * pd2 * pd2) {
+                    if (pt_data.range_sensor > 81.0 * pd2 * pd2) {
                         pt_data.if_valid = true;
                         pt_data.normvec = Eigen::Vector3d(pabcd[0], pabcd[1], pabcd[2]);
                         pt_data.dist = pabcd(3);                            

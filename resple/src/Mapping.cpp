@@ -73,8 +73,8 @@ class MappingBase
         lidar_to_baselink_ = Eigen::Affine3d::Identity();
         imu_to_baselink_ = Eigen::Affine3d::Identity();
 
-        pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("global_map", 
-            rclcpp::QoS(2).best_effort());
+        pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("global_map",
+            rclcpp::QoS(2).reliable());
         ds_filter_each_scan.setLeafSize(0.2, 0.2, 0.2);
         pc_last.reset(new typename pcl::PointCloud<PointType>());
         pc_last_ds.reset(new typename pcl::PointCloud<PointType>());
@@ -98,19 +98,21 @@ class MappingBase
         rclcpp::Rate rate(20);
         while (!pc_L_buff.empty()) {
             t_end_ns = pc_L_buff.front().header.stamp + int64_t (pc_L_buff.front().points.back().intensity * float(1e6));
-            mtx.lock();
-            if (t_end_ns < spl->minTimeNs()) {
-                pc_L_buff.pop_front();
-                mtx.unlock();
-            } else if (t_end_ns <= spl->maxTimeNs()) {
-                transformCloud(pc_L_buff.front(), spl, pc);
-                pc_L_buff.pop_front();
-                mtx.unlock();
-                publishMap(pc, pub_global_map);
-            } else {
-                mtx.unlock();
-                rate.sleep();
-                break;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                if (t_end_ns < spl->minTimeNs()) {
+                    pc_L_buff.pop_front();
+                    continue;
+                } else if (t_end_ns <= spl->maxTimeNs()) {
+                    transformCloud(pc_L_buff.front(), spl, pc);
+                    pc_L_buff.pop_front();
+                    lock.unlock();
+                    publishMap(pc, pub_global_map);
+                } else {
+                    lock.unlock();
+                    rate.sleep();
+                    break;
+                }
             }
         }
     }
@@ -245,9 +247,13 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
 
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
     {
+        // Guard against negative timestamps (sim-time messages)
+        int64_t stamp_ns = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;
+
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(ouster_msg_in->header.frame_id)) return;
-        
+
         this->pc_last->clear();
         pcl::PointCloud<ouster_ros::Point>::Ptr pc_last_ouster(new pcl::PointCloud<ouster_ros::Point>());
         pcl::fromROSMsg(*ouster_msg_in, *pc_last_ouster);
@@ -280,9 +286,12 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds() - time_offset;
-        mtx.lock();
-        this->pc_L_buff.push_back(*pc_last_ds);
-        mtx.unlock();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            // Cap cloud buffer to prevent OOM on processing stalls
+            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            this->pc_L_buff.push_back(*pc_last_ds);
+        }
     }
 
   private:
@@ -335,9 +344,12 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        mtx.lock();
-        this->pc_L_buff.push_back(*pc_last_ds);
-        mtx.unlock();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            // Cap cloud buffer to prevent OOM on processing stalls
+            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            this->pc_L_buff.push_back(*pc_last_ds);
+        }
     }
 
   private:
@@ -389,9 +401,12 @@ public:
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        mtx.lock();
-        this->pc_L_buff.push_back(*pc_last_ds);
-        mtx.unlock();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            // Cap cloud buffer to prevent OOM on processing stalls
+            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            this->pc_L_buff.push_back(*pc_last_ds);
+        }
     }
 
   private:
@@ -443,9 +458,12 @@ public:
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        mtx.lock();
-        this->pc_L_buff.push_back(*pc_last_ds);
-        mtx.unlock();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            // Cap cloud buffer to prevent OOM on processing stalls
+            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            this->pc_L_buff.push_back(*pc_last_ds);
+        }
     }
 
   private:
@@ -505,9 +523,12 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(hesai_msg_in->header.stamp).nanoseconds();
-        mtx.lock();
-        this->pc_L_buff.push_back(*pc_last_ds);
-        mtx.unlock();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            // Cap cloud buffer to prevent OOM on processing stalls
+            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            this->pc_L_buff.push_back(*pc_last_ds);
+        }
     }
 
   private:
@@ -565,9 +586,12 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        mtx.lock();
-        this->pc_L_buff.push_back(*pc_last_ds);
-        mtx.unlock();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            // Cap cloud buffer to prevent OOM on processing stalls
+            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            this->pc_L_buff.push_back(*pc_last_ds);
+        }
     }
 
   private:
@@ -616,12 +640,12 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
 
 
         // Create publishers (inactive until activated)
-        pub_path = this->create_publisher<nav_msgs::msg::Path>("traj_path", 
-            rclcpp::QoS(20).best_effort());
-        pub_knots = this->create_publisher<sensor_msgs::msg::PointCloud>("active_control_points", 
-            rclcpp::QoS(20).best_effort());
-        pub_odom = this->create_publisher<nav_msgs::msg::Odometry>("odometry", 
-            rclcpp::QoS(500).best_effort());
+        pub_path = this->create_publisher<nav_msgs::msg::Path>("traj_path",
+            rclcpp::QoS(20).reliable());
+        pub_knots = this->create_publisher<sensor_msgs::msg::PointCloud>("active_control_points",
+            rclcpp::QoS(20).reliable());
+        pub_odom = this->create_publisher<nav_msgs::msg::Odometry>("odometry",
+            rclcpp::QoS(500).reliable());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
         
         RCLCPP_INFO(this->get_logger(), "Mapping configured successfully");
@@ -726,16 +750,28 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     }
 
     void process() {
-        // RCLCPP_INFO(this->get_logger(), "process");    
+        // RCLCPP_INFO(this->get_logger(), "process");
         rclcpp::Rate rate(10);
         int64_t num_knot = 0;
         while (processing_active_ && rclcpp::ok()) {
-            if (if_init_succeed && spline_global.numKnots() > num_knot) {
+            // Swap pending spline to active (lock-free check then mutex swap)
+            if (spline_pending_ready_.load()) {
+                std::lock_guard<std::mutex> lock(m_spline);
+                if (spline_pending_ready_.load()) {
+                    lock_mappings();
+                    spl_window_st_ns = spl_window_st_ns_pending_;
+                    spline_active_.setTimeIntervalNs(spline_pending_.getKnotTimeIntervalNs());
+                    spline_active_.updateKnots(&spline_pending_);
+                    spline_pending_ready_.store(false);
+                    unlock_mappings();
+                }
+            }
+            if (if_init_succeed && spline_active_.numKnots() > num_knot) {
                 lock_mappings();
                 publishPath();
                 displayControlPoints();
                 pubOdom();
-                num_knot = spline_global.numKnots();
+                num_knot = spline_active_.numKnots();
                 unlock_mappings();
             }
             if (!if_init_succeed) {
@@ -745,7 +781,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 continue;
             }
             for (const auto vis_map : vis_maps) {
-                vis_map->processScan(&spline_global, spl_window_st_ns);
+                vis_map->processScan(&spline_active_, spl_window_st_ns);
             }
         }
     }
@@ -753,7 +789,13 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
 private:
     std::string node_name = "Mapping";
     int64_t spl_window_st_ns;
-    SplineState spline_global;
+    // Double-buffered spline: getEstCallback writes to spline_pending_,
+    // process() copies pending to spline_active_ under m_spline mutex.
+    // This eliminates the race between the callback thread and process thread.
+    SplineState spline_active_;
+    SplineState spline_pending_;
+    std::atomic<bool> spline_pending_ready_{false};
+    int64_t spl_window_st_ns_pending_ = 0;
     rclcpp::Subscription<estimate_msgs::msg::Estimate>::SharedPtr sub_est;
     rclcpp::Subscription<std_msgs::msg::Int64>::SharedPtr sub_start;
     rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;
@@ -781,12 +823,13 @@ private:
 
     void displayControlPoints()
     {
-        if (spline_global.numKnots() < 4) { return; }
+        if (spline_active_.numKnots() < 4) { return; }
+        if (spline_active_.maxTimeNs() < 0) { return; }
         sensor_msgs::msg::PointCloud points_msg;
         points_msg.header.frame_id = map_id;
-        points_msg.header.stamp = rclcpp::Time(spline_global.maxTimeNs());
-        for (int64_t i = spline_global.numKnots() - 4; i < spline_global.numKnots(); i++) {
-            points_msg.points.push_back(CommonUtils::getPointMsg(spline_global.getKnotPos(i)));
+        points_msg.header.stamp = rclcpp::Time(spline_active_.maxTimeNs());
+        for (int64_t i = spline_active_.numKnots() - 4; i < spline_active_.numKnots(); i++) {
+            points_msg.points.push_back(CommonUtils::getPointMsg(spline_active_.getKnotPos(i)));
         }
         pub_knots->publish(points_msg);
     }
@@ -796,8 +839,8 @@ private:
         if (!if_init_succeed) {
             return;
         }
-        // RCLCPP_INFO(this->get_logger(), "getEstCallback");    
-        
+        // RCLCPP_INFO(this->get_logger(), "getEstCallback");
+
         estimate_msgs::msg::Spline spline_msg = est_msg->spline;
         SplineState spline_w;
 
@@ -814,11 +857,14 @@ private:
             Eigen::Vector3d quat_idle(idle.orientation_del.x, idle.orientation_del.y, idle.orientation_del.z);
             spline_w.setIdles(i, t_idle, quat_idle, q_idle0);
         }
-        lock_mappings();
-        spl_window_st_ns = spline_msg.start_t - spline_msg.dt;
-        spline_global.setTimeIntervalNs(spline_msg.dt);
-        spline_global.updateKnots(&spline_w);
-        unlock_mappings();
+        // Write to pending buffer — process() will swap to active under mutex
+        {
+            std::lock_guard<std::mutex> lock(m_spline);
+            spl_window_st_ns_pending_ = spline_msg.start_t - spline_msg.dt;
+            spline_pending_.setTimeIntervalNs(spline_msg.dt);
+            spline_pending_.updateKnots(&spline_w);
+            spline_pending_ready_.store(true);
+        }
     }
 
     void pubOdom()
@@ -832,7 +878,7 @@ private:
         geometry_msgs::msg::PoseStamped odom_pose_last = opt_old_path.poses.rbegin()[1];
         
         // Use the latest spline time for better sync with current_scan
-        // rclcpp::Time current_time = rclcpp::Time(spline_global.maxTimeNs());
+        // rclcpp::Time current_time = rclcpp::Time(spline_active_.maxTimeNs());
         // odom_msg.header.stamp = current_time;
         
         odom_msg.header.stamp = rclcpp::Time(odom_pose_current.header.stamp);
@@ -849,37 +895,43 @@ private:
         odom_msg.pose.covariance[28] =  cov_pose[4];
         odom_msg.pose.covariance[35] =  cov_pose[5];
         
-        double dt = (rclcpp::Time(odom_pose_current.header.stamp) - rclcpp::Time(odom_pose_last.header.stamp)).seconds();
-        if(dt < 1e-10) {
-            RCLCPP_INFO(this->get_logger(), "dt too small!");    
-        } else{
-            odom_msg.twist.twist.linear.x = (odom_pose_current.pose.position.x - odom_pose_last.pose.position.x)/dt;
-            odom_msg.twist.twist.linear.y = (odom_pose_current.pose.position.y - odom_pose_last.pose.position.y)/dt;
-            odom_msg.twist.twist.linear.z = (odom_pose_current.pose.position.z - odom_pose_last.pose.position.z)/dt;
-        }
-
-        double roll_current, pitch_current, yaw_current;
-        tf2::Quaternion q_current(
+        // Quaternions for current and last poses
+        Eigen::Quaterniond q_cur(
+            odom_pose_current.pose.orientation.w,
             odom_pose_current.pose.orientation.x,
             odom_pose_current.pose.orientation.y,
-            odom_pose_current.pose.orientation.z,
-            odom_pose_current.pose.orientation.w);
-        tf2::Matrix3x3 m_current(q_current);
-        m_current.getRPY(roll_current, pitch_current, yaw_current);
-
-        double roll_last, pitch_last, yaw_last;
-        tf2::Quaternion q_last(
+            odom_pose_current.pose.orientation.z);
+        Eigen::Quaterniond q_last(
+            odom_pose_last.pose.orientation.w,
             odom_pose_last.pose.orientation.x,
             odom_pose_last.pose.orientation.y,
-            odom_pose_last.pose.orientation.z,
-            odom_pose_last.pose.orientation.w);
-        tf2::Matrix3x3 m_last(q_last);
-        m_last.getRPY(roll_last, pitch_last, yaw_last);
+            odom_pose_last.pose.orientation.z);
 
-        if(dt >= 1e-10) {
-            odom_msg.twist.twist.angular.x = (roll_current - roll_last)/dt;
-            odom_msg.twist.twist.angular.y = (pitch_current - pitch_last)/dt;
-            odom_msg.twist.twist.angular.z = (yaw_current - yaw_last)/dt;
+        double dt = (rclcpp::Time(odom_pose_current.header.stamp) - rclcpp::Time(odom_pose_last.header.stamp)).seconds();
+        if(dt < 1e-10) {
+            RCLCPP_INFO(this->get_logger(), "dt too small!");
+        } else{
+            // Linear velocity in map frame, then rotate to body frame (REP-105)
+            Eigen::Vector3d v_map(
+                (odom_pose_current.pose.position.x - odom_pose_last.pose.position.x)/dt,
+                (odom_pose_current.pose.position.y - odom_pose_last.pose.position.y)/dt,
+                (odom_pose_current.pose.position.z - odom_pose_last.pose.position.z)/dt);
+            Eigen::Vector3d v_body = q_cur.inverse() * v_map;
+            odom_msg.twist.twist.linear.x = v_body.x();
+            odom_msg.twist.twist.linear.y = v_body.y();
+            odom_msg.twist.twist.linear.z = v_body.z();
+
+            // Angular velocity via quaternion delta (avoids RPY gimbal issues)
+            Eigen::Quaterniond q_delta = q_last.inverse() * q_cur;
+            // Ensure shortest path
+            if (q_delta.w() < 0.0) {
+                q_delta.coeffs() = -q_delta.coeffs();
+            }
+            Eigen::AngleAxisd aa(q_delta);
+            Eigen::Vector3d w_body = aa.axis() * aa.angle() / dt;
+            odom_msg.twist.twist.angular.x = w_body.x();
+            odom_msg.twist.twist.angular.y = w_body.y();
+            odom_msg.twist.twist.angular.z = w_body.z();
         }
 
         odom_msg.twist.covariance[0]  =  cov_twist[0];
@@ -984,27 +1036,35 @@ private:
     void startCallBack(const std_msgs::msg::Int64::SharedPtr start_time_msg)
     {
         int64_t bag_start_time = start_time_msg->data;
-        spline_global.init(1, 0, bag_start_time, 0);  // dt=1 placeholder; overridden by getEstCallback
+        spline_active_.init(1, 0, bag_start_time, 0);  // dt=1 placeholder; overridden by getEstCallback
         if_init_succeed = true;
     }
 
     void publishPath() {
-        // RCLCPP_INFO(this->get_logger(), "publishPath");            
-        if (!if_init_succeed || spline_global.numKnots() <= 4) {
+        // RCLCPP_INFO(this->get_logger(), "publishPath");
+        if (!if_init_succeed || spline_active_.numKnots() <= 4) {
+            return;
+        }
+        if (spline_active_.maxTimeNs() < 0 || spline_active_.minTimeNs() < 0) {
             return;
         }
         if (path_t_ns_ == 0) {
-            path_t_ns_ = spline_global.minTimeNs();
+            path_t_ns_ = spline_active_.minTimeNs();
         }
-        while (path_t_ns_ < std::min(spl_window_st_ns, spline_global.maxTimeNs())) {
+        while (path_t_ns_ < std::min(spl_window_st_ns, spline_active_.maxTimeNs())) {
             Eigen::Quaterniond orient_interp;
-            Eigen::Vector3d t_interp = spline_global.itpPosition(path_t_ns_);
-            spline_global.itpQuaternion(path_t_ns_, &orient_interp);
+            Eigen::Vector3d t_interp = spline_active_.itpPosition(path_t_ns_);
+            spline_active_.itpQuaternion(path_t_ns_, &orient_interp);
             opt_old_path.poses.push_back(CommonUtils::pose2msg(map_id, path_t_ns_, t_interp, orient_interp));
             path_t_ns_ += 1e8;
         }
+        // Cap path length to prevent OOM on long runs
+        if (opt_old_path.poses.size() > 10000) {
+            opt_old_path.poses.erase(opt_old_path.poses.begin(),
+                opt_old_path.poses.begin() + (opt_old_path.poses.size() - 10000));
+        }
         opt_old_path.header.frame_id = map_id;
-        opt_old_path.header.stamp = rclcpp::Time(spline_global.maxTimeNs());
+        opt_old_path.header.stamp = rclcpp::Time(spline_active_.maxTimeNs());
         pub_path->publish(opt_old_path);
     }
 
