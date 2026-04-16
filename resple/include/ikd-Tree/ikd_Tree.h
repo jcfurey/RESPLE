@@ -8,6 +8,8 @@
 #include <math.h>
 #include <algorithm>
 #include <memory.h>
+#include <mutex>
+#include <shared_mutex>
 #include <pcl/point_types.h>
 
 #define EPSS 1e-6
@@ -259,13 +261,13 @@ private:
     bool termination_flag = false;
     bool rebuild_flag = false;
     pthread_t rebuild_thread;
-    pthread_mutex_t termination_flag_mutex_lock, rebuild_ptr_mutex_lock, working_flag_mutex, search_flag_mutex;
+    pthread_mutex_t termination_flag_mutex_lock, rebuild_ptr_mutex_lock, working_flag_mutex;
     pthread_mutex_t rebuild_logger_mutex_lock, points_deleted_rebuild_mutex_lock;
     // queue<Operation_Logger_Type> Rebuild_Logger;
     MANUAL_Q Rebuild_Logger;
     PointVector Rebuild_PCL_Storage;
     KD_TREE_NODE **Rebuild_Ptr = nullptr;
-    int search_mutex_counter = 0;
+    std::shared_mutex search_rw_mutex_;
     static void *multi_thread_ptr(void *arg);
     void multi_thread_rebuild();
     void start_thread();

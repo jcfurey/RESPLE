@@ -219,6 +219,9 @@ class Estimator
     Eigen::Vector3d bg = Eigen::Vector3d::Zero();
     Eigen::Vector3d ba = Eigen::Vector3d::Zero();     
     Eigen::Matrix<double, XSIZE, XSIZE> KH;
+    Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
+    Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
+    Eigen::Matrix<double, Eigen::Dynamic, 1> cov_inv_buf_;
     int max_iter = 5;
     double eps = 0.1;
 
@@ -293,13 +296,13 @@ class Estimator
     bool updateLiDAR(Eigen::aligned_deque<PointData>& pt_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
         const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const double pt_thresh, const double cov_thresh, int num_threads = 5)
     {
-        Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H(num_valid, XSIZE);
-        Eigen::Matrix<double, Eigen::Dynamic, 1> innv(num_valid, 1);
-        Eigen::Matrix<double, Eigen::Dynamic, 1> mat_cov_inv(num_valid, 1);
-        H.setZero();    
-        innv.setZero();
-        mat_cov_inv.setConstant(1/0.01);
-        size_t num_pt = pt_meas.size();    
+        H_buf_.conservativeResize(num_valid, XSIZE);
+        innv_buf_.conservativeResize(num_valid, 1);
+        cov_inv_buf_.conservativeResize(num_valid, 1);
+        H_buf_.setZero();
+        innv_buf_.setZero();
+        cov_inv_buf_.setConstant(1/0.01);
+        size_t num_pt = pt_meas.size();
         #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
         for (size_t i = 0; i < num_pt; i++) {
             PointData& pt_data = pt_meas[i];
@@ -313,23 +316,18 @@ class Estimator
                 Hi.template leftCols<24>() = pt_data.H;
                 double lid_cov = Hi*cov_rcp*Hi.transpose() + pt_data.var_pt;
                 if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
-                    innv(idx_offset) = - pt_data.zp;
-                    H.row(idx_offset) = Hi;
-                    
+                    innv_buf_(idx_offset) = - pt_data.zp;
+                    H_buf_.row(idx_offset) = Hi;
+
                 }
-                // Range-dependent noise: quadratically inflate measurement variance
-                // for close-range points to prevent single-surface degeneracy.
-                // Below range_ref, noise scales as (range_ref/r)^2, so a wall at
-                // 1.5m gets 4x the noise of one at 3m.  This limits how much a
-                // single nearby plane can dominate H^T R^{-1} H.
-                constexpr double range_ref = 3.0;   // full weight above this [m]
+                constexpr double range_ref = 3.0;
                 double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
                 double noise_scale = (r < range_ref) ? (range_ref * range_ref) / (r * r) : 1.0;
-                mat_cov_inv(idx_offset) = 1.0 / (pt_data.var_pt * noise_scale);
+                cov_inv_buf_(idx_offset) = 1.0 / (pt_data.var_pt * noise_scale);
                 idx_offset++;
             }
-        }        
-        return update(innv, mat_cov_inv, H, x_prop, P_prop);
+        }
+        return update(innv_buf_, cov_inv_buf_, H_buf_, x_prop, P_prop);
     }
 
     bool updateLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, Eigen::aligned_deque<ImuData>& imu_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
@@ -346,12 +344,12 @@ class Estimator
             prepIMU(imu_meas[i], g);
         }
         int dim_meas = 6*imu_meas.size() + num_valid;
-        Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H(dim_meas, XSIZE);
-        Eigen::Matrix<double, Eigen::Dynamic, 1> innv(dim_meas, 1);
-        Eigen::Matrix<double, Eigen::Dynamic, 1> mat_cov_inv(dim_meas, 1);
-        H.setZero();    
-        innv.setZero();
-        mat_cov_inv.setZero();
+        H_buf_.conservativeResize(dim_meas, XSIZE);
+        innv_buf_.conservativeResize(dim_meas, 1);
+        cov_inv_buf_.conservativeResize(dim_meas, 1);
+        H_buf_.setZero();
+        innv_buf_.setZero();
+        cov_inv_buf_.setZero();
         int idx_offset = 0;
         size_t id_imu = 0;
         size_t id_pt = 0;
@@ -363,14 +361,13 @@ class Estimator
                         Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
                         double lid_cov = pt_data.H*cov*pt_data.H.transpose() + pt_data.var_pt;
                         if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
-                            innv(idx_offset) = - pt_data.zp;
-                            H.block(idx_offset, 0, 1, 24) = pt_data.H;
+                            innv_buf_(idx_offset) = - pt_data.zp;
+                            H_buf_.block(idx_offset, 0, 1, 24) = pt_data.H;
                         }
-                        // Range-dependent noise (see updateLiDAR for rationale)
                         constexpr double range_ref = 3.0;
                         double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
                         double noise_scale = (r < range_ref) ? (range_ref * range_ref) / (r * r) : 1.0;
-                        mat_cov_inv(idx_offset) = 1.0 / (pt_data.var_pt * noise_scale);
+                        cov_inv_buf_(idx_offset) = 1.0 / (pt_data.var_pt * noise_scale);
                         idx_offset++;
                     }
                     id_pt++;
@@ -398,14 +395,14 @@ class Estimator
                             Hi.row(i+3).setZero();
                         }                     
                     }
-                    innv.segment<6>(idx_offset) = imu - imu_itp;
-                    H.block(idx_offset, 0, 6, XSIZE) = Hi;
-                    mat_cov_inv.segment<6>(idx_offset) = cov_imu_inv;  
+                    innv_buf_.segment<6>(idx_offset) = imu - imu_itp;
+                    H_buf_.block(idx_offset, 0, 6, XSIZE) = Hi;
+                    cov_inv_buf_.segment<6>(idx_offset) = cov_imu_inv;  
                     idx_offset += 6;
                     id_imu++;
             }
         }        
-        return update(innv, mat_cov_inv, H, x_prop, P_prop);
+        return update(innv_buf_, cov_inv_buf_, H_buf_, x_prop, P_prop);
     }
 
     // Returns false if the update was skipped due to numerical failure.

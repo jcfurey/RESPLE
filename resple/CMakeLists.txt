@@ -3,7 +3,7 @@ project(resple)
 
 # Prefer target-based flags. Provide options to gate OpenMP/native arch.
 option(ENABLE_OPENMP "Enable OpenMP parallelism" ON)
-option(ENABLE_NATIVE_ARCH "Enable -march=native optimizations" OFF)
+option(ENABLE_NATIVE_ARCH "Enable -march=native optimizations" ON)
 if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE "Release")
 endif()
@@ -39,6 +39,11 @@ if(ENABLE_OPENMP)
 	find_package(OpenMP REQUIRED)
 endif()
 
+find_package(BLAS QUIET)
+if(BLAS_FOUND)
+	add_definitions(-DEIGEN_USE_BLAS)
+endif()
+
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
 add_library(${PROJECT_NAME}
@@ -61,9 +66,9 @@ target_compile_options(${PROJECT_NAME} PRIVATE
 	$<$<CONFIG:Debug>:-DEIGEN_INITIALIZE_MATRICES_BY_NAN>
 )
 if(ENABLE_NATIVE_ARCH)
-	target_compile_options(${PROJECT_NAME} PRIVATE -O3 -march=native)
+	target_compile_options(${PROJECT_NAME} PRIVATE -O3 -march=native -ffast-math)
 else()
-	target_compile_options(${PROJECT_NAME} PRIVATE -O3)
+	target_compile_options(${PROJECT_NAME} PRIVATE -O3 -ffast-math)
 endif()
 
 # Executables just wrap the library - no source duplication
@@ -119,6 +124,10 @@ if(ENABLE_OPENMP)
   target_link_libraries(RESPLE OpenMP::OpenMP_CXX)
   target_link_libraries(Mapping OpenMP::OpenMP_CXX)
   target_link_libraries(${PROJECT_NAME} OpenMP::OpenMP_CXX)
+endif()
+
+if(BLAS_FOUND)
+  target_link_libraries(${PROJECT_NAME} ${BLAS_LIBRARIES})
 endif()
 
 install(DIRECTORY launch

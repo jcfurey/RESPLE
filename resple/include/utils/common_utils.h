@@ -272,24 +272,22 @@ public:
     {
         const int num_pts = static_cast<int>(point.size());
         if (num_pts < 3) { return false; }
-        Eigen::Matrix<T, Eigen::Dynamic, 3> A(num_pts, 3);
-        Eigen::Matrix<T, Eigen::Dynamic, 1> b(num_pts, 1);
-        A.setZero();
-        b.setOnes();
-        b *= -1.0f;
+        Eigen::Matrix<T, 3, 3> ATA = Eigen::Matrix<T, 3, 3>::Zero();
+        Eigen::Matrix<T, 3, 1> ATb = Eigen::Matrix<T, 3, 1>::Zero();
         for (int j = 0; j < num_pts; j++)
         {
-            A(j,0) = point[j].x;
-            A(j,1) = point[j].y;
-            A(j,2) = point[j].z;
+            Eigen::Matrix<T, 3, 1> row(point[j].x, point[j].y, point[j].z);
+            ATA.noalias() += row * row.transpose();
+            ATb.noalias() -= row;
         }
-        Eigen::Matrix<T, 3, 1> normvec = A.colPivHouseholderQr().solve(b);
+        Eigen::Matrix<T, 3, 1> normvec = ATA.ldlt().solve(ATb);
         T n = normvec.norm();
         if (n < static_cast<T>(1e-12)) { return false; }
-        pca_result(0) = normvec(0) / n;
-        pca_result(1) = normvec(1) / n;
-        pca_result(2) = normvec(2) / n;
-        pca_result(3) = 1.0 / n;
+        T n_inv = static_cast<T>(1.0) / n;
+        pca_result(0) = normvec(0) * n_inv;
+        pca_result(1) = normvec(1) * n_inv;
+        pca_result(2) = normvec(2) * n_inv;
+        pca_result(3) = n_inv;
         for (int j = 0; j < num_pts; j++)
         {
             if (fabs(pca_result(0) * point[j].x + pca_result(1) * point[j].y + pca_result(2) * point[j].z + pca_result(3)) > threshold)
