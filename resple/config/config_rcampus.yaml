@@ -28,7 +28,7 @@
     lidar_time_offset: 0.0  # time offset between lidar and IMU, unit: s
     
     knot_hz: 100
-    if_lidar_only: true # if true, use LiDAR-only odometry
+    if_lidar_only: false # if true, use LiDAR-only odometry; false = LIO (IMU prior every IEKF)
     
     ds_scan_voxel: 0.5
     point_filter_num: 1
