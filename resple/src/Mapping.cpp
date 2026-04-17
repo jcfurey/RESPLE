@@ -4,6 +4,10 @@
 #include <string>
 #include <cmath>
 #include <atomic>
+#include <chrono>
+#include <future>
+#include <cstdlib>
+#include <cstdio>
 
 #include <rclcpp/qos.hpp>
 #include <rclcpp/service.hpp>
@@ -96,7 +100,12 @@ class MappingBase
     {
         // RCLCPP_INFO(node_handle_->get_logger(), "processScan");
         int64_t t_end_ns = 0;
-        rclcpp::Rate rate(20);
+        // std::this_thread::sleep_for instead of rclcpp::Rate: this is a
+        // worker thread, not an executor callback, and rate.sleep() throws
+        // runtime_error("context cannot be slept with...") once SIGINT
+        // invalidates the rclcpp context — checking rclcpp::ok() first
+        // doesn't fix it because the check and sleep aren't atomic.
+        constexpr auto kRatePeriod = std::chrono::milliseconds(50);  // ~20 Hz
         while (!pc_L_buff.empty()) {
             t_end_ns = pc_L_buff.front().header.stamp + int64_t (pc_L_buff.front().points.back().intensity * float(1e6));
             {
@@ -111,7 +120,7 @@ class MappingBase
                     publishMap(pc, pub_global_map);
                 } else {
                     lock.unlock();
-                    rate.sleep();
+                    std::this_thread::sleep_for(kRatePeriod);
                     break;
                 }
             }
@@ -132,8 +141,15 @@ class MappingBase
     {
         if (!have_lidar_transform_) {
             try {
-                geometry_msgs::msg::TransformStamped transform; 
-                if (tf_buffer_->canTransform(this->frame_id, source_frame_id, 
+                // Pre-check both frames exist in the buffer to avoid tf2's
+                // "Invalid frame ID … - frame does not exist" warning
+                // before the static TF publisher has propagated.
+                if (!tf_buffer_->_frameExists(this->frame_id) ||
+                    !tf_buffer_->_frameExists(source_frame_id)) {
+                    return false;
+                }
+                geometry_msgs::msg::TransformStamped transform;
+                if (tf_buffer_->canTransform(this->frame_id, source_frame_id,
                                                 rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
                         transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id, 
                                                                         rclcpp::Time(0));
@@ -621,8 +637,12 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     {
         RCLCPP_INFO(this->get_logger(), "Configuring Mapping...");
 
-        // Initialize TF buffer and listener
-        tf_buffer = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        // Initialize TF buffer and listener.
+        // Bump cache_time to 30s (default 10s) so a brief stall in
+        // RESPLE's pose stream doesn't immediately starve our lookups.
+        tf_buffer = std::make_shared<tf2_ros::Buffer>(
+            this->get_clock(),
+            tf2::durationFromSec(30.0));
         tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
 
         // Read frame ID parameters
@@ -663,10 +683,13 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         pub_knots->on_activate();
         pub_odom->on_activate();
         
-        // Create subscriptions
-        auto reliable_qos = rclcpp::QoS(100).reliable();
+        // Create subscriptions.
+        // start_time uses transient_local to match RESPLE's publisher
+        // QoS, so this subscription still receives the one-shot signal
+        // even if it activates after RESPLE has already published.
+        auto start_qos = rclcpp::QoS(1).transient_local().reliable();
         auto large_reliable_qos = rclcpp::QoS(10000).reliable();
-        sub_start = this->create_subscription<std_msgs::msg::Int64>("start_time", reliable_qos, 
+        sub_start = this->create_subscription<std_msgs::msg::Int64>("start_time", start_qos,
             std::bind(&Mapping::startCallBack, this, std::placeholders::_1));
         sub_est = this->create_subscription<estimate_msgs::msg::Estimate>("est_window", large_reliable_qos, 
             std::bind(&Mapping::getEstCallback, this, std::placeholders::_1));
@@ -683,12 +706,9 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     on_deactivate(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Deactivating Mapping...");
-        
-        // Stop processing thread
+
         processing_active_ = false;
-        if (processing_thread_.joinable()) {
-            processing_thread_.join();
-        }
+        joinProcessingThreadBounded(std::chrono::seconds(2));
         
         // Deactivate publishers
         pub_path->on_deactivate();
@@ -727,12 +747,12 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     on_shutdown(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Shutting down Mapping...");
-        
-        // Ensure processing thread is stopped
+
         processing_active_ = false;
-        if (processing_thread_.joinable()) {
-            processing_thread_.join();
-        }
+        // Bounded join: under SIGINT we have ~5s before SIGTERM. If
+        // process() is wedged inside processScan / lookupTransform, detach
+        // rather than hang the launcher.
+        joinProcessingThreadBounded(std::chrono::seconds(2));
         
         RCLCPP_INFO(this->get_logger(), "Mapping shutdown complete");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -750,9 +770,29 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         }
     }
 
+    // Bounded join: dispatch the join() onto an async future and wait
+    // with a deadline. If the worker is wedged (TF lookup, third-party
+    // lock), detach so shutdown can complete inside the launcher's 5s
+    // SIGINT→SIGTERM window.
+    void joinProcessingThreadBounded(std::chrono::milliseconds timeout)
+    {
+        if (!processing_thread_.joinable()) return;
+        auto join_done = std::async(std::launch::async,
+            [this]{ processing_thread_.join(); });
+        if (join_done.wait_for(timeout) != std::future_status::ready) {
+            if (processing_thread_.joinable()) {
+                processing_thread_.detach();
+                RCLCPP_WARN(this->get_logger(),
+                    "Mapping process thread did not exit within timeout; detached");
+            }
+        }
+    }
+
     void process() {
         // RCLCPP_INFO(this->get_logger(), "process");
-        rclcpp::Rate rate(10);
+        // See processScan for the rationale on std::this_thread::sleep_for
+        // vs rclcpp::Rate: rate.sleep() throws on SIGINT-invalidated context.
+        constexpr auto kRatePeriod = std::chrono::milliseconds(100);  // 10 Hz
         int64_t num_knot = 0;
         while (processing_active_ && rclcpp::ok()) {
             // Swap pending spline to active (lock-free check then mutex swap)
@@ -776,9 +816,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 unlock_mappings();
             }
             if (!if_init_succeed) {
-                if (rclcpp::ok()) {
-                    rate.sleep();
-                }
+                std::this_thread::sleep_for(kRatePeriod);
                 continue;
             }
             for (const auto vis_map : vis_maps) {
@@ -967,13 +1005,23 @@ private:
             baselink_to_map.transform.translation.z = odom_pose_current.pose.position.z;
             baselink_to_map.transform.rotation = odom_pose_current.pose.orientation;
 
-            // Get frame to odom transform
+            // Get frame to odom transform. Use Time(0) — "latest available"
+            // — instead of odom_msg.header.stamp, because:
+            //   - the map→odom offset changes slowly (mostly drift correction),
+            //     so using the most recent base_link↔odom is fine for the
+            //     map↔odom rebroadcast computed below;
+            //   - exact-stamp lookup keeps failing whenever RESPLE's TF
+            //     stamp clock and Mapping's odom_msg stamp clock diverge
+            //     (sliding spline window vs. local path index), even when
+            //     fresh transforms are flowing.
             geometry_msgs::msg::TransformStamped odom_to_baselink;
             bool got_odom_transform = false;
             try {
                 if (tf_buffer->canTransform(this->frame_id, this->odom_id,
-                                            odom_msg.header.stamp, rclcpp::Duration::from_seconds(0.1))) {
-                    odom_to_baselink = tf_buffer->lookupTransform(this->frame_id, this->odom_id, odom_msg.header.stamp);
+                                            tf2::TimePointZero,
+                                            tf2::durationFromSec(0.1))) {
+                    odom_to_baselink = tf_buffer->lookupTransform(
+                        this->frame_id, this->odom_id, tf2::TimePointZero);
                     got_odom_transform = true;
                 } else {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1106,7 +1154,8 @@ int main(int argc, char** argv) {
     exec.spin();
     
     // Cleanup on shutdown (only if context still valid)
-    if (rclcpp::ok()) {
+    bool sigint_path = !rclcpp::ok();
+    if (!sigint_path) {
         RCLCPP_INFO(node->get_logger(), "Gracefully shutting down Mapping...");
         node->deactivate();
         node->cleanup();
@@ -1119,11 +1168,23 @@ int main(int argc, char** argv) {
     }
     exec.remove_node(node->get_node_base_interface());
     exec.remove_node(temp_nh);
-    
-    // Cleanup buffs
-    for (auto buff : buffs) {
-        delete buff;
+
+    // Cleanup buffs (skipped on SIGINT — _exit() below releases everything
+    // and skipping avoids tf2_ros::TransformListener destructors that can
+    // block if the listener thread is mid-callback).
+    if (!sigint_path) {
+        for (auto buff : buffs) {
+            delete buff;
+        }
     }
-    
+
     rclcpp::shutdown();
+    if (sigint_path) {
+        // Same rationale as RESPLE.cpp: bypass static destructors on
+        // Ctrl+C to avoid the launcher escalating SIGINT → SIGTERM →
+        // SIGKILL while CUDA / ikd-Tree / FastDDS atexit handlers stall.
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(0);
+    }
 }
