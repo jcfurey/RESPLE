@@ -30,6 +30,8 @@
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
+#include <future>
 #include <chrono>
 #include <atomic>
 #include <rclcpp/service.hpp>
@@ -211,6 +213,9 @@ public:
             processing_thread_.join();
         }
 
+        if (map_update_future_.valid())
+            map_update_future_.wait();
+
         // Wait for any in-flight SaveMap action
         {
             std::lock_guard<std::mutex> lock(save_map_mutex_);
@@ -244,6 +249,9 @@ public:
     on_cleanup(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Cleaning up RESPLE...");
+
+        if (map_update_future_.valid())
+            map_update_future_.wait();
 
         // Clear buffers and data structures
         lidars.clear();
@@ -357,20 +365,25 @@ public:
                 int64_t max_time_ns = !pt_meas.empty() ? pt_meas.back().time_ns
                                                         : imu_meas.back().time_ns;
                 pt_neighbors_.resize(pt_meas.size());
-                if (if_lidar_only) {
-                    estimator_lo.propRCP(max_time_ns);
-                    estimator_lo.updateIEKFLiDAR(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
-                    total_iekf_iterations_ += estimator_lo.n_iter;
-                } else {
-                    if (!imu_meas.empty()) {
-                        max_time_ns = std::max(imu_meas.back().time_ns, max_time_ns);
+                {
+                    // IEKF reads ikdtree (Nearest_Search) — block until any in-flight
+                    // map mutator (async mapIncremental / lasermapFovSegment) is done.
+                    std::shared_lock<std::shared_mutex> map_read_lock(mtx_map_);
+                    if (if_lidar_only) {
+                        estimator_lo.propRCP(max_time_ns);
+                        estimator_lo.updateIEKFLiDAR(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
+                        total_iekf_iterations_ += estimator_lo.n_iter;
+                    } else {
+                        if (!imu_meas.empty()) {
+                            max_time_ns = std::max(imu_meas.back().time_ns, max_time_ns);
+                        }
+                        while (!imu_meas.empty() && imu_meas.front().time_ns < spline->maxTimeNs() - spline->getKnotTimeIntervalNs()) {
+                            imu_meas.pop_front();
+                        }
+                        estimator_lio.propRCP(max_time_ns);
+                        estimator_lio.updateIEKFLiDARInertial(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
+                        total_iekf_iterations_ += estimator_lio.n_iter;
                     }
-                    while (!imu_meas.empty() && imu_meas.front().time_ns < spline->maxTimeNs() - spline->getKnotTimeIntervalNs()) {
-                        imu_meas.pop_front();
-                    }
-                    estimator_lio.propRCP(max_time_ns);
-                    estimator_lio.updateIEKFLiDARInertial(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
-                    total_iekf_iterations_ += estimator_lio.n_iter;
                 }
                 #pragma omp parallel for num_threads(num_threads_)
                 for (size_t i = 0; i < pt_meas.size(); i++) {
@@ -396,11 +409,22 @@ public:
                    
                 }
                 if (max_time_ns >= t_last_map_upd + 1e8) {
-                    mapIncremental(pc_world, accum_nearest_points);
-                    publishFrameWorld(pc_world);
-                    lasermapFovSegment();
+                    // Wait for any prior async map update before swapping buffers.
+                    if (map_update_future_.valid())
+                        map_update_future_.wait();
+                    pc_world_bg_.points.swap(pc_world.points);
+                    accum_nearest_points_bg_.swap(accum_nearest_points);
                     pc_world.clear();
                     accum_nearest_points.clear();
+                    // Run map mutation + publish + FOV pruning on a background thread.
+                    // mapIncremental and lasermapFovSegment internally take
+                    // unique_lock(mtx_map_); the next IEKF's shared_lock blocks
+                    // until each releases. publishFrameWorld doesn't touch the tree.
+                    map_update_future_ = std::async(std::launch::async, [this]() {
+                        mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
+                        publishFrameWorld(pc_world_bg_);
+                        lasermapFovSegment();
+                    });
                     t_last_map_upd = max_time_ns;
                 }
                 
@@ -511,7 +535,15 @@ private:
     Eigen::aligned_deque<ImuData> imu_meas;
     Eigen::aligned_vector<sensor_msgs::msg::Imu::SharedPtr> imu_int_buff;    
     std::mutex m_buff;
-    std::mutex mtx_map_;
+    // Reader-writer lock guarding ikdtree contents:
+    //   - shared (read) lock around findCorresp / Nearest_Search calls in the IEKF
+    //   - unique (write) lock around Add_Points / Delete_Point_Boxes / Build / flatten
+    // This lets multiple parallel Nearest_Search threads run concurrently but
+    // serializes them against the async map update and SaveMap action.
+    std::shared_mutex mtx_map_;
+    std::future<void> map_update_future_;
+    pcl::PointCloud<pcl::PointXYZINormal> pc_world_bg_;
+    std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> accum_nearest_points_bg_;
     bool acc_ratio;
     Eigen::Vector3d cov_ba;
     Eigen::Vector3d cov_bg;
@@ -582,7 +614,7 @@ private:
 
             pcl::PointCloud<pcl::PointXYZINormal>::Ptr map_cloud(new pcl::PointCloud<pcl::PointXYZINormal>());
             {
-                std::lock_guard<std::mutex> map_lock(mtx_map_);
+                std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
                 ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
                 map_cloud->points = ikdtree.PCL_Storage;
             }
@@ -1501,7 +1533,7 @@ private:
                 }
             }
             {
-                std::lock_guard<std::mutex> map_lock(mtx_map_);
+                std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
                 ikdtree.Build(pc_world.points);
             }
             pc_world.clear();
@@ -1625,7 +1657,7 @@ private:
         LocalMap_Points = New_LocalMap_Points;
 
         if(cub_needrm.size() > 0) {
-            std::lock_guard<std::mutex> map_lock(mtx_map_);
+            std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
             ikdtree.Delete_Point_Boxes(cub_needrm);
         }
     }
@@ -1664,7 +1696,7 @@ private:
             }
         }
         {
-            std::lock_guard<std::mutex> map_lock(mtx_map_);
+            std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
             ikdtree.Add_Points(PointToAdd, true);
             ikdtree.Add_Points(PointNoNeedDownsample, false);
         }
