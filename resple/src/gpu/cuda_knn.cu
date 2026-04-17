@@ -1,4 +1,5 @@
 #include "gpu/cuda_knn.h"
+#include "gpu/cuda_profile.h"
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -315,6 +316,7 @@ CudaMap::CudaMap() : impl_(new Impl()) {}
 CudaMap::~CudaMap() { delete impl_; }
 
 void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
+    RESPLE_NVTX("CudaMap::update");
     const int n = static_cast<int>(n_in);
     impl_->n_points = n;
     if (n == 0) {
@@ -325,16 +327,21 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
     impl_->ensure_bucket_storage();
 
     // Stage points → float4 on host, then upload to d_input_points.
-    std::vector<float4> staged(n);
-    for (int i = 0; i < n; ++i) {
-        const auto& p = points[i];
-        staged[i] = {p.x, p.y, p.z, p.intensity};
+    {
+        RESPLE_PROF_PHASE_CPU("update.stage_points_host");
+        std::vector<float4> staged(n);
+        for (int i = 0; i < n; ++i) {
+            const auto& p = points[i];
+            staged[i] = {p.x, p.y, p.z, p.intensity};
+        }
+        RESPLE_PROF_PHASE_GPU("update.h2d_points");
+        CUDA_CHECK(cudaMemcpy(impl_->d_input_points, staged.data(),
+                              n * sizeof(float4), cudaMemcpyHostToDevice));
     }
-    CUDA_CHECK(cudaMemcpy(impl_->d_input_points, staged.data(),
-                          n * sizeof(float4), cudaMemcpyHostToDevice));
 
     // Phase 1: compute each point's bucket.
     {
+        RESPLE_PROF_PHASE_GPU("update.compute_buckets_kernel");
         const int blocks = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
         compute_buckets_kernel<<<blocks, kThreadsPerBlock>>>(
             impl_->d_input_points, n, impl_->d_buckets);
@@ -344,16 +351,19 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
     // arrays present, and we'll sort the indices to match the sorted
     // bucket order.
     {
+        RESPLE_PROF_PHASE_CPU("update.stage_indices_host");
         // Could use cub::DeviceFor or a tiny kernel; a small kernel is
         // simpler (and we don't pay for a fresh cub include).
         std::vector<int> h_idx(n);
         for (int i = 0; i < n; ++i) h_idx[i] = i;
+        RESPLE_PROF_PHASE_GPU("update.h2d_indices");
         CUDA_CHECK(cudaMemcpy(impl_->d_input_indices, h_idx.data(),
                               n * sizeof(int), cudaMemcpyHostToDevice));
     }
 
     // Phase 2: sort (bucket, index) pairs by bucket.
     {
+        RESPLE_PROF_PHASE_GPU("update.sort_pairs");
         size_t needed = 0;
         cub::DeviceRadixSort::SortPairs(
             nullptr, needed,
@@ -370,6 +380,7 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
 
     // Phase 3: gather points by sorted index → d_sorted_points.
     {
+        RESPLE_PROF_PHASE_GPU("update.gather_points_kernel");
         const int blocks = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
         gather_points_kernel<<<blocks, kThreadsPerBlock>>>(
             impl_->d_input_points, impl_->d_sorted_indices, n,
@@ -381,6 +392,7 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
     //   bucket_starts[b] = first sorted index whose bucket >= b
     // and bucket_starts is monotone non-decreasing in b.
     {
+        RESPLE_PROF_PHASE_GPU("update.bucket_starts");
         const int init_blocks = (kNumBuckets + 1 + kThreadsPerBlock - 1) / kThreadsPerBlock;
         init_bucket_starts_kernel<<<init_blocks, kThreadsPerBlock>>>(
             impl_->d_bucket_starts, n);
@@ -403,11 +415,18 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
                            std::vector<pcl::PointXYZINormal>& neighbors,
                            std::vector<float>& dist_sq)
 {
+    RESPLE_NVTX("CudaMap::batch_search");
     const int n_queries = static_cast<int>(n_queries_in);
-    neighbors.assign(n_queries * k, pcl::PointXYZINormal{});
-    dist_sq.assign(n_queries * k, INFINITY);
+    {
+        RESPLE_PROF_PHASE_CPU("search.alloc_outputs");
+        neighbors.assign(n_queries * k, pcl::PointXYZINormal{});
+        dist_sq.assign(n_queries * k, INFINITY);
+    }
 
-    if (n_queries == 0 || impl_->n_points == 0) return;
+    if (n_queries == 0 || impl_->n_points == 0) {
+        prof::frame_done();
+        return;
+    }
     if (k <= 0 || k > kMaxK) {
         throw std::runtime_error(
             "CudaMap::batch_search: k out of range [1, kMaxK]");
@@ -416,44 +435,62 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
     impl_->ensure_queries_capacity(n_queries);
     impl_->ensure_out_capacity(n_queries * k);
 
-    std::vector<float4> staged_q(n_queries);
-    for (int i = 0; i < n_queries; ++i) {
-        const auto& p = queries[i];
-        staged_q[i] = {p.x, p.y, p.z, 0.0f};
+    {
+        RESPLE_PROF_PHASE_CPU("search.stage_queries_host");
+        std::vector<float4> staged_q(n_queries);
+        for (int i = 0; i < n_queries; ++i) {
+            const auto& p = queries[i];
+            staged_q[i] = {p.x, p.y, p.z, 0.0f};
+        }
+        RESPLE_PROF_PHASE_GPU("search.h2d_queries");
+        CUDA_CHECK(cudaMemcpy(impl_->d_queries, staged_q.data(),
+                              n_queries * sizeof(float4),
+                              cudaMemcpyHostToDevice));
     }
-    CUDA_CHECK(cudaMemcpy(impl_->d_queries, staged_q.data(),
-                          n_queries * sizeof(float4),
-                          cudaMemcpyHostToDevice));
 
-    const int blocks = (n_queries + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    search_kernel<<<blocks, kThreadsPerBlock>>>(
-        impl_->d_sorted_points, impl_->d_bucket_starts, impl_->n_points,
-        impl_->d_queries, n_queries,
-        impl_->d_out_neighbors, impl_->d_out_dist_sq, k);
-    CUDA_CHECK(cudaGetLastError());
+    {
+        RESPLE_PROF_PHASE_GPU("search.search_kernel");
+        const int blocks = (n_queries + kThreadsPerBlock - 1) / kThreadsPerBlock;
+        search_kernel<<<blocks, kThreadsPerBlock>>>(
+            impl_->d_sorted_points, impl_->d_bucket_starts, impl_->n_points,
+            impl_->d_queries, n_queries,
+            impl_->d_out_neighbors, impl_->d_out_dist_sq, k);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     // Stage neighbor coords back as float4, then unpack into PCL points
     // on the CPU. (Could DtoH directly into a PCL buffer if we cast,
     // but PCL's struct layout has padding so a separate stage is safer.)
     std::vector<float4> staged_n(n_queries * k);
-    CUDA_CHECK(cudaMemcpy(staged_n.data(), impl_->d_out_neighbors,
-                          n_queries * k * sizeof(float4),
-                          cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dist_sq.data(), impl_->d_out_dist_sq,
-                          n_queries * k * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-
-    for (int i = 0; i < n_queries * k; ++i) {
-        auto& dst = neighbors[i];
-        dst.x = staged_n[i].x;
-        dst.y = staged_n[i].y;
-        dst.z = staged_n[i].z;
-        dst.intensity = staged_n[i].w;
-        dst.normal_x = 0;
-        dst.normal_y = 0;
-        dst.normal_z = 0;
-        dst.curvature = 0;
+    {
+        RESPLE_PROF_PHASE_GPU("search.d2h_neighbors");
+        CUDA_CHECK(cudaMemcpy(staged_n.data(), impl_->d_out_neighbors,
+                              n_queries * k * sizeof(float4),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(dist_sq.data(), impl_->d_out_dist_sq,
+                              n_queries * k * sizeof(float),
+                              cudaMemcpyDeviceToHost));
     }
+
+    {
+        RESPLE_PROF_PHASE_CPU("search.unpack_neighbors_host");
+        for (int i = 0; i < n_queries * k; ++i) {
+            auto& dst = neighbors[i];
+            dst.x = staged_n[i].x;
+            dst.y = staged_n[i].y;
+            dst.z = staged_n[i].z;
+            dst.intensity = staged_n[i].w;
+            dst.normal_x = 0;
+            dst.normal_y = 0;
+            dst.normal_z = 0;
+            dst.curvature = 0;
+        }
+    }
+
+    // batch_search is the natural per-frame cadence (one call per IEKF
+    // iteration; iterations are bounded by max_iter — the periodic dump
+    // will catch any phase divergence even with multiple iter/frame).
+    prof::frame_done();
 }
 
 std::size_t CudaMap::n_points() const {
