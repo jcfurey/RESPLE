@@ -4,6 +4,7 @@ project(resple)
 # Prefer target-based flags. Provide options to gate OpenMP/native arch.
 option(ENABLE_OPENMP "Enable OpenMP parallelism" ON)
 option(ENABLE_NATIVE_ARCH "Enable -march=native optimizations" ON)
+option(ENABLE_CUDA "Enable CUDA k-NN acceleration (requires nvcc)" OFF)
 if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE "Release")
 endif()
@@ -49,11 +50,37 @@ endif()
 
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
-add_library(${PROJECT_NAME}
-		src/Mapping.cpp
-		src/RESPLE.cpp
-		include/ikd-Tree/ikd_Tree.cpp
+
+# CUDA support — must precede add_library so .cu files compile correctly.
+# CUDA 13 dropped Maxwell/Pascal: defaults below target Turing through Ada.
+# For Jetson Nano (sm_53), build with CUDA <= 11 and override with
+#   -DCMAKE_CUDA_ARCHITECTURES="53;75;86" or similar.
+if(ENABLE_CUDA)
+	enable_language(CUDA)
+	if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+		# Turing (75), Ampere desktop (86), Orin (87), Ada Lovelace (89)
+		set(CMAKE_CUDA_ARCHITECTURES 75 86 87 89)
+	endif()
+	message(STATUS "CUDA enabled: targeting compute ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+
+set(RESPLE_LIB_SOURCES
+	src/Mapping.cpp
+	src/RESPLE.cpp
+	include/ikd-Tree/ikd_Tree.cpp
 )
+if(ENABLE_CUDA)
+	list(APPEND RESPLE_LIB_SOURCES src/gpu/cuda_knn.cu)
+endif()
+
+add_library(${PROJECT_NAME} ${RESPLE_LIB_SOURCES})
+
+if(ENABLE_CUDA)
+	target_compile_definitions(${PROJECT_NAME} PUBLIC RESPLE_USE_CUDA)
+	set_target_properties(${PROJECT_NAME} PROPERTIES
+		CUDA_SEPARABLE_COMPILATION ON
+	)
+endif()
 
 target_include_directories(${PROJECT_NAME}
 	PUBLIC

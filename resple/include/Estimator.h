@@ -97,6 +97,98 @@ class Estimator
         }
     }
 
+#ifdef RESPLE_USE_CUDA
+    // GPU overload: same logic, but findCorresp uses the batched CudaMap path.
+    void updateIEKFLiDAR(Eigen::aligned_deque<PointData>& pt_meas,
+                         std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>>& pt_neighbors,
+                         resple_gpu::CudaMap* cuda_map, const double pt_thresh, const double cov_thresh,
+                         int num_threads = 5, int num_match_points = 5)
+    {
+        const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
+        Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
+        bool converged = true;
+        int num_tot_eff = 0;
+        int t = 0;
+        for (int i = 0; i < max_iter; i++) {
+            Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
+            if (converged) {
+                num_tot_eff = 0;
+                Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, num_threads, num_match_points);
+            }
+            if (num_tot_eff > 0) {
+                if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
+                    std::cerr << "[Estimator] IEKF LiDAR update failed (numerical), resetting covariance to prior\n";
+                    cov_rcp = cov_prop;
+                    break;
+                }
+            } else {
+                break;
+            }
+            converged = true;
+            Eigen::Matrix<double, XSIZE, 1> state_af = getState();
+            if ((state_af - rcpi).norm() > eps) {
+                converged = false;
+            } else {
+                t++;
+            }
+            if(!t && i == max_iter - 2) {
+                converged = true;
+            }
+            if ((t > n_iter) || (i == max_iter - 1)) {
+                cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
+                break;
+            }
+        }
+    }
+
+    void updateIEKFLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas,
+        std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>>& pt_neighbors,
+        resple_gpu::CudaMap* cuda_map, const double pt_thresh,
+        Eigen::aligned_deque<ImuData>& imu_meas, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro, const double cov_thresh,
+        int num_threads = 5, int num_match_points = 5)
+    {
+        const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
+        Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
+        bool converged = true;
+        int num_tot_eff = 0;
+        int t = 0;
+        for (int i = 0; i < max_iter; i++) {
+            Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
+            if (converged) {
+                num_tot_eff = 0;
+                Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, num_threads, num_match_points);
+            }
+            bool update_ok = false;
+            if (num_tot_eff > 0 && imu_meas.empty()) {
+                update_ok = updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads);
+            } else if (num_tot_eff > 0) {
+                update_ok = updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, g, cov_acc, cov_gyro, num_threads);
+            } else {
+                break;
+            }
+            if (!update_ok) {
+                std::cerr << "[Estimator] IEKF LIO update failed (numerical), resetting covariance to prior\n";
+                cov_rcp = cov_prop;
+                break;
+            }
+            converged = true;
+            Eigen::Matrix<double, XSIZE, 1> state_af = getState();
+            if ((state_af - rcpi).norm() > eps) {
+                converged = false;
+            } else {
+                t++;
+            }
+            if(!t && i == max_iter - 2) {
+                converged = true;
+            }
+            if ((t > n_iter) || (i == max_iter - 1)) {
+                cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
+                break;
+            }
+        }
+    }
+#endif  // RESPLE_USE_CUDA
+
     void updateIEKFLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas,
         std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>>& pt_neighbors,
         KD_TREE<pcl::PointXYZINormal>* ikdtree, const double pt_thresh,

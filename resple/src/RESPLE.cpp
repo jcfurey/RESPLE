@@ -47,8 +47,14 @@
 #include "estimate_msgs/msg/estimate.hpp"
 #include "estimate_msgs/action/save_map.hpp"
 #include "Estimator.h"
+#ifdef RESPLE_USE_CUDA
+#include "gpu/cuda_knn.h"
+#endif
 
 KD_TREE<pcl::PointXYZINormal> ikdtree;
+#ifdef RESPLE_USE_CUDA
+static resple_gpu::CudaMap g_cuda_map;
+#endif
 
 class RESPLE : public rclcpp_lifecycle::LifecycleNode
 {
@@ -366,12 +372,28 @@ public:
                                                         : imu_meas.back().time_ns;
                 pt_neighbors_.resize(pt_meas.size());
                 {
-                    // IEKF reads ikdtree (Nearest_Search) — block until any in-flight
-                    // map mutator (async mapIncremental / lasermapFovSegment) is done.
+                    // IEKF reads the map structure (kd-tree or GPU map). The
+                    // shared lock blocks until any in-flight map mutator
+                    // (async mapIncremental / lasermapFovSegment) is done.
                     std::shared_lock<std::shared_mutex> map_read_lock(mtx_map_);
+#ifdef RESPLE_USE_CUDA
+                    // Use GPU path only once the map has actually been seeded
+                    // (mapIncremental initializes the kd-tree first; until
+                    // CudaMap::update() runs, fall back to the kd-tree path).
+                    const bool use_gpu = !g_cuda_map.empty();
+#else
+                    constexpr bool use_gpu = false;
+#endif
                     if (if_lidar_only) {
                         estimator_lo.propRCP(max_time_ns);
-                        estimator_lo.updateIEKFLiDAR(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
+#ifdef RESPLE_USE_CUDA
+                        if (use_gpu) {
+                            estimator_lo.updateIEKFLiDAR(pt_meas, pt_neighbors_, &g_cuda_map, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
+                        } else
+#endif
+                        {
+                            estimator_lo.updateIEKFLiDAR(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
+                        }
                         total_iekf_iterations_ += estimator_lo.n_iter;
                     } else {
                         if (!imu_meas.empty()) {
@@ -381,7 +403,14 @@ public:
                             imu_meas.pop_front();
                         }
                         estimator_lio.propRCP(max_time_ns);
-                        estimator_lio.updateIEKFLiDARInertial(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
+#ifdef RESPLE_USE_CUDA
+                        if (use_gpu) {
+                            estimator_lio.updateIEKFLiDARInertial(pt_meas, pt_neighbors_, &g_cuda_map, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
+                        } else
+#endif
+                        {
+                            estimator_lio.updateIEKFLiDARInertial(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
+                        }
                         total_iekf_iterations_ += estimator_lio.n_iter;
                     }
                 }
@@ -421,9 +450,24 @@ public:
                     // unique_lock(mtx_map_); the next IEKF's shared_lock blocks
                     // until each releases. publishFrameWorld doesn't touch the tree.
                     map_update_future_ = std::async(std::launch::async, [this]() {
-                        mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
-                        publishFrameWorld(pc_world_bg_);
-                        lasermapFovSegment();
+                        // All map mutations + GPU sync under a single unique_lock
+                        // so the IEKF (shared_lock) never observes a state where
+                        // the GPU map is out-of-sync with the kd-tree. Releasing
+                        // the lock between mapIncremental, lasermapFovSegment,
+                        // and the GPU upload would let IEKF read a stale GPU map
+                        // (e.g., still containing FOV-pruned points) → bad
+                        // neighbors → trajectory drift.
+                        {
+                            std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
+                            mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
+                            lasermapFovSegment();
+#ifdef RESPLE_USE_CUDA
+                            ikdtree.PCL_Storage.clear();
+                            ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                            g_cuda_map.update(ikdtree.PCL_Storage.data(), ikdtree.PCL_Storage.size());
+#endif
+                        }
+                        publishFrameWorld(pc_world_bg_);  // no map access; outside lock
                     });
                     t_last_map_upd = max_time_ns;
                 }
@@ -1535,6 +1579,12 @@ private:
             {
                 std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
                 ikdtree.Build(pc_world.points);
+#ifdef RESPLE_USE_CUDA
+                // Initial GPU map sync from the freshly-built kd-tree.
+                ikdtree.PCL_Storage.clear();
+                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                g_cuda_map.update(ikdtree.PCL_Storage.data(), ikdtree.PCL_Storage.size());
+#endif
             }
             pc_world.clear();
             if_init_map = true;
@@ -1656,8 +1706,9 @@ private:
         }
         LocalMap_Points = New_LocalMap_Points;
 
+        // Caller (async map task) holds mtx_map_ unique_lock for the entire
+        // sequence of mapIncremental + lasermapFovSegment + GPU sync.
         if(cub_needrm.size() > 0) {
-            std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
             ikdtree.Delete_Point_Boxes(cub_needrm);
         }
     }
@@ -1695,11 +1746,9 @@ private:
                 PointNoNeedDownsample.emplace_back(point);
             }
         }
-        {
-            std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
-            ikdtree.Add_Points(PointToAdd, true);
-            ikdtree.Add_Points(PointNoNeedDownsample, false);
-        }
+        // Caller (async map task) holds mtx_map_ unique_lock.
+        ikdtree.Add_Points(PointToAdd, true);
+        ikdtree.Add_Points(PointNoNeedDownsample, false);
     }
 
 };
