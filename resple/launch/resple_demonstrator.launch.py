@@ -42,7 +42,7 @@ def generate_launch_description():
         emulate_tty=True,
         output='log',
         parameters=[config_yaml_fusion],
-        arguments=['--ros-args', '--log-level', 'warn'])
+        arguments=['--ros-args', '--log-level', 'info'])
 
     mapping_node = launch_ros.actions.Node(
         package='resple',
@@ -51,7 +51,7 @@ def generate_launch_description():
         emulate_tty=True,
         output='log',
         parameters=[config_yaml_fusion],
-        arguments=['--ros-args', '--log-level', 'warn'])
+        arguments=['--ros-args', '--log-level', 'info'])
 
     # Wrap each in a TimerAction. period accepts a Substitution that
     # resolves to a numeric string at launch time, so users can override

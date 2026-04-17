@@ -61,7 +61,7 @@ def generate_launch_description():
                 emulate_tty=True,
                 output='both',
                 parameters=[config_yaml_fusion],
-                arguments=['--ros-args', '--log-level', 'warn'])
+                arguments=['--ros-args', '--log-level', 'info'])
             ]),                 
         TimerAction(
             period=_mapping_delay,
@@ -73,7 +73,7 @@ def generate_launch_description():
                 emulate_tty=True,
                 output='both',
                 parameters=[config_yaml_fusion],
-                arguments=['--ros-args', '--log-level', 'warn'])
+                arguments=['--ros-args', '--log-level', 'info'])
             ])                
   ])
 
