@@ -98,39 +98,64 @@ class MappingBase
 
     void processScan(SplineState* spl, const int64_t spl_window_st_ns)
     {
-        // RCLCPP_INFO(node_handle_->get_logger(), "processScan");
+        (void)spl_window_st_ns;
         int64_t t_end_ns = 0;
-        // std::this_thread::sleep_for instead of rclcpp::Rate: this is a
-        // worker thread, not an executor callback, and rate.sleep() throws
-        // runtime_error("context cannot be slept with...") once SIGINT
-        // invalidates the rclcpp context — checking rclcpp::ok() first
-        // doesn't fix it because the check and sleep aren't atomic.
         constexpr auto kRatePeriod = std::chrono::milliseconds(50);  // ~20 Hz
+        // Tally outcomes per call so the throttled summary log below
+        // shows where every scan went: published, dropped-as-old, or
+        // gated by spline-not-yet-caught-up.
+        int n_published = 0, n_dropped_old = 0, n_pending_new = 0;
         while (!pc_L_buff.empty()) {
             t_end_ns = pc_L_buff.front().header.stamp + int64_t (pc_L_buff.front().points.back().intensity * float(1e6));
             {
                 std::unique_lock<std::mutex> lock(mtx);
                 if (t_end_ns < spl->minTimeNs()) {
                     pc_L_buff.pop_front();
+                    n_dropped_old++;
                     continue;
                 } else if (t_end_ns <= spl->maxTimeNs()) {
                     transformCloud(pc_L_buff.front(), spl, pc);
                     pc_L_buff.pop_front();
                     lock.unlock();
                     publishMap(pc, pub_global_map);
+                    n_published++;
                 } else {
                     lock.unlock();
+                    n_pending_new++;
                     std::this_thread::sleep_for(kRatePeriod);
                     break;
                 }
             }
         }
+        // Update aggregate counters (cheap; called once per process-loop tick).
+        total_published_ += n_published;
+        total_dropped_old_ += n_dropped_old;
+        total_pending_new_ += n_pending_new;
+        // Throttled summary: every 2s, dump where scans are landing.
+        // Reading out spline window + buffer state makes it obvious if we're
+        // pinned in any of the failure modes (e.g., t_end always > spline_max).
+        auto now_clk = node_handle_->get_clock()->now();
+        if ((now_clk - last_processScan_log_).seconds() >= 2.0) {
+            last_processScan_log_ = now_clk;
+            int64_t s_min = spl->minTimeNs(), s_max = spl->maxTimeNs();
+            RCLCPP_INFO(node_handle_->get_logger(),
+                "[Mapping] processScan: pc_L_buff=%zu spline_knots=%ld "
+                "spline=[%ld..%ld] last_t_end=%ld "
+                "totals: published=%zu dropped_old=%zu pending_new=%zu",
+                pc_L_buff.size(), spl->numKnots(), s_min, s_max, t_end_ns,
+                total_published_, total_dropped_old_, total_pending_new_);
+        }
     }
 
     void publishMap(const typename pcl::PointCloud<PointType>::Ptr& pcs,
-                         const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher) const
+                         const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher)
     {
-        // RCLCPP_INFO(node_handle_->get_logger(), "publishMap");
+        if (!publishMap_logged_) {
+            publishMap_logged_ = true;
+            RCLCPP_INFO(node_handle_->get_logger(),
+                "[Mapping] first publishMap on /global_map (points=%zu)",
+                pcs->points.size());
+        }
         sensor_msgs::msg::PointCloud2 msgs;
         pcl::toROSMsg(*pcs, msgs);
         msgs.header.frame_id = map_id;
@@ -227,8 +252,14 @@ class MappingBase
 
   protected:
     rclcpp::QoS lidar_qos;
-    rclcpp::SubscriptionOptions sub_opt;    
+    rclcpp::SubscriptionOptions sub_opt;
     Eigen::aligned_deque<typename pcl::PointCloud<PointType>> pc_L_buff;
+    // Diagnostic counters + last-log time (see processScan / publishMap).
+    bool publishMap_logged_ = false;
+    rclcpp::Time last_processScan_log_{0, 0, RCL_ROS_TIME};
+    size_t total_published_ = 0;
+    size_t total_dropped_old_ = 0;
+    size_t total_pending_new_ = 0;
     typename pcl::PointCloud<PointType>::Ptr pc_last;
     typename pcl::PointCloud<PointType>::Ptr pc_last_ds;
     pcl::VoxelGrid<pcl::PointXYZINormal> ds_filter_each_scan;
@@ -306,7 +337,7 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
         {
             std::lock_guard<std::mutex> lock(mtx);
             // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
     }
@@ -364,7 +395,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         {
             std::lock_guard<std::mutex> lock(mtx);
             // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
     }
@@ -421,7 +452,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx);
             // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
     }
@@ -478,7 +509,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx);
             // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
     }
@@ -543,7 +574,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
         {
             std::lock_guard<std::mutex> lock(mtx);
             // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
     }
@@ -606,7 +637,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
         {
             std::lock_guard<std::mutex> lock(mtx);
             // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 5) { this->pc_L_buff.pop_front(); }
+            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
     }
@@ -845,6 +876,7 @@ private:
     std::shared_ptr<tf2_ros::Buffer> tf_buffer;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener;
 
+    bool getEstCallback_logged_ = false;
     // Lifecycle management
     std::atomic<bool> processing_active_;
     std::thread processing_thread_;
@@ -856,7 +888,7 @@ private:
     Eigen::Vector<double, 6> cov_twist;
     bool publish_tf, invert_tf;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
-    bool if_init_succeed = false;
+    std::atomic<bool> if_init_succeed{false};
     int64_t path_t_ns_ = 0;
     std::mutex m_spline;
 
@@ -875,10 +907,15 @@ private:
 
     void getEstCallback(const estimate_msgs::msg::Estimate::SharedPtr est_msg)
     {
+        if (!getEstCallback_logged_) {
+            getEstCallback_logged_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                "[Mapping] first /est_window received (knots=%zu, init_succeed=%d)",
+                est_msg->spline.knots.size(), int(if_init_succeed.load()));
+        }
         if (!if_init_succeed) {
             return;
         }
-        // RCLCPP_INFO(this->get_logger(), "getEstCallback");
 
         estimate_msgs::msg::Spline spline_msg = est_msg->spline;
         SplineState spline_w;
@@ -1062,6 +1099,9 @@ private:
         int64_t bag_start_time = start_time_msg->data;
         spline_active_.init(1, 0, bag_start_time, 0);  // dt=1 placeholder; overridden by getEstCallback
         if_init_succeed = true;
+        RCLCPP_INFO(this->get_logger(),
+            "[Mapping] startCallBack: if_init_succeed=true (bag_start_time=%ld)",
+            bag_start_time);
     }
 
     void publishPath() {
@@ -1160,31 +1200,22 @@ int main(int argc, char** argv) {
         node->deactivate();
         node->cleanup();
         node->shutdown();
-    } else {
-        // Context already shut down (Ctrl+C), just stop processing
-        RCLCPP_WARN(node->get_logger(), "Context invalid, forcing shutdown...");
-        // Manually trigger shutdown to stop thread
-        node->on_shutdown(node->get_current_state());
-    }
-    exec.remove_node(node->get_node_base_interface());
-    exec.remove_node(temp_nh);
-
-    // Cleanup buffs (skipped on SIGINT — _exit() below releases everything
-    // and skipping avoids tf2_ros::TransformListener destructors that can
-    // block if the listener thread is mid-callback).
-    if (!sigint_path) {
+        exec.remove_node(node->get_node_base_interface());
+        exec.remove_node(temp_nh);
         for (auto buff : buffs) {
             delete buff;
         }
+        rclcpp::shutdown();
+        return 0;
     }
 
-    rclcpp::shutdown();
-    if (sigint_path) {
-        // Same rationale as RESPLE.cpp: bypass static destructors on
-        // Ctrl+C to avoid the launcher escalating SIGINT → SIGTERM →
-        // SIGKILL while CUDA / ikd-Tree / FastDDS atexit handlers stall.
-        std::fflush(stdout);
-        std::fflush(stderr);
-        std::_Exit(0);
-    }
+    // SIGINT path: same rationale as RESPLE.cpp main(). Run on_shutdown
+    // to stop the worker thread, then bail out with _Exit before any of
+    // the wedge-prone teardown paths (executor, tf listener join, ROS
+    // context shutdown, static dtors).
+    RCLCPP_WARN(node->get_logger(), "Context invalid, forcing shutdown...");
+    node->on_shutdown(node->get_current_state());
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);
 }
