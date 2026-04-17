@@ -938,6 +938,13 @@ private:
     
     void getImuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg)
     {
+        // In LO mode, drop IMU entirely once the filter is initialized.
+        // Cheap no-op flag check avoids destroying the live Subscription from
+        // the worker thread (which races the executor → SIGSEGV).
+        if (if_lidar_only && if_init_filter) {
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(m_buff);
         if (imu_int_buff.size() >= 2000) {
             imu_int_buff.erase(imu_int_buff.begin());
@@ -1520,13 +1527,18 @@ private:
                     n_imu, accel_variance, if_lidar_only ? "LO" : "LIO");
             }
 
-            // In LO mode, drop IMU subscription after gravity init — not needed for IEKF
+            // In LO mode, drop IMU after gravity init — not needed for IEKF.
+            // We do NOT call sub_imu.reset() here: tearing down a live
+            // Subscription from this worker thread races the executor's
+            // dispatcher (MultiThreadedExecutor on the sensor callback group)
+            // and can use-after-free → SIGSEGV. Instead, getImuCallback
+            // early-returns once (if_lidar_only && if_init_filter) is true,
+            // and the subscription is destroyed in on_deactivate / on_cleanup.
             if (if_lidar_only) {
-                sub_imu.reset();
                 std::lock_guard<std::mutex> lock(m_buff);
                 imu_int_buff.clear();
                 imu_buff.clear();
-                RCLCPP_INFO(this->get_logger(), "LO mode: IMU subscription dropped after gravity alignment");
+                RCLCPP_INFO(this->get_logger(), "LO mode: IMU input disabled after gravity alignment");
             }
 
             initFilter(start_t_ns, Eigen::Vector3d(0, 0, 0), q_WI);
