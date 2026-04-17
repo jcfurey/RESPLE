@@ -858,12 +858,22 @@ private:
             Eigen::Vector3d quat_idle(idle.orientation_del.x, idle.orientation_del.y, idle.orientation_del.z);
             spline_w.setIdles(i, t_idle, quat_idle, q_idle0);
         }
-        // Write to pending buffer — process() will swap to active under mutex
+        // Write to pending buffer — process() will swap to active under mutex.
+        //
+        // Move-assign (don't merge): spline_pending_ must hold THIS window's
+        // knots/start_i intact so process()'s spline_active_.updateKnots()
+        // sees the correct global indexing offset. The previous code called
+        // spline_pending_.updateKnots(&spline_w), which:
+        //   (a) read spline_pending_.num_knot before it was ever initialized
+        //       (default ctor leaves int64_t indeterminate → loop bound was
+        //       garbage on first call → setOneStateKnot writes out of bounds
+        //       → SIGSEGV in Eigen Vector3d copy);
+        //   (b) accumulated knots across callbacks, so spline_pending_ grew
+        //       unbounded and start_i never matched the latest window.
         {
             std::lock_guard<std::mutex> lock(m_spline);
             spl_window_st_ns_pending_ = spline_msg.start_t - spline_msg.dt;
-            spline_pending_.setTimeIntervalNs(spline_msg.dt);
-            spline_pending_.updateKnots(&spline_w);
+            spline_pending_ = std::move(spline_w);
             spline_pending_ready_.store(true);
         }
     }
