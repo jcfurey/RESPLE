@@ -16,16 +16,25 @@ namespace {
 constexpr int kMaxK = 8;
 constexpr int kThreadsPerBlock = 128;
 
-// Voxel size for hash-grid bucketing. Matches the typical map downsample
-// (ds_lm_voxel ~ 0.2-0.5 m). Cells of this size make 27-cell search cover
-// a sphere of radius ~sqrt(3) * voxel_size, which exceeds the IEKF's
-// max-neighbor-distance gate (sqrt(5) ~ 2.24m) when voxel_size >= 1.3m.
-// Below that, 27 cells cover only a small neighborhood — but this matches
-// the natural density of the LiDAR points anyway, and the search is still
-// EXACT within the searched cells (we just may miss far neighbors that
-// are also missed by the IEKF gate).
-constexpr float kVoxelSize = 0.5f;
+// Voxel size for hash-grid bucketing. We deliberately keep this larger than
+// the map downsample (ds_lm_voxel ~ 0.2-0.5 m) so each cell holds ~40-60
+// points — scanning a cell is a contiguous memory read that the warp
+// coalesces cleanly.
+//
+// Correctness: the CPU path in Association::findCorresp (kdtree radius
+// 2.236 m, plane-gate dist² < 5 i.e. dist < sqrt(5) ≈ 2.236 m) silently
+// rejects GPU candidates beyond that gate, so the GPU must GUARANTEE it
+// finds every point within 2.236 m of the query — else the IEKF sees
+// fewer correspondences than the CPU baseline (→ more iterations, drift).
+//
+// For a query anywhere in the center cell, the minimum distance to the
+// outside of a (2*S+1)-cell cube is S * voxel. So the guaranteed search
+// radius r_guaranteed = kSearchShellRadius * kVoxelSize must exceed the
+// CPU gate 2.236 m. (1.2 m × 2 = 2.4 m ✓)
+constexpr float kVoxelSize = 1.2f;
 constexpr float kInvVoxelSize = 1.0f / kVoxelSize;
+constexpr int   kSearchShellRadius = 2;    // ±2 → 5×5×5 = 125 cells
+constexpr int   kSearchShellDiam   = 2 * kSearchShellRadius + 1;
 
 // Hash table size. Aim for ~4 points per bucket on average for a 1M map.
 // Power of two enables fast modulo via bit-mask.
@@ -154,10 +163,12 @@ __device__ __forceinline__ void insert_topk_pt(float* arr_dist, float4* arr_pt,
     arr_pt[j] = pt;
 }
 
-// Search kernel: per-query, scan the 27 surrounding cells, find top-k.
-// Outputs neighbor coordinates (float4) and squared distances directly,
-// avoiding the need for a host-side index → point lookup table.
-// One block per kThreadsPerBlock queries, one thread per query.
+// Search kernel: per-query, scan surrounding cells in shell-order until
+// the k-th best distance is guaranteed-covered (see kSearchShellRadius),
+// finding top-k. Outputs neighbor coordinates (float4) and squared
+// distances directly, avoiding the need for a host-side index → point
+// lookup table. One block per kThreadsPerBlock queries, one thread per
+// query.
 __global__ void search_kernel(const float4* __restrict__ sorted_points,
                               const int* __restrict__ bucket_starts,
                               int n_points,
@@ -171,6 +182,17 @@ __global__ void search_kernel(const float4* __restrict__ sorted_points,
     if (qid >= n_queries) return;
 
     const float4 q = queries[qid];
+    // Inactive queries (points outside the active 4-knot window) are
+    // marked with NaN coords by Association::findCorresp. Skip them
+    // cheaply instead of relying on NaN falling through insert_topk's
+    // comparison guard, which then corrupts slot 0 with a NaN distance.
+    if (!isfinite(q.x) || !isfinite(q.y) || !isfinite(q.z)) {
+        for (int i = 0; i < k; ++i) {
+            out_dist_sq[qid * k + i] = INFINITY;
+            out_neighbors[qid * k + i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        return;
+    }
     const int qcx = floor_div(q.x, kInvVoxelSize);
     const int qcy = floor_div(q.y, kInvVoxelSize);
     const int qcz = floor_div(q.z, kInvVoxelSize);
@@ -184,34 +206,53 @@ __global__ void search_kernel(const float4* __restrict__ sorted_points,
         local_pt[i] = make_float4(0.f, 0.f, 0.f, 0.f);
     }
 
-    // Scan 27 neighbor cells.
-    for (int dz = -1; dz <= 1; ++dz)
-    for (int dy = -1; dy <= 1; ++dy)
-    for (int dx = -1; dx <= 1; ++dx) {
-        const int cx = qcx + dx;
-        const int cy = qcy + dy;
-        const int cz = qcz + dz;
-        const uint32_t bucket = hash_cell(cx, cy, cz) & kBucketMask;
+    // Shell-ordered cell scan with early termination.
+    //
+    // After scanning all cells at offset ≤ shell, we have examined every
+    // point within radius (shell * voxel) of the query. If the current
+    // k-th best distance is ≤ (shell * voxel)², no future shell can
+    // produce a closer candidate (points in cells at offset ≥ shell+1
+    // are at least shell*voxel away from the query), so we're done.
+    //
+    // This is the canonical radius-search kNN prune. In typical LiDAR
+    // densities the first shell satisfies the k=5 query, so most calls
+    // touch only 1-27 cells rather than all (2*S+1)^3.
+    for (int shell = 0; shell <= kSearchShellRadius; ++shell) {
+        for (int dz = -shell; dz <= shell; ++dz)
+        for (int dy = -shell; dy <= shell; ++dy)
+        for (int dx = -shell; dx <= shell; ++dx) {
+            // Skip cells belonging to inner shells (already scanned).
+            const int m = max(max(abs(dx), abs(dy)), abs(dz));
+            if (m != shell) continue;
 
-        const int start = bucket_starts[bucket];
-        const int end   = bucket_starts[bucket + 1];
+            const int cx = qcx + dx;
+            const int cy = qcy + dy;
+            const int cz = qcz + dz;
+            const uint32_t bucket = hash_cell(cx, cy, cz) & kBucketMask;
 
-        for (int p = start; p < end; ++p) {
-            const float4 pt = sorted_points[p];
-            // Hash-collision filter: a different cell may hash to the
-            // same bucket; check that this point actually belongs to
-            // the cell we're examining.
-            const int pcx = floor_div(pt.x, kInvVoxelSize);
-            const int pcy = floor_div(pt.y, kInvVoxelSize);
-            const int pcz = floor_div(pt.z, kInvVoxelSize);
-            if (pcx != cx || pcy != cy || pcz != cz) continue;
+            const int start = bucket_starts[bucket];
+            const int end   = bucket_starts[bucket + 1];
 
-            const float ddx = pt.x - q.x;
-            const float ddy = pt.y - q.y;
-            const float ddz = pt.z - q.z;
-            const float d = ddx*ddx + ddy*ddy + ddz*ddz;
-            insert_topk_pt(local_dist, local_pt, k, d, pt);
+            for (int p = start; p < end; ++p) {
+                const float4 pt = sorted_points[p];
+                // Hash-collision filter: a different cell may hash to
+                // the same bucket; check that this point actually
+                // belongs to the cell we're examining.
+                const int pcx = floor_div(pt.x, kInvVoxelSize);
+                const int pcy = floor_div(pt.y, kInvVoxelSize);
+                const int pcz = floor_div(pt.z, kInvVoxelSize);
+                if (pcx != cx || pcy != cy || pcz != cz) continue;
+
+                const float ddx = pt.x - q.x;
+                const float ddy = pt.y - q.y;
+                const float ddz = pt.z - q.z;
+                const float d = ddx*ddx + ddy*ddy + ddz*ddz;
+                insert_topk_pt(local_dist, local_pt, k, d, pt);
+            }
         }
+
+        const float r_safe = shell * kVoxelSize;
+        if (local_dist[k - 1] <= r_safe * r_safe) break;
     }
 
     // Write top-k.
