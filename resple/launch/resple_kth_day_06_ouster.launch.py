@@ -2,7 +2,8 @@ import os
 import launch
 import launch_ros.actions
 from ament_index_python.packages import get_package_share_directory
-from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.actions import DeclareLaunchArgument, TimerAction, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
 
@@ -23,18 +24,15 @@ def generate_launch_description():
         get_package_share_directory('resple'),
         'config',
         'config_kth_day_06_ouster.yaml')    
-    config_rviz = os.path.join(
+    viz_launch = os.path.join(
         get_package_share_directory('resple'),
-        'config',
-        'config.rviz')     
+        'launch',
+        'resple_viz.launch.py')
     return launch.LaunchDescription([
         start_delay_arg,
         mapping_delay_arg,          	
-        launch_ros.actions.Node(
-            package='rviz2',
-            executable='rviz2',
-            name='rviz2',
-            arguments=['-d', config_rviz, '--ros-args', '--log-level', 'WARN']),   
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(viz_launch)),   
         launch_ros.actions.Node(
             package='tf2_ros',
             executable='static_transform_publisher',

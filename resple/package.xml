@@ -38,6 +38,11 @@
   <depend>rclcpp_lifecycle</depend>
   <depend>rosbag2_cpp</depend>
 
+  <!-- Visualization: foxglove_bridge serves data to Trillium/Foxglove clients;
+       rviz2 kept as an optional fallback via resple_viz.launch.py -->
+  <exec_depend>foxglove_bridge</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
   <test_depend>ament_lint_common</test_depend>
   <test_depend>ament_lint_auto</test_depend>  
   <exec_depend>builtin_interfaces</exec_depend>  
