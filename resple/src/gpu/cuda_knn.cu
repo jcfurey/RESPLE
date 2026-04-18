@@ -83,10 +83,14 @@ __device__ __forceinline__ void insert_topk(float* arr_dist, int* arr_idx,
     arr_idx[j] = idx;
 }
 
-// Phase 1: compute each point's bucket index.
+// Phase 1: compute each point's bucket index AND its cell ID. The cell ID
+// is stashed alongside the point so the search kernel can do an integer
+// equality check for hash-collision verification instead of recomputing
+// three floorf() per candidate — the dominant inner-loop cost.
 __global__ void compute_buckets_kernel(const float4* __restrict__ points,
                                        int n_points,
-                                       uint32_t* __restrict__ out_buckets)
+                                       uint32_t* __restrict__ out_buckets,
+                                       int3* __restrict__ out_cell_ids)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_points) return;
@@ -94,18 +98,24 @@ __global__ void compute_buckets_kernel(const float4* __restrict__ points,
     const int cx = floor_div(p.x, kInvVoxelSize);
     const int cy = floor_div(p.y, kInvVoxelSize);
     const int cz = floor_div(p.z, kInvVoxelSize);
-    out_buckets[i] = hash_cell(cx, cy, cz) & kBucketMask;
+    out_buckets[i]  = hash_cell(cx, cy, cz) & kBucketMask;
+    out_cell_ids[i] = make_int3(cx, cy, cz);
 }
 
-// Phase 2: gather points by sorted index (after CUB sorts indices by bucket).
+// Phase 2: gather points AND their precomputed cell IDs by sorted index
+// (one pass — two gathers share the index load).
 __global__ void gather_points_kernel(const float4* __restrict__ src_points,
-                                     const int* __restrict__ sorted_indices,
+                                     const int3*   __restrict__ src_cell_ids,
+                                     const int*    __restrict__ sorted_indices,
                                      int n_points,
-                                     float4* __restrict__ dst_points)
+                                     float4* __restrict__ dst_points,
+                                     int3*   __restrict__ dst_cell_ids)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_points) return;
-    dst_points[i] = src_points[sorted_indices[i]];
+    const int idx = sorted_indices[i];
+    dst_points[i]   = src_points[idx];
+    dst_cell_ids[i] = src_cell_ids[idx];
 }
 
 // Fill d_out[i] = i for i in [0, n). Replaces the host-side std::vector<int>
@@ -150,6 +160,7 @@ __device__ __forceinline__ void insert_topk_pt(float* arr_dist, float4* arr_pt,
 // lookup table. One block per kThreadsPerBlock queries, one thread per
 // query.
 __global__ void search_kernel(const float4* __restrict__ sorted_points,
+                              const int3*   __restrict__ sorted_cell_ids,
                               const int* __restrict__ bucket_starts,
                               int n_points,
                               const float4* __restrict__ queries,
@@ -214,15 +225,15 @@ __global__ void search_kernel(const float4* __restrict__ sorted_points,
             const int end   = bucket_starts[bucket + 1];
 
             for (int p = start; p < end; ++p) {
-                const float4 pt = sorted_points[p];
                 // Hash-collision filter: a different cell may hash to
-                // the same bucket; check that this point actually
-                // belongs to the cell we're examining.
-                const int pcx = floor_div(pt.x, kInvVoxelSize);
-                const int pcy = floor_div(pt.y, kInvVoxelSize);
-                const int pcz = floor_div(pt.z, kInvVoxelSize);
-                if (pcx != cx || pcy != cy || pcz != cz) continue;
+                // the same bucket. Compare against the precomputed
+                // per-point cell ID (3×int32 equality) rather than
+                // recomputing via three floorf() calls per candidate —
+                // this inner loop is the hottest point in the kernel.
+                const int3 cid = sorted_cell_ids[p];
+                if (cid.x != cx || cid.y != cy || cid.z != cz) continue;
 
+                const float4 pt = sorted_points[p];
                 const float ddx = pt.x - q.x;
                 const float ddy = pt.y - q.y;
                 const float ddz = pt.z - q.z;
@@ -290,6 +301,7 @@ struct CudaMap::Impl {
 
     // GPU-resident sorted map (after hash-grid build).
     float4* d_sorted_points = nullptr;
+    int3*   d_sorted_cell_ids = nullptr;   // (cx, cy, cz) per sorted point
     int n_points = 0;
     int points_capacity = 0;
 
@@ -301,6 +313,7 @@ struct CudaMap::Impl {
     PinnedBuf staged_points;   // pinned host float4[n]; .dev = d_input_points on discrete
     uint32_t* d_buckets = nullptr;
     uint32_t* d_sorted_buckets = nullptr;
+    int3*     d_cell_ids = nullptr;         // unsorted: output of compute_buckets_kernel
     int* d_input_indices = nullptr;
     int* d_sorted_indices = nullptr;
     int build_capacity = 0;
@@ -333,16 +346,20 @@ struct CudaMap::Impl {
     void ensure_build_capacity(int n) {
         staged_points.ensure(n * sizeof(float4), integrated);
         if (n <= build_capacity) return;
-        if (d_sorted_points) CUDA_CHECK(cudaFree(d_sorted_points));
+        if (d_sorted_points)   CUDA_CHECK(cudaFree(d_sorted_points));
+        if (d_sorted_cell_ids) CUDA_CHECK(cudaFree(d_sorted_cell_ids));
         if (d_buckets)        CUDA_CHECK(cudaFree(d_buckets));
         if (d_sorted_buckets) CUDA_CHECK(cudaFree(d_sorted_buckets));
+        if (d_cell_ids)       CUDA_CHECK(cudaFree(d_cell_ids));
         if (d_input_indices)  CUDA_CHECK(cudaFree(d_input_indices));
         if (d_sorted_indices) CUDA_CHECK(cudaFree(d_sorted_indices));
         build_capacity = n + (n >> 2);
         points_capacity = build_capacity;
-        CUDA_CHECK(cudaMalloc(&d_sorted_points,  build_capacity * sizeof(float4)));
+        CUDA_CHECK(cudaMalloc(&d_sorted_points,   build_capacity * sizeof(float4)));
+        CUDA_CHECK(cudaMalloc(&d_sorted_cell_ids, build_capacity * sizeof(int3)));
         CUDA_CHECK(cudaMalloc(&d_buckets,        build_capacity * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&d_sorted_buckets, build_capacity * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_cell_ids,       build_capacity * sizeof(int3)));
         CUDA_CHECK(cudaMalloc(&d_input_indices,  build_capacity * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_sorted_indices, build_capacity * sizeof(int)));
         // Force re-query of CUB temp sizes (they depend on n).
@@ -383,9 +400,11 @@ struct CudaMap::Impl {
         staged_queries.free_all();
         staged_out_nbr.free_all();
         staged_out_dst.free_all();
-        if (d_sorted_points)  cudaFree(d_sorted_points);
+        if (d_sorted_points)   cudaFree(d_sorted_points);
+        if (d_sorted_cell_ids) cudaFree(d_sorted_cell_ids);
         if (d_buckets)        cudaFree(d_buckets);
         if (d_sorted_buckets) cudaFree(d_sorted_buckets);
+        if (d_cell_ids)       cudaFree(d_cell_ids);
         if (d_input_indices)  cudaFree(d_input_indices);
         if (d_sorted_indices) cudaFree(d_sorted_indices);
         if (d_bucket_starts)  cudaFree(d_bucket_starts);
@@ -393,6 +412,7 @@ struct CudaMap::Impl {
         if (d_cub_sort)       cudaFree(d_cub_sort);
         if (d_cub_hist)       cudaFree(d_cub_hist);
         if (d_cub_scan)       cudaFree(d_cub_scan);
+        if (stream)           cudaStreamDestroy(stream);
     }
 };
 
@@ -432,12 +452,13 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
         }
     }
 
-    // Phase 1: compute each point's bucket.
+    // Phase 1: compute each point's bucket + cell ID (stored alongside
+    // points so the search kernel can skip 3 floorf() per candidate).
     {
         RESPLE_PROF_PHASE_GPU("update.compute_buckets_kernel");
         const int blocks = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
         compute_buckets_kernel<<<blocks, kThreadsPerBlock>>>(
-            d_input, n, impl_->d_buckets);
+            d_input, n, impl_->d_buckets, impl_->d_cell_ids);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -472,13 +493,14 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
             n);
     }
 
-    // Phase 3: gather points by sorted index → d_sorted_points.
+    // Phase 3: gather points + cell IDs by sorted index (one kernel,
+    // shared index load).
     {
         RESPLE_PROF_PHASE_GPU("update.gather_points_kernel");
         const int blocks = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
         gather_points_kernel<<<blocks, kThreadsPerBlock>>>(
-            d_input, impl_->d_sorted_indices, n,
-            impl_->d_sorted_points);
+            d_input, impl_->d_cell_ids, impl_->d_sorted_indices, n,
+            impl_->d_sorted_points, impl_->d_sorted_cell_ids);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -586,7 +608,8 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
         RESPLE_PROF_PHASE_GPU("search.search_kernel");
         const int blocks = (n_queries + kThreadsPerBlock - 1) / kThreadsPerBlock;
         search_kernel<<<blocks, kThreadsPerBlock>>>(
-            impl_->d_sorted_points, impl_->d_bucket_starts, impl_->n_points,
+            impl_->d_sorted_points, impl_->d_sorted_cell_ids,
+            impl_->d_bucket_starts, impl_->n_points,
             d_queries, n_queries,
             d_out_nbr, d_out_dst, k);
         CUDA_CHECK(cudaGetLastError());
