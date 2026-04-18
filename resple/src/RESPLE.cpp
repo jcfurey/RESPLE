@@ -1562,8 +1562,24 @@ private:
             CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose);
         pub_pose->publish(pose_msg);
 
-        geometry_msgs::msg::PoseWithCovarianceStamped pose_cov_msg =
-            CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose, cov_pose);
+        // Pull the IEKF posterior covariance from the active estimator and
+        // project it through the spline Jacobian so downstream consumers
+        // (robot_localization, sierra) actually see per-step uncertainty
+        // rather than the static cov_pose YAML diagonal.
+        const Eigen::Matrix<double, 6, 6> P_pose =
+            if_lidar_only ? estimator_lo.getLastPoseCovariance()
+                          : estimator_lio.getLastPoseCovariance();
+        const Eigen::Matrix<double, 6, 6> P_twist =
+            if_lidar_only ? estimator_lo.getLastTwistCovariance()
+                          : estimator_lio.getLastTwistCovariance();
+
+        geometry_msgs::msg::PoseWithCovarianceStamped pose_cov_msg;
+        pose_cov_msg.header.frame_id = odom_id;
+        pose_cov_msg.header.stamp = rclcpp::Time(pose_time_ns);
+        pose_cov_msg.pose.pose = pose_msg.pose;
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c)
+                pose_cov_msg.pose.covariance[r * 6 + c] = P_pose(r, c);
         pub_pose_cov->publish(pose_cov_msg);
 
         // Odometry (pose + twist) for EKF fusion — twist from spline derivative
@@ -1588,12 +1604,9 @@ private:
         odom_msg.twist.twist.angular.y = w_body.y();
         odom_msg.twist.twist.angular.z = w_body.z();
 
-        odom_msg.twist.covariance[0]  = cov_pose[0] * 4.0;
-        odom_msg.twist.covariance[7]  = cov_pose[1] * 4.0;
-        odom_msg.twist.covariance[14] = cov_pose[2] * 4.0;
-        odom_msg.twist.covariance[21] = cov_pose[3] * 4.0;
-        odom_msg.twist.covariance[28] = cov_pose[4] * 4.0;
-        odom_msg.twist.covariance[35] = cov_pose[5] * 4.0;
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c)
+                odom_msg.twist.covariance[r * 6 + c] = P_twist(r, c);
 
         pub_odom->publish(odom_msg);
 

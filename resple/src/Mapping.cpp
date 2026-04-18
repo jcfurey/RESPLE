@@ -42,6 +42,7 @@
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.hpp>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.hpp>
 
@@ -699,7 +700,8 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         pub_odom = this->create_publisher<nav_msgs::msg::Odometry>("odometry",
             rclcpp::QoS(500).reliable());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
-        
+        static_br_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
+
         RCLCPP_INFO(this->get_logger(), "Mapping configured successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
@@ -888,6 +890,8 @@ private:
     Eigen::Vector<double, 6> cov_twist;
     bool publish_tf, invert_tf;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
+    std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_br_;
+    std::atomic<bool> static_map_odom_sent_{false};
     std::atomic<bool> if_init_succeed{false};
     int64_t path_t_ns_ = 0;
     std::mutex m_spline;
@@ -1102,6 +1106,24 @@ private:
         RCLCPP_INFO(this->get_logger(),
             "[Mapping] startCallBack: if_init_succeed=true (bag_start_time=%ld)",
             bag_start_time);
+
+        // Latch an identity map→odom so the REP-105 chain is never broken
+        // during the cold-start window before pubOdom() gets its first
+        // valid odom→base_link lookup. tf_static is transient_local, so
+        // late-joining listeners still receive it.
+        if (publish_tf && static_br_ && !static_map_odom_sent_.exchange(true)) {
+            geometry_msgs::msg::TransformStamped identity;
+            identity.header.stamp = this->get_clock()->now();
+            if (invert_tf) {
+                identity.header.frame_id = odom_id;
+                identity.child_frame_id  = map_id;
+            } else {
+                identity.header.frame_id = map_id;
+                identity.child_frame_id  = odom_id;
+            }
+            identity.transform.rotation.w = 1.0;
+            static_br_->sendTransform(identity);
+        }
     }
 
     void publishPath() {
