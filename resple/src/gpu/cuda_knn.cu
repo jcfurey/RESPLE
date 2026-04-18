@@ -108,44 +108,24 @@ __global__ void gather_points_kernel(const float4* __restrict__ src_points,
     dst_points[i] = src_points[sorted_indices[i]];
 }
 
-// Initialize bucket_starts to n_points (sentinel = "no points >= this bucket").
-// Backward-scan with min(bucket_starts[b], bucket_starts[b+1]) will produce
-// the correct monotone bucket_starts where:
-//   bucket_starts[b] = first sorted index whose bucket >= b
-// Empty buckets b will have bucket_starts[b] == bucket_starts[b+1] (zero range).
-__global__ void init_bucket_starts_kernel(int* __restrict__ bucket_starts,
-                                          int n_points)
+// Fill d_out[i] = i for i in [0, n). Replaces the host-side std::vector<int>
+// of 0..n-1 that we used to copy to the device each frame — saves one
+// n*4-byte alloc + H2D copy on a 1M-point map (~4 MB/frame on Nano).
+__global__ void iota_kernel(int* __restrict__ d_out, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i > kNumBuckets) return;
-    bucket_starts[i] = n_points;
+    if (i >= n) return;
+    d_out[i] = i;
 }
 
-// Phase 3a: scatter the min sorted index into each populated bucket using
-// atomicMin. This gives the correct value for buckets with points; empty
-// buckets retain n_points. O(n_points) work, no per-thread inner loop.
-__global__ void scatter_bucket_starts_kernel(const uint32_t* __restrict__ sorted_buckets,
-                                             int n_points,
-                                             int* __restrict__ bucket_starts)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_points) return;
-    const uint32_t b = sorted_buckets[i];
-    atomicMin(&bucket_starts[b], i);
-}
-
-// Phase 3b: backward suffix-min scan. Sequential on a single GPU thread
-// to avoid the read/write races of a doubling-stride parallel scan.
-// 256K iterations × ~1ns/iter ≈ 0.3ms — well within budget.
-__global__ void backward_suffix_min_kernel(int* __restrict__ bucket_starts,
-                                           int n_buckets)
+// Set bucket_starts[kNumBuckets] = n. Needed as the exclusive-scan output
+// only populates [0..kNumBuckets); the search kernel reads
+// bucket_starts[bucket + 1] so the final slot must be the global count.
+__global__ void set_bucket_sentinel_kernel(int* __restrict__ bucket_starts,
+                                           int n_points)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    for (int b = n_buckets - 1; b >= 0; --b) {
-        if (bucket_starts[b + 1] < bucket_starts[b]) {
-            bucket_starts[b] = bucket_starts[b + 1];
-        }
-    }
+    bucket_starts[kNumBuckets] = n_points;
 }
 
 // insert_topk variant that also tracks the neighbor's float4 coords.
@@ -264,7 +244,50 @@ __global__ void search_kernel(const float4* __restrict__ sorted_points,
 
 }  // namespace
 
+// Pinned/zero-copy host buffer. On integrated GPUs (Tegra/Jetson) the
+// device pointer aliases host memory — kernel accesses bypass the
+// pageable copy entirely. On discrete GPUs the host side stays pinned
+// for fast async H2D but the device pointer is a separate VRAM alloc.
+struct PinnedBuf {
+    void*  host = nullptr;
+    void*  dev  = nullptr;
+    size_t bytes = 0;
+    bool   mapped = false;   // host and dev alias the same DRAM
+
+    void free_all() {
+        // Silent free: called from both ensure() (reallocation) and ~Impl()
+        // (destruction). Matching the surrounding destructor style — on
+        // shutdown we'd rather let the program exit cleanly than abort.
+        if (host) cudaFreeHost(host);
+        if (!mapped && dev) cudaFree(dev);
+        host = nullptr; dev = nullptr; bytes = 0;
+    }
+    void ensure(size_t needed, bool integrated) {
+        if (needed <= bytes && mapped == integrated) return;
+        free_all();
+        bytes = needed + (needed >> 2);
+        mapped = integrated;
+        if (mapped) {
+            CUDA_CHECK(cudaHostAlloc(&host, bytes, cudaHostAllocMapped));
+            CUDA_CHECK(cudaHostGetDevicePointer(&dev, host, 0));
+        } else {
+            CUDA_CHECK(cudaHostAlloc(&host, bytes, cudaHostAllocDefault));
+            CUDA_CHECK(cudaMalloc(&dev, bytes));
+        }
+    }
+};
+
 struct CudaMap::Impl {
+    // True on Tegra/Jetson. On integrated SoCs GPU and CPU share physical
+    // DRAM, so mapped host pointers are the fastest path; explicit
+    // cudaMemcpy is pure overhead. Detected lazily on first use — we
+    // can't probe the device from a static initializer without forcing
+    // CUDA context creation before the user has had a chance to
+    // cudaSetDevice.
+    bool integrated = false;
+    bool integrated_detected = false;
+    cudaStream_t stream = 0;
+
     // GPU-resident sorted map (after hash-grid build).
     float4* d_sorted_points = nullptr;
     int n_points = 0;
@@ -272,29 +295,44 @@ struct CudaMap::Impl {
 
     // Hash-grid metadata.
     int* d_bucket_starts = nullptr;  // kNumBuckets + 1 entries
+    int* d_bucket_counts = nullptr;  // histogram scratch, kNumBuckets entries
 
     // Build scratch (kept around so we don't reallocate every update).
-    float4* d_input_points = nullptr;
+    PinnedBuf staged_points;   // pinned host float4[n]; .dev = d_input_points on discrete
     uint32_t* d_buckets = nullptr;
     uint32_t* d_sorted_buckets = nullptr;
     int* d_input_indices = nullptr;
     int* d_sorted_indices = nullptr;
     int build_capacity = 0;
 
-    void* d_cub_temp = nullptr;
-    size_t cub_temp_bytes = 0;
+    // CUB temp caches. Queried once per distinct operation & n; cached.
+    void* d_cub_sort = nullptr;       size_t cub_sort_bytes = 0;
+    void* d_cub_hist = nullptr;       size_t cub_hist_bytes = 0;
+    void* d_cub_scan = nullptr;       size_t cub_scan_bytes = 0;
+    int cub_query_n = 0;   // last n for which sort/hist sizes were queried
 
-    // Search scratch.
-    float4* d_queries = nullptr;
+    // Search staging.
+    PinnedBuf staged_queries;  // pinned host float4[n_queries]; .dev = d_queries on discrete
     int queries_capacity = 0;
 
-    float4* d_out_neighbors = nullptr;
-    float* d_out_dist_sq = nullptr;
+    PinnedBuf staged_out_nbr;  // pinned host float4[n_queries * k]; .dev = d_out_neighbors on discrete
+    PinnedBuf staged_out_dst;  // pinned host float  [n_queries * k]; .dev = d_out_dist_sq  on discrete
     int out_capacity = 0;
 
+    void maybe_detect_integrated() {
+        if (integrated_detected) return;
+        int dev_id = 0;
+        CUDA_CHECK(cudaGetDevice(&dev_id));
+        int is_integrated = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&is_integrated,
+                                          cudaDevAttrIntegrated, dev_id));
+        integrated = (is_integrated != 0);
+        integrated_detected = true;
+    }
+
     void ensure_build_capacity(int n) {
+        staged_points.ensure(n * sizeof(float4), integrated);
         if (n <= build_capacity) return;
-        if (d_input_points)  CUDA_CHECK(cudaFree(d_input_points));
         if (d_sorted_points) CUDA_CHECK(cudaFree(d_sorted_points));
         if (d_buckets)        CUDA_CHECK(cudaFree(d_buckets));
         if (d_sorted_buckets) CUDA_CHECK(cudaFree(d_sorted_buckets));
@@ -302,54 +340,59 @@ struct CudaMap::Impl {
         if (d_sorted_indices) CUDA_CHECK(cudaFree(d_sorted_indices));
         build_capacity = n + (n >> 2);
         points_capacity = build_capacity;
-        CUDA_CHECK(cudaMalloc(&d_input_points,   build_capacity * sizeof(float4)));
         CUDA_CHECK(cudaMalloc(&d_sorted_points,  build_capacity * sizeof(float4)));
         CUDA_CHECK(cudaMalloc(&d_buckets,        build_capacity * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&d_sorted_buckets, build_capacity * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&d_input_indices,  build_capacity * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_sorted_indices, build_capacity * sizeof(int)));
+        // Force re-query of CUB temp sizes (they depend on n).
+        cub_query_n = 0;
     }
 
     void ensure_bucket_storage() {
-        if (d_bucket_starts) return;
-        CUDA_CHECK(cudaMalloc(&d_bucket_starts, (kNumBuckets + 1) * sizeof(int)));
+        if (!d_bucket_starts) {
+            CUDA_CHECK(cudaMalloc(&d_bucket_starts, (kNumBuckets + 1) * sizeof(int)));
+        }
+        if (!d_bucket_counts) {
+            CUDA_CHECK(cudaMalloc(&d_bucket_counts, kNumBuckets * sizeof(int)));
+        }
     }
 
     void ensure_queries_capacity(int n) {
-        if (n <= queries_capacity) return;
-        if (d_queries) CUDA_CHECK(cudaFree(d_queries));
-        queries_capacity = n + (n >> 2);
-        CUDA_CHECK(cudaMalloc(&d_queries, queries_capacity * sizeof(float4)));
+        staged_queries.ensure(n * sizeof(float4), integrated);
+        queries_capacity = std::max(queries_capacity,
+                                    static_cast<int>(staged_queries.bytes / sizeof(float4)));
     }
 
     void ensure_out_capacity(int n) {
-        if (n <= out_capacity) return;
-        if (d_out_neighbors) CUDA_CHECK(cudaFree(d_out_neighbors));
-        if (d_out_dist_sq) CUDA_CHECK(cudaFree(d_out_dist_sq));
-        out_capacity = n + (n >> 2);
-        CUDA_CHECK(cudaMalloc(&d_out_neighbors, out_capacity * sizeof(float4)));
-        CUDA_CHECK(cudaMalloc(&d_out_dist_sq, out_capacity * sizeof(float)));
+        staged_out_nbr.ensure(n * sizeof(float4), integrated);
+        staged_out_dst.ensure(n * sizeof(float),  integrated);
+        out_capacity = std::max(out_capacity,
+                                static_cast<int>(staged_out_nbr.bytes / sizeof(float4)));
     }
 
-    void ensure_cub_temp(size_t bytes) {
-        if (bytes <= cub_temp_bytes) return;
-        if (d_cub_temp) CUDA_CHECK(cudaFree(d_cub_temp));
-        cub_temp_bytes = bytes + (bytes >> 2);
-        CUDA_CHECK(cudaMalloc(&d_cub_temp, cub_temp_bytes));
+    void ensure_cub_temp(void*& ptr, size_t& cur_bytes, size_t needed) {
+        if (needed <= cur_bytes) return;
+        if (ptr) CUDA_CHECK(cudaFree(ptr));
+        cur_bytes = needed + (needed >> 2);
+        CUDA_CHECK(cudaMalloc(&ptr, cur_bytes));
     }
 
     ~Impl() {
-        if (d_input_points)   cudaFree(d_input_points);
+        staged_points.free_all();
+        staged_queries.free_all();
+        staged_out_nbr.free_all();
+        staged_out_dst.free_all();
         if (d_sorted_points)  cudaFree(d_sorted_points);
         if (d_buckets)        cudaFree(d_buckets);
         if (d_sorted_buckets) cudaFree(d_sorted_buckets);
         if (d_input_indices)  cudaFree(d_input_indices);
         if (d_sorted_indices) cudaFree(d_sorted_indices);
         if (d_bucket_starts)  cudaFree(d_bucket_starts);
-        if (d_cub_temp)       cudaFree(d_cub_temp);
-        if (d_queries)        cudaFree(d_queries);
-        if (d_out_neighbors)  cudaFree(d_out_neighbors);
-        if (d_out_dist_sq)    cudaFree(d_out_dist_sq);
+        if (d_bucket_counts)  cudaFree(d_bucket_counts);
+        if (d_cub_sort)       cudaFree(d_cub_sort);
+        if (d_cub_hist)       cudaFree(d_cub_hist);
+        if (d_cub_scan)       cudaFree(d_cub_scan);
     }
 };
 
@@ -364,20 +407,29 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
         return;
     }
 
+    impl_->maybe_detect_integrated();
     impl_->ensure_build_capacity(n);
     impl_->ensure_bucket_storage();
 
-    // Stage points → float4 on host, then upload to d_input_points.
+    // Stage points → float4 in pinned host memory. On integrated GPUs the
+    // device pointer aliases this host buffer (zero-copy — the kernel
+    // reads through the same physical DRAM). On discrete GPUs we still
+    // need an H2D copy, but starting from pinned memory is substantially
+    // faster than pageable.
+    float4* const h_input = static_cast<float4*>(impl_->staged_points.host);
+    float4* const d_input = static_cast<float4*>(impl_->staged_points.dev);
     {
         RESPLE_PROF_PHASE_CPU("update.stage_points_host");
-        std::vector<float4> staged(n);
         for (int i = 0; i < n; ++i) {
             const auto& p = points[i];
-            staged[i] = {p.x, p.y, p.z, p.intensity};
+            h_input[i] = {p.x, p.y, p.z, p.intensity};
         }
-        RESPLE_PROF_PHASE_GPU("update.h2d_points");
-        CUDA_CHECK(cudaMemcpy(impl_->d_input_points, staged.data(),
-                              n * sizeof(float4), cudaMemcpyHostToDevice));
+        if (!impl_->integrated) {
+            RESPLE_PROF_PHASE_GPU("update.h2d_points");
+            CUDA_CHECK(cudaMemcpy(d_input, h_input,
+                                  n * sizeof(float4),
+                                  cudaMemcpyHostToDevice));
+        }
     }
 
     // Phase 1: compute each point's bucket.
@@ -385,35 +437,36 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
         RESPLE_PROF_PHASE_GPU("update.compute_buckets_kernel");
         const int blocks = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
         compute_buckets_kernel<<<blocks, kThreadsPerBlock>>>(
-            impl_->d_input_points, n, impl_->d_buckets);
+            d_input, n, impl_->d_buckets);
+        CUDA_CHECK(cudaGetLastError());
     }
 
-    // Initialize indices [0, 1, ..., n-1] on the device. CUB needs both
-    // arrays present, and we'll sort the indices to match the sorted
-    // bucket order.
+    // Seed indices [0, 1, ..., n-1] on-device. Previously this was a
+    // host-side std::vector allocated + filled + copied; a 1-line
+    // kernel does the same work without any host allocation or copy.
     {
-        RESPLE_PROF_PHASE_CPU("update.stage_indices_host");
-        // Could use cub::DeviceFor or a tiny kernel; a small kernel is
-        // simpler (and we don't pay for a fresh cub include).
-        std::vector<int> h_idx(n);
-        for (int i = 0; i < n; ++i) h_idx[i] = i;
-        RESPLE_PROF_PHASE_GPU("update.h2d_indices");
-        CUDA_CHECK(cudaMemcpy(impl_->d_input_indices, h_idx.data(),
-                              n * sizeof(int), cudaMemcpyHostToDevice));
+        RESPLE_PROF_PHASE_GPU("update.iota_kernel");
+        const int blocks = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
+        iota_kernel<<<blocks, kThreadsPerBlock>>>(impl_->d_input_indices, n);
+        CUDA_CHECK(cudaGetLastError());
     }
 
-    // Phase 2: sort (bucket, index) pairs by bucket.
+    // Phase 2: sort (bucket, index) pairs by bucket. Cache the CUB temp
+    // size across calls (requery only when n changes) — previously we
+    // re-queried every frame, which isn't free.
     {
         RESPLE_PROF_PHASE_GPU("update.sort_pairs");
-        size_t needed = 0;
+        if (n != impl_->cub_query_n) {
+            size_t needed = 0;
+            cub::DeviceRadixSort::SortPairs(
+                nullptr, needed,
+                impl_->d_buckets, impl_->d_sorted_buckets,
+                impl_->d_input_indices, impl_->d_sorted_indices,
+                n);
+            impl_->ensure_cub_temp(impl_->d_cub_sort, impl_->cub_sort_bytes, needed);
+        }
         cub::DeviceRadixSort::SortPairs(
-            nullptr, needed,
-            impl_->d_buckets, impl_->d_sorted_buckets,
-            impl_->d_input_indices, impl_->d_sorted_indices,
-            n);
-        impl_->ensure_cub_temp(needed);
-        cub::DeviceRadixSort::SortPairs(
-            impl_->d_cub_temp, impl_->cub_temp_bytes,
+            impl_->d_cub_sort, impl_->cub_sort_bytes,
             impl_->d_buckets, impl_->d_sorted_buckets,
             impl_->d_input_indices, impl_->d_sorted_indices,
             n);
@@ -424,29 +477,60 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
         RESPLE_PROF_PHASE_GPU("update.gather_points_kernel");
         const int blocks = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
         gather_points_kernel<<<blocks, kThreadsPerBlock>>>(
-            impl_->d_input_points, impl_->d_sorted_indices, n,
+            d_input, impl_->d_sorted_indices, n,
             impl_->d_sorted_points);
+        CUDA_CHECK(cudaGetLastError());
     }
 
-    // Phase 4: build per-bucket start offsets via atomic-scatter +
-    // parallel backward min-scan. After this:
+    // Phase 4: build per-bucket start offsets as
     //   bucket_starts[b] = first sorted index whose bucket >= b
-    // and bucket_starts is monotone non-decreasing in b.
+    //
+    // sorted_buckets is already sorted ascending, so:
+    //   counts[b]        = #points in bucket b  (histogram)
+    //   bucket_starts[b] = Σ_{b'<b} counts[b']  (exclusive scan of counts)
+    //
+    // This replaces a 3-kernel init+scatter+single-thread-suffix-min
+    // pipeline whose last phase was a <<<1,1>>> 256K-iteration loop —
+    // the dominant cost on sm_53 (~2-5 ms per update on Nano).
     {
         RESPLE_PROF_PHASE_GPU("update.bucket_starts");
-        const int init_blocks = (kNumBuckets + 1 + kThreadsPerBlock - 1) / kThreadsPerBlock;
-        init_bucket_starts_kernel<<<init_blocks, kThreadsPerBlock>>>(
-            impl_->d_bucket_starts, n);
+        if (n != impl_->cub_query_n) {
+            size_t h_needed = 0;
+            cub::DeviceHistogram::HistogramEven(
+                nullptr, h_needed,
+                impl_->d_sorted_buckets, impl_->d_bucket_counts,
+                /*num_levels=*/ kNumBuckets + 1,
+                /*lower_level=*/ 0u,
+                /*upper_level=*/ static_cast<uint32_t>(kNumBuckets),
+                n);
+            impl_->ensure_cub_temp(impl_->d_cub_hist, impl_->cub_hist_bytes, h_needed);
 
-        const int scatter_blocks = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
-        scatter_bucket_starts_kernel<<<scatter_blocks, kThreadsPerBlock>>>(
-            impl_->d_sorted_buckets, n, impl_->d_bucket_starts);
+            size_t s_needed = 0;
+            cub::DeviceScan::ExclusiveSum(
+                nullptr, s_needed,
+                impl_->d_bucket_counts,
+                impl_->d_bucket_starts,
+                kNumBuckets);
+            impl_->ensure_cub_temp(impl_->d_cub_scan, impl_->cub_scan_bytes, s_needed);
+        }
 
-        // Backward suffix-min scan (sequential single-thread; ~0.3ms).
-        backward_suffix_min_kernel<<<1, 1>>>(
-            impl_->d_bucket_starts, kNumBuckets);
+        cub::DeviceHistogram::HistogramEven(
+            impl_->d_cub_hist, impl_->cub_hist_bytes,
+            impl_->d_sorted_buckets, impl_->d_bucket_counts,
+            kNumBuckets + 1, 0u,
+            static_cast<uint32_t>(kNumBuckets), n);
+
+        cub::DeviceScan::ExclusiveSum(
+            impl_->d_cub_scan, impl_->cub_scan_bytes,
+            impl_->d_bucket_counts,
+            impl_->d_bucket_starts,
+            kNumBuckets);
+
+        set_bucket_sentinel_kernel<<<1, 1>>>(impl_->d_bucket_starts, n);
+        CUDA_CHECK(cudaGetLastError());
     }
 
+    impl_->cub_query_n = n;
     // No DtoH copy / host mirror — search kernel returns neighbor coords
     // directly, so the host doesn't need a copy of the sorted map.
 }
@@ -473,20 +557,29 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
             "CudaMap::batch_search: k out of range [1, kMaxK]");
     }
 
+    impl_->maybe_detect_integrated();
     impl_->ensure_queries_capacity(n_queries);
     impl_->ensure_out_capacity(n_queries * k);
 
+    float4* const h_queries = static_cast<float4*>(impl_->staged_queries.host);
+    float4* const d_queries = static_cast<float4*>(impl_->staged_queries.dev);
+    float4* const h_out_nbr = static_cast<float4*>(impl_->staged_out_nbr.host);
+    float4* const d_out_nbr = static_cast<float4*>(impl_->staged_out_nbr.dev);
+    float*  const h_out_dst = static_cast<float*> (impl_->staged_out_dst.host);
+    float*  const d_out_dst = static_cast<float*> (impl_->staged_out_dst.dev);
+
     {
         RESPLE_PROF_PHASE_CPU("search.stage_queries_host");
-        std::vector<float4> staged_q(n_queries);
         for (int i = 0; i < n_queries; ++i) {
             const auto& p = queries[i];
-            staged_q[i] = {p.x, p.y, p.z, 0.0f};
+            h_queries[i] = {p.x, p.y, p.z, 0.0f};
         }
-        RESPLE_PROF_PHASE_GPU("search.h2d_queries");
-        CUDA_CHECK(cudaMemcpy(impl_->d_queries, staged_q.data(),
-                              n_queries * sizeof(float4),
-                              cudaMemcpyHostToDevice));
+        if (!impl_->integrated) {
+            RESPLE_PROF_PHASE_GPU("search.h2d_queries");
+            CUDA_CHECK(cudaMemcpy(d_queries, h_queries,
+                                  n_queries * sizeof(float4),
+                                  cudaMemcpyHostToDevice));
+        }
     }
 
     {
@@ -494,37 +587,41 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
         const int blocks = (n_queries + kThreadsPerBlock - 1) / kThreadsPerBlock;
         search_kernel<<<blocks, kThreadsPerBlock>>>(
             impl_->d_sorted_points, impl_->d_bucket_starts, impl_->n_points,
-            impl_->d_queries, n_queries,
-            impl_->d_out_neighbors, impl_->d_out_dist_sq, k);
+            d_queries, n_queries,
+            d_out_nbr, d_out_dst, k);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // Stage neighbor coords back as float4, then unpack into PCL points
-    // on the CPU. (Could DtoH directly into a PCL buffer if we cast,
-    // but PCL's struct layout has padding so a separate stage is safer.)
-    std::vector<float4> staged_n(n_queries * k);
-    {
+    // Bring neighbor coords + distances back to host. On integrated we
+    // just need a sync point (mapped buffer already contains the kernel
+    // output); on discrete we async-copy back via pinned buffers.
+    if (impl_->integrated) {
+        RESPLE_PROF_PHASE_GPU("search.sync_mapped");
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } else {
         RESPLE_PROF_PHASE_GPU("search.d2h_neighbors");
-        CUDA_CHECK(cudaMemcpy(staged_n.data(), impl_->d_out_neighbors,
+        CUDA_CHECK(cudaMemcpy(h_out_nbr, d_out_nbr,
                               n_queries * k * sizeof(float4),
                               cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(dist_sq.data(), impl_->d_out_dist_sq,
+        CUDA_CHECK(cudaMemcpy(h_out_dst, d_out_dst,
                               n_queries * k * sizeof(float),
                               cudaMemcpyDeviceToHost));
     }
 
     {
         RESPLE_PROF_PHASE_CPU("search.unpack_neighbors_host");
-        for (int i = 0; i < n_queries * k; ++i) {
+        const int total = n_queries * k;
+        for (int i = 0; i < total; ++i) {
             auto& dst = neighbors[i];
-            dst.x = staged_n[i].x;
-            dst.y = staged_n[i].y;
-            dst.z = staged_n[i].z;
-            dst.intensity = staged_n[i].w;
+            dst.x = h_out_nbr[i].x;
+            dst.y = h_out_nbr[i].y;
+            dst.z = h_out_nbr[i].z;
+            dst.intensity = h_out_nbr[i].w;
             dst.normal_x = 0;
             dst.normal_y = 0;
             dst.normal_z = 0;
             dst.curvature = 0;
+            dist_sq[i] = h_out_dst[i];
         }
     }
 
