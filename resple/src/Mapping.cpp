@@ -94,27 +94,45 @@ class MappingBase
 
     void processScan(SplineState* spl, const int64_t spl_window_st_ns)
     {
-        // RCLCPP_INFO(node_handle_->get_logger(), "processScan");
-        int64_t t_end_ns = 0;
+        (void)spl_window_st_ns;
         rclcpp::Rate rate(20);
-        while (!pc_L_buff.empty()) {
-            t_end_ns = pc_L_buff.front().header.stamp + int64_t (pc_L_buff.front().points.back().intensity * float(1e6));
+        while (true) {
+            // Pull the next cloud out of the buffer entirely under the lock.
+            // The previous code read pc_L_buff.front() before taking mtx,
+            // which raced the callback's buffer-cap pop_front: front()
+            // returns a reference that pop_front invalidates → UAF read of
+            // the cloud header.
+            pcl::PointCloud<PointType> front_cloud;
             {
                 std::unique_lock<std::mutex> lock(mtx);
+                if (pc_L_buff.empty()) break;
+                const auto& front = pc_L_buff.front();
+                // points.back() on an empty cloud is UB; guard and drop.
+                if (front.points.empty()) {
+                    pc_L_buff.pop_front();
+                    continue;
+                }
+                const int64_t t_end_ns = front.header.stamp +
+                    int64_t(front.points.back().intensity * float(1e6));
                 if (t_end_ns < spl->minTimeNs()) {
                     pc_L_buff.pop_front();
                     continue;
-                } else if (t_end_ns <= spl->maxTimeNs()) {
-                    transformCloud(pc_L_buff.front(), spl, pc);
-                    pc_L_buff.pop_front();
-                    lock.unlock();
-                    publishMap(pc, pub_global_map);
-                } else {
+                }
+                if (t_end_ns > spl->maxTimeNs()) {
+                    // Front spans beyond the current spline window — retry
+                    // next tick once more knots are available.
                     lock.unlock();
                     rate.sleep();
                     break;
                 }
+                // Move the cloud out of the deque (deque move of
+                // pcl::PointCloud is a pointer swap) so the transform +
+                // publish run without blocking the callback.
+                front_cloud = std::move(pc_L_buff.front());
+                pc_L_buff.pop_front();
             }
+            transformCloud(front_cloud, spl, pc);
+            publishMap(pc, pub_global_map);
         }
     }
 

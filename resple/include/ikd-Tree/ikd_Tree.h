@@ -335,6 +335,18 @@ public:
     void Delete_Points(PointVector &PointToDel);
     int Delete_Point_Boxes(vector<BoxPointType> &BoxPoints);
     void flatten(KD_TREE_NODE *root, PointVector &Storage, delete_point_storage_set storage_type);
+    // Thread-safe flatten over Root_Node. Acquires search_rw_mutex_ (shared),
+    // which coordinates with multi_thread_rebuild's subtree-swap critical
+    // section at ikd_Tree.cpp:259 and ikd_Tree.cpp:293. Callers that run
+    // concurrently with the internal rebuild thread (the async map-update
+    // lambda, the SaveMap action) MUST use this instead of calling
+    // flatten(Root_Node, ...) directly — the raw flatten traverses
+    // left_son_ptr/right_son_ptr with no synchronization against the rebuild
+    // thread swapping a subtree, which races to UAF.
+    void flatten_safe(PointVector &Storage, delete_point_storage_set storage_type) {
+        std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+        flatten(Root_Node, Storage, storage_type);
+    }
     void acquire_removed_points(PointVector &removed_points);
     BoxPointType tree_range();
     PointVector PCL_Storage;

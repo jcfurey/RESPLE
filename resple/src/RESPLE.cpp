@@ -363,7 +363,13 @@ public:
                 }
                 continue;
             }
-            while (collectMeasurements()) {
+            while (true) {
+                bool have_meas;
+                {
+                    std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                    have_meas = collectMeasurements();
+                }
+                if (!have_meas) break;
                 if (pt_meas.empty() && imu_meas.empty()) { continue; }
                 // Track computation time
                 auto frame_start = std::chrono::high_resolution_clock::now();
@@ -376,6 +382,13 @@ public:
                     // shared lock blocks until any in-flight map mutator
                     // (async mapIncremental / lasermapFovSegment) is done.
                     std::shared_lock<std::shared_mutex> map_read_lock(mtx_map_);
+                    // Separate lock for SplineState mutations — serializes the
+                    // IEKF's propRCP / updateIEKF writes against publishFrameWorld
+                    // reads in the async thread. Taken INSIDE the map read lock
+                    // so the lock ordering (mtx_map_ before spline_mutex_) is
+                    // consistent with the async path (no spline_mutex_ under
+                    // mtx_map_ unique) — no cross-lock cycle possible.
+                    std::lock_guard<std::mutex> spline_lock(spline_mutex_);
 #ifdef RESPLE_USE_CUDA
                     // Use GPU path only once the map has actually been seeded
                     // (mapIncremental initializes the kd-tree first; until
@@ -414,10 +427,15 @@ public:
                         total_iekf_iterations_ += estimator_lio.n_iter;
                     }
                 }
-                #pragma omp parallel for num_threads(num_threads_)
-                for (size_t i = 0; i < pt_meas.size(); i++) {
-                    PointData& pt_data = pt_meas[i];
-                    Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
+                {
+                    // pointBodyToWorld reads spline; keep serialized with
+                    // publishFrameWorld / IEKF writes via spline_mutex_.
+                    std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                    #pragma omp parallel for num_threads(num_threads_)
+                    for (size_t i = 0; i < pt_meas.size(); i++) {
+                        PointData& pt_data = pt_meas[i];
+                        Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
+                    }
                 }
                 for (size_t i = 0; i < pt_meas.size(); i++) {
                     PointData& pt_data = pt_meas[i];
@@ -427,15 +445,16 @@ public:
                 pt_meas.clear();
                 if (spline->numKnots() > max_spl_knots) {
                     estimate_msgs::msg::Spline spline_msg;
-                    spline->getSplineMsg(spline_msg, std::max(int(max_spl_knots-1),0));
+                    {
+                        std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                        spline->getSplineMsg(spline_msg, std::max(int(max_spl_knots-1),0));
+                        max_spl_knots = spline->numKnots();
+                    }
                     estimate_msgs::msg::Estimate est_msg;
                     est_msg.spline = spline_msg;
-                    est_msg.if_full_window.data = (spline->numKnots() >= 4);
+                    est_msg.if_full_window.data = (max_spl_knots >= 4);
                     est_msg.runtime.data = 0;
-                    pub_est->publish(est_msg);  
-                    max_spl_knots = spline->numKnots();       
-
-                   
+                    pub_est->publish(est_msg);
                 }
                 if (max_time_ns >= t_last_map_upd + 1e8) {
                     // Wait for any prior async map update before swapping buffers.
@@ -445,29 +464,29 @@ public:
                     accum_nearest_points_bg_.swap(accum_nearest_points);
                     pc_world.clear();
                     accum_nearest_points.clear();
-                    // Run map mutation + publish + FOV pruning on a background thread.
-                    // mapIncremental and lasermapFovSegment internally take
-                    // unique_lock(mtx_map_); the next IEKF's shared_lock blocks
-                    // until each releases. publishFrameWorld doesn't touch the tree.
+                    // Async map mutation + pose publish. Two separate mutexes:
+                    //   mtx_map_ (unique) — serializes kd-tree mutations against
+                    //     IEKF's shared_lock readers. Does NOT cover the pose publish.
+                    //   spline_mutex_ — serializes spline reads in publishFrameWorld
+                    //     against worker's propRCP / updateIEKF writes. Taken
+                    //     outside mtx_map_ so a slow ROS publish can't block
+                    //     the worker's next IEKF cycle.
                     map_update_future_ = std::async(std::launch::async, [this]() {
-                        // All map mutations + GPU sync under a single unique_lock
-                        // so the IEKF (shared_lock) never observes a state where
-                        // the GPU map is out-of-sync with the kd-tree. Releasing
-                        // the lock between mapIncremental, lasermapFovSegment,
-                        // and the GPU upload would let IEKF read a stale GPU map
-                        // (e.g., still containing FOV-pruned points) → bad
-                        // neighbors → trajectory drift.
                         {
                             std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
                             mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
                             lasermapFovSegment();
 #ifdef RESPLE_USE_CUDA
                             ikdtree.PCL_Storage.clear();
-                            ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                            ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
                             g_cuda_map.update(ikdtree.PCL_Storage.data(), ikdtree.PCL_Storage.size());
 #endif
                         }
-                        publishFrameWorld(pc_world_bg_);  // no map access; outside lock
+                        // publishFrameWorld only touches the spline; guard it
+                        // with spline_mutex_ rather than the (released) map
+                        // lock so IEKF can proceed in parallel with the publish.
+                        std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                        publishFrameWorld(pc_world_bg_);
                     });
                     t_last_map_upd = max_time_ns;
                 }
@@ -585,6 +604,17 @@ private:
     // This lets multiple parallel Nearest_Search threads run concurrently but
     // serializes them against the async map update and SaveMap action.
     std::shared_mutex mtx_map_;
+    // Serializes SplineState mutations (IEKF propRCP / updateIEKF /
+    // collectMeasurements propRCP / pointBodyToWorld read) against reads
+    // in publishFrameWorld (async thread). mtx_map_ only covers the
+    // kd-tree; the spline is logically separate, so it gets its own
+    // lock — this lets publishFrameWorld's ROS publishes run in parallel
+    // with the worker's next IEKF cycle (whereas putting the publish
+    // inside mtx_map_ unique blocks the filter if a subscriber lags).
+    //
+    // Lock ordering: when both are held, mtx_map_ is always acquired
+    // first, then spline_mutex_, to avoid deadlocks.
+    std::mutex spline_mutex_;
     std::future<void> map_update_future_;
     pcl::PointCloud<pcl::PointXYZINormal> pc_world_bg_;
     std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> accum_nearest_points_bg_;
@@ -659,7 +689,7 @@ private:
             pcl::PointCloud<pcl::PointXYZINormal>::Ptr map_cloud(new pcl::PointCloud<pcl::PointXYZINormal>());
             {
                 std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
                 map_cloud->points = ikdtree.PCL_Storage;
             }
             map_cloud->width = map_cloud->points.size();
@@ -938,31 +968,46 @@ private:
     
     void getImuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg)
     {
-        // In LO mode, drop IMU entirely once the filter is initialized.
-        // Cheap no-op flag check avoids destroying the live Subscription from
-        // the worker thread (which races the executor → SIGSEGV).
-        if (if_lidar_only && if_init_filter) {
+        // Snapshot both flags ONCE under m_buff so they can't flip mid-callback.
+        // Previously we double-checked if_init_filter — first unlocked, then
+        // under the lock — and in LO mode the worker could flip if_init_filter
+        // true between the two reads, sending this callback into the LIO
+        // transformImu + push_back path that LO was never meant to run.
+        //
+        // Under m_buff (which the worker also holds while clearing the buffers
+        // immediately before setting if_init_filter), the snapshot is coherent:
+        // either the worker hasn't flipped the flag yet (we treat as pre-init
+        // and buffer raw IMU), or it already flipped and released m_buff (we
+        // early-return in LO mode, or run the LIO transform path).
+        std::lock_guard<std::mutex> lock(m_buff);
+
+        const bool init_done = if_init_filter;
+
+        // LO mode: once initialized, drop IMU entirely. The subscription itself
+        // is torn down only in on_deactivate / on_cleanup (tearing it down from
+        // the worker raced the executor and crashed — bdab3dc fix).
+        if (if_lidar_only && init_done) {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(m_buff);
         if (imu_int_buff.size() >= 2000) {
             imu_int_buff.erase(imu_int_buff.begin());
         }
 
-        // Before filter init, accept raw IMU for gravity alignment.
-        // Gravity direction is frame-independent for roll/pitch — the
-        // accelerometer measures g regardless of the sensor's mounting frame.
-        if (!if_init_filter) {
+        // Pre-init: accept raw IMU for gravity alignment. Gravity direction is
+        // frame-independent for roll/pitch — the accelerometer measures g
+        // regardless of the sensor's mounting frame.
+        if (!init_done) {
             imu_int_buff.push_back(imu_msg);
             return;
         }
 
+        // LIO mode, post-init: apply the base_link extrinsic.
         if (updateImuTransform(imu_msg->header.frame_id)) {
             sensor_msgs::msg::Imu::SharedPtr transformed_imu = transformImu(imu_msg, imu_to_baselink_);
             imu_int_buff.push_back(transformed_imu);
         } else {
-            // Pass through raw if transform not yet available (assumes IMU already in base_link frame)
+            // Transform not yet available — pass through (assumes IMU already in base_link frame)
             imu_int_buff.push_back(imu_msg);
         }
     }
@@ -1527,22 +1572,34 @@ private:
                     n_imu, accel_variance, if_lidar_only ? "LO" : "LIO");
             }
 
-            // In LO mode, drop IMU after gravity init — not needed for IEKF.
+            // Initialize the filter BEFORE flipping if_init_filter — this way
+            // when the callback acquires m_buff and sees if_init_filter=true,
+            // the SplineState is already fully constructed.
+            initFilter(start_t_ns, Eigen::Vector3d(0, 0, 0), q_WI);
+
+            // Flip if_init_filter under m_buff so getImuCallback's snapshot
+            // observes a coherent pre→post transition. In LO mode we also
+            // clear the IMU buffers here — callbacks that already acquired
+            // m_buff and are waiting (or about to run) will observe the
+            // post-init state and either early-return (LO) or take the
+            // LIO transform path.
+            //
             // We do NOT call sub_imu.reset() here: tearing down a live
             // Subscription from this worker thread races the executor's
             // dispatcher (MultiThreadedExecutor on the sensor callback group)
             // and can use-after-free → SIGSEGV. Instead, getImuCallback
             // early-returns once (if_lidar_only && if_init_filter) is true,
             // and the subscription is destroyed in on_deactivate / on_cleanup.
-            if (if_lidar_only) {
+            {
                 std::lock_guard<std::mutex> lock(m_buff);
-                imu_int_buff.clear();
-                imu_buff.clear();
-                RCLCPP_INFO(this->get_logger(), "LO mode: IMU input disabled after gravity alignment");
+                if (if_lidar_only) {
+                    imu_int_buff.clear();
+                    imu_buff.clear();
+                    RCLCPP_INFO(this->get_logger(), "LO mode: IMU input disabled after gravity alignment");
+                }
+                if_init_filter = true;
             }
 
-            initFilter(start_t_ns, Eigen::Vector3d(0, 0, 0), q_WI);
-            if_init_filter = true;
             std_msgs::msg::Int64 start_time;
             start_time.data = start_t_ns;
             pub_start_time->publish(start_time);
@@ -1594,7 +1651,7 @@ private:
 #ifdef RESPLE_USE_CUDA
                 // Initial GPU map sync from the freshly-built kd-tree.
                 ikdtree.PCL_Storage.clear();
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
                 g_cuda_map.update(ikdtree.PCL_Storage.data(), ikdtree.PCL_Storage.size());
 #endif
             }
