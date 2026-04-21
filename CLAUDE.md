@@ -168,73 +168,40 @@ executable and the `Mapping` standalone executable. The component registration
 is `PLUGIN "RESPLE" EXECUTABLE RESPLE_node` — we launch the executable, not
 the composable node.
 
-## Known hazards and the hardening plan
+## Hardening status
 
-The following were identified in a dedicated audit. Treat these as the working
-list for threading/memory/accuracy work in this package. File:line citations
-reference the current HEAD.
+Full phased roadmap and rationale in **[`HARDENING.md`](HARDENING.md)** (same
+directory). Summary:
 
-### Concurrency
+| Phase | Title | Status |
+| --- | --- | --- |
+| 0 | Instrumentation + sanitizer builds | code complete (`74f9078`); bag replay pending |
+| 1 | Safety fixes | complete (`512da1d`) |
+| 2 | Concurrency hardening | pending Phase 0 data |
+| 3 | Spline / mapping accuracy | pending Phase 0 data |
+| 4 | Diagnostics publisher | after Phase 3 begins |
+| 5 | Regression tests | last |
 
-1. **ikd-Tree `Nearest_Search` lock contract is not explicitly documented.**
-   The IEKF takes `mtx_map_` (shared) and runs `#pragma omp parallel for` over
-   findCorresp, which calls `Nearest_Search` (`Association.h:58`,
-   `Estimator.h:408`). Shared-lock concurrent calls are only safe if the ikd-Tree
-   internally serializes its own tree-mutation vs. search operations. Needs
-   verification in `ikd_Tree.cpp` + a stress test before relying on it. **(Open.)**
-2. **Initialization state machine is a bool pair.** `if_init_filter` +
-   `if_init_map` + `localmap_initialized_` — the ordering rules are correct
-   today but easily broken by future refactors. Should become a single
-   `std::atomic<State>` enum. **(Open.)**
-3. ~~**`map_update_future_.valid()` is read without a lock** in `on_deactivate`
-   and `on_cleanup`.~~ **(Phase 1, 2026-04-21.)** Replaced with
-   `std::atomic<bool> map_update_pending_`, set before `std::async` and cleared
-   at the end of the lambda; `.wait()` is gated on the atomic.
+### Known hazards (compact view)
 
-### Memory and lifecycle
+The full audit identified 10 concrete issues. Quick reference:
 
-4. **Unbounded knot growth.** `SplineState::t_knots` / `q_knots` / `ort_delta`
-   grow indefinitely; there is no pruning. Phase 0 now publishes `Spline Knots`
-   in diagnostics so the growth rate can be measured before deciding on a
-   pruning strategy. **(Open — needs Phase 0 data.)**
-5. **Unbounded input buffers.** `pc_buff` and `imu_int_buff` have no max size.
-   Phase 0 publishes their sizes in diagnostics; if they trend up under load,
-   add bounded-size + drop-oldest + counters. **(Open — needs Phase 0 data.)**
-6. ~~**`assert()` in hot paths.**~~ **(Phase 1, 2026-04-21.)** All five asserts
-   in `SplineState.h` replaced with `RESPLE_LOG_INVARIANT_ONCE` + safe
-   fallbacks (early return or identity quaternion). The default RelWithDebInfo
-   build sets `-DNDEBUG`, so the old asserts were no-ops and the code after
-   them silently performed out-of-bounds accesses — that UB is now gated.
+| # | Hazard | Status | Phase |
+| --- | --- | --- | --- |
+| 1 | ikd-Tree `Nearest_Search` lock contract unverified | open | 2.1 |
+| 2 | Init state machine is a bool pair (fragile) | open | 2.2 |
+| 3 | `map_update_future_.valid()` racy read | **fixed** | 1 |
+| 4 | Unbounded knot growth | open, measuring | 3.1 |
+| 5 | Unbounded input buffers | open, measuring | 2.3 |
+| 6 | `assert()` in hot paths → silent UB under `-DNDEBUG` | **fixed** | 1 |
+| 7 | No divergence detection | partial (failure counter) | 0 → 3.3 |
+| 8 | Plane-fit outlier rejection incomplete | open | 3.2 |
+| 9 | Deskew out-of-window extrapolation | **fixed (detection)** | 1 |
+| 10 | `-ffast-math` on | **fixed** | 1 |
 
-### Accuracy
-
-7. **No divergence detection.** Covariance trace, λ_min, and NaN checks on
-   the posterior would catch filter collapse before the bad pose propagates
-   downstream. Phase 0 now counts `IEKF Numerical Failures` per window and
-   escalates diagnostics to WARN when they occur; full divergence detection
-   (cov trace / λ_min / NaN) is Phase 3. **(Partial — Phase 0.)**
-8. **Plane-fit rejection is incomplete.** `Association.h:59-68` uses only a
-   point-distance threshold (`pd2 < 5`) and hardcoded `esti_plane` threshold
-   `0.1f`. No eigenvalue-ratio test, no counters for dropped candidates. **(Open.)**
-9. **Deskew uses post-IEKF spline.** The spline is refined by the current
-   IEKF pass, then `pointBodyToWorld` queries the *refined* knots. Intentional
-   iterative refinement. Phase 1 added a bounds check + cumulative
-   `out_of_range_queries_` counter in `Association::pointBodyToWorld` so an
-   out-of-window query is visible in diagnostics instead of silently
-   extrapolating. **(Addressed; root cause of out-of-window queries still
-   pending investigation if they fire.)**
-10. ~~**`-ffast-math` is on.**~~ **(Phase 1, 2026-04-21.)** Dropped from both
-    `ENABLE_NATIVE_ARCH` and the plain `-O3` path; `-Wextra -Wshadow` added
-    to the library target.
-
-### Ordering for fixes
-
-Phase 0 (docs + instrumentation + sanitizer build options) committed in
-`74f9078`. Phase 1 (safety fixes — asserts, bounds checks, Eigen zero-init,
-map-future atomic, `-ffast-math` drop) follows. Later phases (concurrency
-hardening, divergence detection, knot pruning) require Phase 0 bag-replay
-data before implementation. Do not skip Phase 0; most remaining items are
-suspected, not confirmed triggered.
+"Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
+gated on observing the signal. Do not implement a fix in category 4 / 5 / 7
+without the Phase 0 bag data — see `HARDENING.md` for decision gates.
 
 ## Parameters you will hit often
 
