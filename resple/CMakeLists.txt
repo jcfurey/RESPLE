@@ -101,26 +101,40 @@ target_include_directories(${PROJECT_NAME}
 
 # Enforce C++17 and apply optimization flags to the library target
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
+# Warning set matches the workspace's colcon_defaults where practical. -Wshadow
+# catches the local/member name reuse that the audit flagged as the kind of
+# bug that would slip past code review. -Wextra is strictly more than -Wall.
+# Kept private so downstream consumers aren't forced into the same warnings.
 target_compile_options(${PROJECT_NAME} PRIVATE
 	-Wall
+	-Wextra
+	-Wshadow
 	$<$<CONFIG:Debug>:-DEIGEN_INITIALIZE_MATRICES_BY_NAN>
 )
 
-# Optimization / sanitizer flag selection. Sanitizers take precedence over the
-# default -O3 path: they need -O1 (so the stack is walkable) and must not run
-# under -ffast-math (which rewrites FP ops and breaks UBSan's FP checks).
+# Optimization / sanitizer flag selection.
+#
+# -ffast-math was previously enabled unconditionally. It was dropped because
+# this library runs a 24x24 / 30x30 Joseph-form Kalman update whose
+# PSD-preservation argument depends on IEEE-754 associativity semantics; with
+# -ffast-math the compiler is free to reassociate the (I-KH)P(I-KH)^T + KRK^T
+# expression and break that guarantee, and all NaN/Inf divergence checks
+# become no-ops. -O3 -march=native still applies.
+#
+# Sanitizers take precedence over the default -O3 path: they need -O1 (so the
+# stack is walkable in reports) and drop -march=native reliance.
 if(ENABLE_TSAN)
 	set(RESPLE_OPT_FLAGS -O1 -g -fno-omit-frame-pointer)
 	set(RESPLE_SAN_FLAGS -fsanitize=thread)
-	message(STATUS "resple: ThreadSanitizer enabled; optimizations reduced to -O1, -ffast-math dropped")
+	message(STATUS "resple: ThreadSanitizer enabled; optimizations reduced to -O1")
 elseif(ENABLE_ASAN)
 	set(RESPLE_OPT_FLAGS -O1 -g -fno-omit-frame-pointer)
 	set(RESPLE_SAN_FLAGS -fsanitize=address -fsanitize=undefined)
-	message(STATUS "resple: AddressSanitizer + UBSan enabled; optimizations reduced to -O1, -ffast-math dropped")
+	message(STATUS "resple: AddressSanitizer + UBSan enabled; optimizations reduced to -O1")
 elseif(ENABLE_NATIVE_ARCH)
-	set(RESPLE_OPT_FLAGS -O3 -march=native -ffast-math)
+	set(RESPLE_OPT_FLAGS -O3 -march=native)
 else()
-	set(RESPLE_OPT_FLAGS -O3 -ffast-math)
+	set(RESPLE_OPT_FLAGS -O3)
 endif()
 target_compile_options(${PROJECT_NAME} PRIVATE ${RESPLE_OPT_FLAGS})
 if(RESPLE_SAN_FLAGS)

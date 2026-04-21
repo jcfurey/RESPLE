@@ -322,16 +322,22 @@ class Estimator
 
   private:
     SplineState spl;
-    Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp;  
-    Eigen::Matrix<double, XSIZE, XSIZE> cov_sys; 
-    Eigen::Matrix<double, XSIZE, XSIZE> a_mat;   
+    // Zero-initialized explicitly: the default workspace build uses
+    // RelWithDebInfo which disables Eigen's optional NaN-init (Debug-only
+    // EIGEN_INITIALIZE_MATRICES_BY_NAN). Previously these matrices held
+    // whatever was on the heap until setState() / update() wrote them; any
+    // read before that first write would have been UB. setState() now runs
+    // on valid zeros.
+    Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp  = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
+    Eigen::Matrix<double, XSIZE, XSIZE> cov_sys  = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
+    Eigen::Matrix<double, XSIZE, XSIZE> a_mat    = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Vector3d bg = Eigen::Vector3d::Zero();
-    Eigen::Vector3d ba = Eigen::Vector3d::Zero();     
-    Eigen::Matrix<double, XSIZE, XSIZE> KH;
+    Eigen::Vector3d ba = Eigen::Vector3d::Zero();
+    Eigen::Matrix<double, XSIZE, XSIZE> KH       = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     // Joseph-form posterior covariance set by update() each iteration.
     // P_post = (I - KH) P_prior (I - KH)^T + K R K^T -- numerically PSD-preserving
     // in floating point, unlike the simpler (I - KH) P_prior form.
-    Eigen::Matrix<double, XSIZE, XSIZE> cov_post_;
+    Eigen::Matrix<double, XSIZE, XSIZE> cov_post_ = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> cov_inv_buf_;

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+#include <iostream>
 #include <eigen3/Eigen/Geometry>
 #include <eigen3/Eigen/Dense>
 #include "utils/common_utils.h"
@@ -13,10 +16,33 @@
 class Association
 {
 public:
+    // Diagnostic counter: how many pointBodyToWorld queries hit a timestamp
+    // outside the current spline support [minTimeNs, maxTimeNs]. findCorresp
+    // has an active-window guard, but RESPLE::processData's deskew loop calls
+    // pointBodyToWorld on every pt_meas entry (including ones findCorresp
+    // skipped) — that path has no window check, so a stale or out-of-order
+    // scan can silently extrapolate. This counter surfaces that in
+    // updateDiagnostics. Inline-static so the single definition is shared
+    // across TUs (C++17).
+    inline static std::atomic<uint64_t> out_of_range_queries_{0};
 
     template<class PointType>
     static void pointBodyToWorld(int64_t t_ns, const SplineState* spline, const PointType& pi, PointType& po, const Eigen::Vector3d& t_bl, const Eigen::Quaterniond& q_bl)
     {
+        // Bounds check against the current spline support. We still call
+        // itpPose so the output point is deterministic — itpPose's own
+        // out-of-range guard (Phase 1) returns identity, which yields
+        // body-frame coords translated by t_bl. This is still wrong for map
+        // insertion, but it's deterministic and NaN-free; the counter lets
+        // the operator decide whether to tighten the upstream window check.
+        if (t_ns < spline->minTimeNs() || t_ns > spline->maxTimeNs()) {
+            if (out_of_range_queries_.fetch_add(1, std::memory_order_relaxed) == 0) {
+                std::cerr << "[Association] pointBodyToWorld: t_ns=" << t_ns
+                          << " outside spline range [" << spline->minTimeNs()
+                          << "," << spline->maxTimeNs() << "]; "
+                          << "further occurrences silent, see diagnostics counter.\n";
+            }
+        }
         Eigen::Quaterniond q;
         Eigen::Vector3d pos;
         spline->itpPose(t_ns, &pos, nullptr, &q, nullptr);

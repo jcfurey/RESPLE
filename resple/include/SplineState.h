@@ -1,9 +1,25 @@
 #pragma once
 
+#include <iostream>
 #include "utils/common_utils.h"
 #include "utils/math_tools.h"
 #include "estimate_msgs/msg/spline.hpp"
 #include "estimate_msgs/msg/knot.hpp"
+
+// Log an invariant violation at most once per (file, line) to avoid spamming.
+// The default workspace build sets -DNDEBUG, which compiles out assert(),
+// meaning the code after a failed assert would silently execute with invalid
+// state (often an out-of-bounds vector access). These helpers replace the
+// asserts with a log + early return / safe fallback.
+#define RESPLE_LOG_INVARIANT_ONCE(msg)                                         \
+    do {                                                                       \
+        static bool _respleLogged = false;                                     \
+        if (!_respleLogged) {                                                  \
+            std::cerr << "[SplineState] invariant violated (" << __FILE__      \
+                      << ":" << __LINE__ << "): " << msg << std::endl;         \
+            _respleLogged = true;                                              \
+        }                                                                      \
+    } while (0)
 
 template <class MatT>
 struct JacobianStruct {
@@ -67,6 +83,10 @@ class SplineState
 
     void updateRCPs(const Eigen::Matrix<double, 24, 1>& cp)
     {
+        if (num_knot < 4) {
+            RESPLE_LOG_INVARIANT_ONCE("updateRCPs called with num_knot < 4 (need 4 active knots); skipping");
+            return;
+        }
         for (int i = 0; i < 4; i++) {
             t_knots[num_knot - 4 + i] = cp.block<3, 1>(i*6, 0);
             ort_delta[num_knot - 4 + i] = cp.block<3, 1>(i*6 + 3, 0);
@@ -74,10 +94,10 @@ class SplineState
             Quater::exp(ort_delta[num_knot - 4 + i], q_del);
             if (int(num_knot) - 4 + i > 0) {
                 q_knots[num_knot - 4 + i] = q_knots[num_knot - 5 + i] * q_del;
-            } else if (int(num_knot) - 4 + i == 0) {
-                q_knots[num_knot - 4 + i] = q_idle[2] * q_del;
             } else {
-                assert(false && "num_knot - 4 + i  < 0");
+                // int(num_knot) - 4 + i == 0 is the only remaining case given
+                // the guard above; the previous "< 0" branch is unreachable.
+                q_knots[num_knot - 4 + i] = q_idle[2] * q_del;
             }
         }
     }    
@@ -100,12 +120,19 @@ class SplineState
 
     void setIdles(int idx, const Eigen::Vector3d& t, const Eigen::Vector3d& ort_del, const Eigen::Quaterniond& q_idle0)
     {
+        if (idx < 0 || idx > 2) {
+            RESPLE_LOG_INVARIANT_ONCE("setIdles called with idx=" << idx << " outside [0,2]");
+            return;
+        }
         t_idle[idx] = t;
         ort_delta_idle[idx] = ort_del;
         Eigen::Quaterniond q_del;
-        Quater::exp(ort_del, q_del);        
+        Quater::exp(ort_del, q_del);
         if (idx == 2) {
-            assert(num_knot > 0);
+            if (num_knot == 0) {
+                RESPLE_LOG_INVARIANT_ONCE("setIdles(idx=2) requires num_knot>0; skipping q_knots[0] write");
+                return;
+            }
             q_knots[0] = q_idle[2] * q_del;
         } else if (idx == 1) {
             q_idle[2] = q_idle[1] * q_del;
@@ -113,10 +140,17 @@ class SplineState
             q_idle[0] = q_idle0;
             q_idle[1] = q_idle[0] * q_del;
         }
-    }    
+    }
 
     void setOneStateKnot(int i, const Eigen::Vector3d& pos, const Eigen::Vector3d& ort_del)
     {
+        // Guard against out-of-bounds knot index before touching any vector.
+        // With -DNDEBUG the old assert was a no-op, so the t_knots[i] /
+        // ort_delta[i] writes below were silently UB for i<0 or i>=num_knot.
+        if (i < 0 || static_cast<int64_t>(i) >= num_knot) {
+            RESPLE_LOG_INVARIANT_ONCE("setOneStateKnot i=" << i << " out of [0," << num_knot << ")");
+            return;
+        }
         t_knots[i] = pos;
 
         ort_delta[i] = ort_del;
@@ -124,12 +158,11 @@ class SplineState
         Quater::exp(ort_del, q_del);
         if (i > 0) {
             q_knots[i] = q_knots[i - 1] * q_del;
-        } else if (i == 0) {
-            q_knots[i] = q_idle[2] * q_del;
         } else {
-            assert(false && "i  < 0");
+            // i == 0 is the only remaining case given the bounds guard above.
+            q_knots[i] = q_idle[2] * q_del;
         }
-    }    
+    }
 
     void updateKnots(SplineState* other)
     {
@@ -224,7 +257,16 @@ class SplineState
         } else if (idx_r == 1) {
             cp0 = q_idle[0];
         } else {
-            assert(false);
+            // idx_r < 1 means prepareInterpolation returned a window before
+            // the first idle knot — caller queried outside the spline support.
+            // Fall back to identity and short-circuit so callers don't act on
+            // uninitialized q_out / w_out. (Previously an NDEBUG no-op assert.)
+            RESPLE_LOG_INVARIANT_ONCE("itpQuaternion idx_r=" << idx_r << " out of range; returning identity");
+            if (q_out) *q_out = Eigen::Quaterniond::Identity();
+            if (w_out) *w_out = Eigen::Vector3d::Zero();
+            if (J_q) { J_q->d_val_d_knot.clear(); J_q->start_idx = 0; }
+            if (J_w) { J_w->d_val_d_knot.clear(); J_w->start_idx = 0; }
+            return;
         }
 
         Eigen::Vector3d t_delta_scale[4];
@@ -374,7 +416,14 @@ class SplineState
             else if (idx_r == 3) cp0 = q_idle[2];
             else if (idx_r == 2) cp0 = q_idle[1];
             else if (idx_r == 1) cp0 = q_idle[0];
-            else assert(false);
+            else {
+                // Query before the first idle knot — return identity and zero
+                // Jacobian rather than leaving q_out / J_q garbage.
+                RESPLE_LOG_INVARIANT_ONCE("itpPose idx_r=" << idx_r << " out of range; returning identity quaternion");
+                if (q_out) *q_out = Eigen::Quaterniond::Identity();
+                if (J_q) { J_q->d_val_d_knot.clear(); J_q->start_idx = 0; }
+                return;
+            }
 
             Eigen::Vector3d t_delta_scale[4];
             Eigen::Quaterniond q_delta_scale[4];

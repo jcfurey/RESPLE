@@ -154,9 +154,11 @@ clean.
 | --- | --- | --- |
 | `-O3` | On in Release | — |
 | `-march=native` | On (`ENABLE_NATIVE_ARCH`) | Binary is non-portable across hosts. OK for single-host deployment. |
-| `-ffast-math` | **On** | Allows reassociation, assumes no NaN/Inf. Numerical stability risk; see Hazards. |
-| `-Wall` | On | `-Wextra` / `-Wshadow` / `-Wpedantic` are NOT enabled. |
-| `EIGEN_INITIALIZE_MATRICES_BY_NAN` | Debug only | Release builds have uninitialized Eigen state unless explicitly zeroed in code. |
+| `-ffast-math` | **Off** (dropped 2026-04-21) | Previously on; removed because it reassociates the Joseph-form `(I-KH)P(I-KH)^T+KRK^T` update and silences NaN/Inf divergence checks. |
+| `-Wall -Wextra -Wshadow` | On | `-Wpedantic` / `-Wunused` subflags not added (upstream noise). |
+| `ENABLE_TSAN` | Off | Mutually exclusive with `ENABLE_ASAN`. Switches to `-O1 -g -fno-omit-frame-pointer -fsanitize=thread`. |
+| `ENABLE_ASAN` | Off | ASan + UBSan combined. Switches to `-O1 -g -fno-omit-frame-pointer -fsanitize=address -fsanitize=undefined`. |
+| `EIGEN_INITIALIZE_MATRICES_BY_NAN` | Debug only | Estimator members are explicitly zero-initialized via in-class initializers so Release builds don't rely on this flag. |
 | `ENABLE_OPENMP` | On | Required for parallel findCorresp / pointBodyToWorld. |
 | `ENABLE_CUDA` | **Off** | CUDA k-NN path exists (`src/gpu/cuda_knn.cu`, `RESPLE_USE_CUDA`) but is not built by default. |
 | `BLAS` | Detected if present (`-DEIGEN_USE_BLAS`) | Destabilized the simpler `(I-KH)P` update historically; safe now that the Joseph-form posterior is used. |
@@ -179,50 +181,60 @@ reference the current HEAD.
    findCorresp, which calls `Nearest_Search` (`Association.h:58`,
    `Estimator.h:408`). Shared-lock concurrent calls are only safe if the ikd-Tree
    internally serializes its own tree-mutation vs. search operations. Needs
-   verification in `ikd_Tree.cpp` + a stress test before relying on it.
+   verification in `ikd_Tree.cpp` + a stress test before relying on it. **(Open.)**
 2. **Initialization state machine is a bool pair.** `if_init_filter` +
    `if_init_map` + `localmap_initialized_` — the ordering rules are correct
    today but easily broken by future refactors. Should become a single
-   `std::atomic<State>` enum.
-3. **`map_update_future_.valid()` is read without a lock** in `on_deactivate`
-   (`RESPLE.cpp:222`) and `on_cleanup` (`RESPLE.cpp:259`). libstdc++ makes
-   this safe in practice, but the standard does not guarantee it.
+   `std::atomic<State>` enum. **(Open.)**
+3. ~~**`map_update_future_.valid()` is read without a lock** in `on_deactivate`
+   and `on_cleanup`.~~ **(Phase 1, 2026-04-21.)** Replaced with
+   `std::atomic<bool> map_update_pending_`, set before `std::async` and cleared
+   at the end of the lambda; `.wait()` is gated on the atomic.
 
 ### Memory and lifecycle
 
 4. **Unbounded knot growth.** `SplineState::t_knots` / `q_knots` / `ort_delta`
-   grow indefinitely; there is no pruning. A long run eventually triggers
-   vector growth reallocation (fine) plus unbounded memory (not fine).
+   grow indefinitely; there is no pruning. Phase 0 now publishes `Spline Knots`
+   in diagnostics so the growth rate can be measured before deciding on a
+   pruning strategy. **(Open — needs Phase 0 data.)**
 5. **Unbounded input buffers.** `pc_buff` and `imu_int_buff` have no max size.
-   If the worker stalls, memory grows without backpressure or drops.
-6. **`assert()` in hot paths.** `SplineState.h:108, 130, 227` abort the
-   process on bad knot indices. An IEKF that produces an out-of-range query
-   should degrade, not crash.
+   Phase 0 publishes their sizes in diagnostics; if they trend up under load,
+   add bounded-size + drop-oldest + counters. **(Open — needs Phase 0 data.)**
+6. ~~**`assert()` in hot paths.**~~ **(Phase 1, 2026-04-21.)** All five asserts
+   in `SplineState.h` replaced with `RESPLE_LOG_INVARIANT_ONCE` + safe
+   fallbacks (early return or identity quaternion). The default RelWithDebInfo
+   build sets `-DNDEBUG`, so the old asserts were no-ops and the code after
+   them silently performed out-of-bounds accesses — that UB is now gated.
 
 ### Accuracy
 
 7. **No divergence detection.** Covariance trace, λ_min, and NaN checks on
    the posterior would catch filter collapse before the bad pose propagates
-   downstream. Currently the node silently publishes garbage if IEKF fails.
+   downstream. Phase 0 now counts `IEKF Numerical Failures` per window and
+   escalates diagnostics to WARN when they occur; full divergence detection
+   (cov trace / λ_min / NaN) is Phase 3. **(Partial — Phase 0.)**
 8. **Plane-fit rejection is incomplete.** `Association.h:59-68` uses only a
    point-distance threshold (`pd2 < 5`) and hardcoded `esti_plane` threshold
-   `0.1f`. No eigenvalue-ratio test, no counters for dropped candidates.
+   `0.1f`. No eigenvalue-ratio test, no counters for dropped candidates. **(Open.)**
 9. **Deskew uses post-IEKF spline.** The spline is refined by the current
-   IEKF pass, then `pointBodyToWorld` queries the *refined* knots. This is
-   intentional iterative refinement, not a bug, but it is undocumented and
-   depends on the scan timestamps lying within the knot window. Out-of-window
-   queries currently hit `itpPose` without bounds checking.
-10. **`-ffast-math` is on.** Allows the compiler to assume no NaN/Inf and to
-    reassociate FP operations. For a Kalman filter doing 24×24/30×30 Joseph-form
-    updates this is risky; it should be evaluated against drift metrics.
+   IEKF pass, then `pointBodyToWorld` queries the *refined* knots. Intentional
+   iterative refinement. Phase 1 added a bounds check + cumulative
+   `out_of_range_queries_` counter in `Association::pointBodyToWorld` so an
+   out-of-window query is visible in diagnostics instead of silently
+   extrapolating. **(Addressed; root cause of out-of-window queries still
+   pending investigation if they fire.)**
+10. ~~**`-ffast-math` is on.**~~ **(Phase 1, 2026-04-21.)** Dropped from both
+    `ENABLE_NATIVE_ARCH` and the plain `-O3` path; `-Wextra -Wshadow` added
+    to the library target.
 
 ### Ordering for fixes
 
-See the remediation plan in the session that produced this doc:
-instrument first (Phase 0: TSan/ASan/UBSan + knot-growth logging) before
-changing code, then work through safety fixes → concurrency → accuracy →
-diagnostics. Do not skip Phase 0; most items above are suspected, not
-confirmed triggered.
+Phase 0 (docs + instrumentation + sanitizer build options) committed in
+`74f9078`. Phase 1 (safety fixes — asserts, bounds checks, Eigen zero-init,
+map-future atomic, `-ffast-math` drop) follows. Later phases (concurrency
+hardening, divergence detection, knot pruning) require Phase 0 bag-replay
+data before implementation. Do not skip Phase 0; most remaining items are
+suspected, not confirmed triggered.
 
 ## Parameters you will hit often
 

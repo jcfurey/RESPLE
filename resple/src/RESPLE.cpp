@@ -219,8 +219,12 @@ public:
             processing_thread_.join();
         }
 
-        if (map_update_future_.valid())
+        // Worker is now joined; no writer to map_update_future_ remains. Gate
+        // on the atomic so we don't touch the future object at all when no
+        // async map update was ever launched.
+        if (map_update_pending_.load(std::memory_order_acquire) && map_update_future_.valid()) {
             map_update_future_.wait();
+        }
 
         // Wait for any in-flight SaveMap action
         {
@@ -256,8 +260,11 @@ public:
     {
         RCLCPP_INFO(this->get_logger(), "Cleaning up RESPLE...");
 
-        if (map_update_future_.valid())
+        // Worker was joined during on_deactivate; gate the future check on
+        // the atomic pending flag (see field declaration for rationale).
+        if (map_update_pending_.load(std::memory_order_acquire) && map_update_future_.valid()) {
             map_update_future_.wait();
+        }
 
         // Clear buffers and data structures
         lidars.clear();
@@ -461,8 +468,11 @@ public:
                 }
                 if (max_time_ns >= t_last_map_upd + 1e8) {
                     // Wait for any prior async map update before swapping buffers.
-                    if (map_update_future_.valid())
+                    // Gated on map_update_pending_ so the worker never reads the
+                    // future until a prior launch was observed here.
+                    if (map_update_pending_.load(std::memory_order_acquire)) {
                         map_update_future_.wait();
+                    }
                     pc_world_bg_.points.swap(pc_world.points);
                     accum_nearest_points_bg_.swap(accum_nearest_points);
                     pc_world.clear();
@@ -474,6 +484,13 @@ public:
                     //     against worker's propRCP / updateIEKF writes. Taken
                     //     outside mtx_map_ so a slow ROS publish can't block
                     //     the worker's next IEKF cycle.
+                    //
+                    // Set map_update_pending_ BEFORE launching so on_deactivate's
+                    // read (after worker join) sees the pending state. The
+                    // lambda clears it on exit so the next loop iteration's
+                    // wait() can short-circuit if the prior async already
+                    // finished.
+                    map_update_pending_.store(true, std::memory_order_release);
                     map_update_future_ = std::async(std::launch::async, [this]() {
                         {
                             std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
@@ -488,8 +505,11 @@ public:
                         // publishFrameWorld only touches the spline; guard it
                         // with spline_mutex_ rather than the (released) map
                         // lock so IEKF can proceed in parallel with the publish.
-                        std::lock_guard<std::mutex> spline_lock(spline_mutex_);
-                        publishFrameWorld(pc_world_bg_);
+                        {
+                            std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                            publishFrameWorld(pc_world_bg_);
+                        }
+                        map_update_pending_.store(false, std::memory_order_release);
                     });
                     t_last_map_upd = max_time_ns;
                 }
@@ -629,6 +649,13 @@ private:
     // first, then spline_mutex_, to avoid deadlocks.
     std::mutex spline_mutex_;
     std::future<void> map_update_future_;
+    // Gatekeeper for map_update_future_ access. The worker thread is the only
+    // writer of the future object itself; on_deactivate/on_cleanup read it
+    // only AFTER joining the worker, so the future access is safe in practice.
+    // This atomic flag makes the intent explicit and also surfaces the
+    // pending state to diagnostics. Set true immediately before std::async,
+    // set false by the async lambda as its final step.
+    std::atomic<bool> map_update_pending_{false};
     pcl::PointCloud<pcl::PointXYZINormal> pc_world_bg_;
     std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> accum_nearest_points_bg_;
     bool acc_ratio;
@@ -1096,6 +1123,12 @@ private:
         stat.add("IEKF Numerical Failures (LIO, cumulative)", static_cast<int>(fails_lio));
         stat.add("IEKF Numerical Failures (LO, last window)",  static_cast<int>(dfails_lo));
         stat.add("IEKF Numerical Failures (LIO, last window)", static_cast<int>(dfails_lio));
+
+        // Out-of-spline-range query counter from Association::pointBodyToWorld.
+        // Signals that the deskew loop saw a scan timestamp outside the current
+        // knot window — potential for extrapolation / map poisoning.
+        stat.add("Spline Out-of-Range Queries (cumulative)",
+                 static_cast<int>(Association::out_of_range_queries_.load(std::memory_order_relaxed)));
 
         // Escalate to at least WARN if the IEKF rejected an update this window —
         // they are silent otherwise (only std::cerr, no ROS publish). Don't
