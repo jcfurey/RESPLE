@@ -4,6 +4,10 @@
 #include <string>
 #include <cmath>
 #include <atomic>
+#include <cstdio>
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
 
 #include <rclcpp/qos.hpp>
 #include <rclcpp/service.hpp>
@@ -1064,7 +1068,35 @@ private:
 
 };
 
+// Crash handler: prints a backtrace to stderr on fatal signals, then restores
+// the default handler and re-raises. Mirror of the handler in RESPLE.cpp.
+// See that file's comment block for rationale (added 2026-04-21 to debug a
+// deterministic SIGSEGV after gravity alignment).
+static void mappingCrashHandler(int sig)
+{
+    constexpr int kMaxFrames = 64;
+    void *addrs[kMaxFrames];
+    int n = backtrace(addrs, kMaxFrames);
+    const char *name = (sig == SIGSEGV) ? "SIGSEGV" :
+                       (sig == SIGABRT) ? "SIGABRT" :
+                       (sig == SIGBUS)  ? "SIGBUS"  :
+                       (sig == SIGFPE)  ? "SIGFPE"  :
+                       (sig == SIGILL)  ? "SIGILL"  : "unknown";
+    dprintf(STDERR_FILENO, "\n=== Mapping crash handler: caught %s (%d), %d frames ===\n",
+            name, sig, n);
+    backtrace_symbols_fd(addrs, n, STDERR_FILENO);
+    dprintf(STDERR_FILENO, "=== end Mapping backtrace ===\n");
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 int main(int argc, char** argv) {
+    signal(SIGSEGV, mappingCrashHandler);
+    signal(SIGABRT, mappingCrashHandler);
+    signal(SIGBUS,  mappingCrashHandler);
+    signal(SIGFPE,  mappingCrashHandler);
+    signal(SIGILL,  mappingCrashHandler);
+
     pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
     rclcpp::init(argc, argv);
     

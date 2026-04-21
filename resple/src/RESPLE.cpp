@@ -34,6 +34,10 @@
 #include <future>
 #include <chrono>
 #include <atomic>
+#include <cstdio>
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
 #include <rclcpp/service.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <pcl/filters/voxel_grid.h>
@@ -1907,8 +1911,51 @@ private:
 
 };
 
+// Crash handler: prints a backtrace to stderr on fatal signals, then restores
+// the default handler and re-raises so the kernel can still produce a core
+// dump / the launch system sees the original signal. Installed in main().
+//
+// Added 2026-04-21: RESPLE was dying with exit code -11 immediately after
+// gravity alignment in sim, with no prior log context. Launch-level respawn
+// kept the stack up but each restart crashed the same way deterministically.
+// This handler produces the call stack needed to pinpoint the instruction.
+//
+// Not signal-safe in the strictest sense (fprintf allocates, backtrace_symbols
+// can malloc), but it's the last thing the process does before re-raising, so
+// any heap corruption here is a non-issue. backtrace_symbols_fd is the
+// async-signal-safer variant we use for the actual frame output.
+static void respleCrashHandler(int sig)
+{
+    constexpr int kMaxFrames = 64;
+    void *addrs[kMaxFrames];
+    int n = backtrace(addrs, kMaxFrames);
+    const char *name = (sig == SIGSEGV) ? "SIGSEGV" :
+                       (sig == SIGABRT) ? "SIGABRT" :
+                       (sig == SIGBUS)  ? "SIGBUS"  :
+                       (sig == SIGFPE)  ? "SIGFPE"  :
+                       (sig == SIGILL)  ? "SIGILL"  : "unknown";
+    // Write the banner via the STDERR fd directly so it appears even when the
+    // stdio buffers are corrupted (common after a memory-safety violation).
+    dprintf(STDERR_FILENO, "\n=== RESPLE crash handler: caught %s (%d), %d frames ===\n",
+            name, sig, n);
+    backtrace_symbols_fd(addrs, n, STDERR_FILENO);
+    dprintf(STDERR_FILENO, "=== end RESPLE backtrace ===\n");
+    // Restore default disposition and re-raise so the kernel emits a core
+    // and the parent (ros2 launch) observes the original signal.
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 int main(int argc, char *argv[])
 {
+    // Install before rclcpp::init so crashes during subscriber/publisher
+    // construction also produce a trace.
+    signal(SIGSEGV, respleCrashHandler);
+    signal(SIGABRT, respleCrashHandler);
+    signal(SIGBUS,  respleCrashHandler);
+    signal(SIGFPE,  respleCrashHandler);
+    signal(SIGILL,  respleCrashHandler);
+
     pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
     rclcpp::init(argc, argv);
     

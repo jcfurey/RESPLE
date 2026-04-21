@@ -151,6 +151,12 @@ target_sources(Mapping PRIVATE src/Mapping.cpp)
 add_executable(RESPLE)
 target_sources(RESPLE PRIVATE src/RESPLE.cpp)
 
+# -rdynamic exports symbols in the dynamic symbol table so the crash-handler's
+# backtrace_symbols_fd() in RESPLE.cpp prints function names instead of just
+# addresses. Tiny binary-size cost; worth it every time RESPLE segfaults.
+target_link_options(RESPLE  PRIVATE -rdynamic)
+target_link_options(Mapping PRIVATE -rdynamic)
+
 ament_target_dependencies(${PROJECT_NAME} 
 	rclcpp
 	rclcpp_components
