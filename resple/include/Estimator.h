@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <iostream>
 #include "SplineState.h"
 #include "Association.h"
@@ -10,8 +12,13 @@ class Estimator
   public:
     static const int CP_SIZE = 24;
     static const int BA_OFFSET = 24;
-    static const int BG_OFFSET = 27;  
+    static const int BG_OFFSET = 27;
     int n_iter = 1;
+
+    // Atomic because updateDiagnostics may read these from the ROS executor
+    // thread while the worker is mid-IEKF. Monotonic; no reset — the diagnostics
+    // publisher snapshots deltas.
+    std::atomic<uint64_t> num_numerical_failures_{0};
 
     Estimator() {};
 
@@ -72,6 +79,7 @@ class Estimator
             if (num_tot_eff > 0) {
                 if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
                     std::cerr << "[Estimator] IEKF LiDAR update failed (numerical), resetting covariance to prior\n";
+                    num_numerical_failures_.fetch_add(1, std::memory_order_relaxed);
                     cov_rcp = cov_prop;
                     break;
                 }
@@ -118,6 +126,7 @@ class Estimator
             if (num_tot_eff > 0) {
                 if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
                     std::cerr << "[Estimator] IEKF LiDAR update failed (numerical), resetting covariance to prior\n";
+                    num_numerical_failures_.fetch_add(1, std::memory_order_relaxed);
                     cov_rcp = cov_prop;
                     break;
                 }
@@ -168,6 +177,7 @@ class Estimator
             }
             if (!update_ok) {
                 std::cerr << "[Estimator] IEKF LIO update failed (numerical), resetting covariance to prior\n";
+                num_numerical_failures_.fetch_add(1, std::memory_order_relaxed);
                 cov_rcp = cov_prop;
                 break;
             }
@@ -216,6 +226,7 @@ class Estimator
             }
             if (!update_ok) {
                 std::cerr << "[Estimator] IEKF LIO update failed (numerical), resetting covariance to prior\n";
+                num_numerical_failures_.fetch_add(1, std::memory_order_relaxed);
                 cov_rcp = cov_prop;
                 break;
             }

@@ -5,6 +5,16 @@ project(resple)
 option(ENABLE_OPENMP "Enable OpenMP parallelism" ON)
 option(ENABLE_NATIVE_ARCH "Enable -march=native optimizations" ON)
 option(ENABLE_CUDA "Enable CUDA k-NN acceleration (requires nvcc)" OFF)
+# Sanitizer builds for the hardening workflow. Mutually exclusive; both force
+# -O1 and drop -ffast-math so the sanitizer runtime sees the real control flow
+# and FP semantics. Build with e.g.
+#   colcon build --packages-select resple --cmake-args -DENABLE_TSAN=ON
+# then run a bag under TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1.
+option(ENABLE_TSAN "Enable ThreadSanitizer (mutually exclusive with ASan)" OFF)
+option(ENABLE_ASAN "Enable AddressSanitizer + UndefinedBehaviorSanitizer (mutually exclusive with TSan)" OFF)
+if(ENABLE_TSAN AND ENABLE_ASAN)
+	message(FATAL_ERROR "resple: ENABLE_TSAN and ENABLE_ASAN are mutually exclusive")
+endif()
 if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE "Release")
 endif()
@@ -91,14 +101,33 @@ target_include_directories(${PROJECT_NAME}
 
 # Enforce C++17 and apply optimization flags to the library target
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
-target_compile_options(${PROJECT_NAME} PRIVATE 
+target_compile_options(${PROJECT_NAME} PRIVATE
 	-Wall
 	$<$<CONFIG:Debug>:-DEIGEN_INITIALIZE_MATRICES_BY_NAN>
 )
-if(ENABLE_NATIVE_ARCH)
-	target_compile_options(${PROJECT_NAME} PRIVATE -O3 -march=native -ffast-math)
+
+# Optimization / sanitizer flag selection. Sanitizers take precedence over the
+# default -O3 path: they need -O1 (so the stack is walkable) and must not run
+# under -ffast-math (which rewrites FP ops and breaks UBSan's FP checks).
+if(ENABLE_TSAN)
+	set(RESPLE_OPT_FLAGS -O1 -g -fno-omit-frame-pointer)
+	set(RESPLE_SAN_FLAGS -fsanitize=thread)
+	message(STATUS "resple: ThreadSanitizer enabled; optimizations reduced to -O1, -ffast-math dropped")
+elseif(ENABLE_ASAN)
+	set(RESPLE_OPT_FLAGS -O1 -g -fno-omit-frame-pointer)
+	set(RESPLE_SAN_FLAGS -fsanitize=address -fsanitize=undefined)
+	message(STATUS "resple: AddressSanitizer + UBSan enabled; optimizations reduced to -O1, -ffast-math dropped")
+elseif(ENABLE_NATIVE_ARCH)
+	set(RESPLE_OPT_FLAGS -O3 -march=native -ffast-math)
 else()
-	target_compile_options(${PROJECT_NAME} PRIVATE -O3 -ffast-math)
+	set(RESPLE_OPT_FLAGS -O3 -ffast-math)
+endif()
+target_compile_options(${PROJECT_NAME} PRIVATE ${RESPLE_OPT_FLAGS})
+if(RESPLE_SAN_FLAGS)
+	# Sanitizer flags must apply to every TU and to the link of any executable
+	# that pulls in this library, so mark them PUBLIC.
+	target_compile_options(${PROJECT_NAME} PUBLIC ${RESPLE_SAN_FLAGS})
+	target_link_options(${PROJECT_NAME} PUBLIC ${RESPLE_SAN_FLAGS})
 endif()
 
 # Executables just wrap the library - no source duplication

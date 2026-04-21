@@ -436,6 +436,9 @@ public:
                         PointData& pt_data = pt_meas[i];
                         Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
                     }
+                    // Cache knot count for updateDiagnostics (may run on the
+                    // executor thread; atomic read there is lock-free).
+                    cached_spline_knots_.store(spline->numKnots(), std::memory_order_relaxed);
                 }
                 for (size_t i = 0; i < pt_meas.size(); i++) {
                     PointData& pt_data = pt_meas[i];
@@ -522,6 +525,16 @@ private:
     size_t frame_count_;
     double total_computation_time_ms_;
     size_t total_iekf_iterations_;
+    // Phase-0 hardening instrumentation: cached under spline_mutex_ by the
+    // worker at the end of each IEKF cycle, read lock-free by updateDiagnostics
+    // (which may run on the ROS executor thread via the Updater's internal
+    // timer, not just from the worker's force_update). Atomic so the read is
+    // not a data race; stale-by-one-cycle is acceptable.
+    std::atomic<int64_t> cached_spline_knots_{0};
+    // Per-window baseline for IEKF numerical-failure deltas (published as a
+    // per-second rate, not a cumulative count).
+    uint64_t last_numerical_failures_lo_ = 0;
+    uint64_t last_numerical_failures_lio_ = 0;
     
     // Lifecycle management
     std::atomic<bool> processing_active_;
@@ -1020,24 +1033,25 @@ private:
         double processing_rate = (time_elapsed > 0) ? frame_count_ / time_elapsed : 0.0;
         double avg_computation_time = (frame_count_ > 0) ? total_computation_time_ms_ / frame_count_ : 0.0;
         double avg_iekf_iters = (frame_count_ > 0) ? static_cast<double>(total_iekf_iterations_) / frame_count_ : 0.0;
-        
-        // Determine system health
+
+        // Determine rate-based health level
         const double expected_rate = 20.0;  // Target: 20 Hz
         const double warn_threshold = 0.7 * expected_rate;  // 14 Hz
         const double error_threshold = 0.5 * expected_rate;  // 10 Hz
-        
+
+        uint8_t level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+        std::string msg = "System healthy";
         if (frame_count_ == 0) {
-            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, "No frames processed yet");
+            level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            msg = "No frames processed yet";
         } else if (processing_rate < error_threshold) {
-            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, 
-                        "Processing rate critically low");
+            level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+            msg = "Processing rate critically low";
         } else if (processing_rate < warn_threshold) {
-            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, 
-                        "Processing rate below target");
-        } else {
-            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "System healthy");
+            level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            msg = "Processing rate below target";
         }
-        
+
         // Add detailed metrics
         stat.add("Processing Rate (Hz)", processing_rate);
         stat.add("Target Rate (Hz)", expected_rate);
@@ -1046,7 +1060,7 @@ private:
         stat.add("Avg IEKF Iterations", avg_iekf_iters);
         stat.add("Num Threads", num_threads_);
         stat.add("Num Match Points", num_match_points_);
-        
+
         // Buffer sizes
         size_t total_lidar_buffer = 0;
         for (const auto& [name, data] : lidars_data) {
@@ -1055,7 +1069,45 @@ private:
         stat.add("LiDAR Buffer Size", static_cast<int>(total_lidar_buffer));
         stat.add("IMU Buffer Size", static_cast<int>(imu_buff.size()));
         stat.add("Point Meas Buffer Size", static_cast<int>(pt_meas.size()));
-        
+
+        // Phase-0 instrumentation: spline growth + IMU staging buffer + IEKF
+        // numerical-failure rate. These are the primary signals for deciding
+        // whether the unbounded-knot / unbounded-buffer / silent-failure
+        // hazards listed in CLAUDE.md actually fire in practice.
+        stat.add("Spline Knots", static_cast<int>(cached_spline_knots_.load(std::memory_order_relaxed)));
+        size_t imu_int_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_buff);
+            imu_int_size = imu_int_buff.size();
+        }
+        stat.add("IMU Staging Buffer Size", static_cast<int>(imu_int_size));
+
+        // IEKF numerical-failure delta per window. Only one of the two
+        // estimators is actually active per run (gated by if_lidar_only) but
+        // both exist and both expose a counter — publish both so the non-active
+        // one stays pinned at 0 and the active one accumulates.
+        uint64_t fails_lo  = estimator_lo.num_numerical_failures_.load(std::memory_order_relaxed);
+        uint64_t fails_lio = estimator_lio.num_numerical_failures_.load(std::memory_order_relaxed);
+        uint64_t dfails_lo  = fails_lo  - last_numerical_failures_lo_;
+        uint64_t dfails_lio = fails_lio - last_numerical_failures_lio_;
+        last_numerical_failures_lo_  = fails_lo;
+        last_numerical_failures_lio_ = fails_lio;
+        stat.add("IEKF Numerical Failures (LO, cumulative)",  static_cast<int>(fails_lo));
+        stat.add("IEKF Numerical Failures (LIO, cumulative)", static_cast<int>(fails_lio));
+        stat.add("IEKF Numerical Failures (LO, last window)",  static_cast<int>(dfails_lo));
+        stat.add("IEKF Numerical Failures (LIO, last window)", static_cast<int>(dfails_lio));
+
+        // Escalate to at least WARN if the IEKF rejected an update this window —
+        // they are silent otherwise (only std::cerr, no ROS publish). Don't
+        // overwrite a pre-existing ERROR.
+        if ((dfails_lo > 0 || dfails_lio > 0)
+            && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+            level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            msg = "IEKF numerical update failures observed this window";
+        }
+
+        stat.summary(level, msg);
+
         // Reset counters for next period
         frame_count_ = 0;
         total_computation_time_ms_ = 0.0;
