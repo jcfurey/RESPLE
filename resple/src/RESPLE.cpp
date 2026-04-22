@@ -406,7 +406,7 @@ public:
                     // CudaMap::update() runs, fall back to the kd-tree path).
                     const bool use_gpu = !g_cuda_map.empty();
 #else
-                    constexpr bool use_gpu = false;
+                    [[maybe_unused]] constexpr bool use_gpu = false;
 #endif
                     if (if_lidar_only) {
                         estimator_lo.propRCP(max_time_ns);

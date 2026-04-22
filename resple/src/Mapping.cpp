@@ -54,11 +54,11 @@ class MappingBase
 
     std::mutex mtx;
     LidarConfig lidar;
-    MappingBase(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config, 
-                rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr) 
+    MappingBase(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config,
+                rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
                 : lidar(lidar_config)
-                , node_handle_(nh)
                 , lidar_qos(rclcpp::SensorDataQoS().keep_last(100).best_effort())
+                , node_handle_(nh)
     {
         if (sensor_cb) sub_opt.callback_group = sensor_cb;
 
