@@ -90,17 +90,55 @@ RESPLE nodes in one composable container.
 ### Lifecycle state vs. callback safety
 
 The IMU callback snapshots both `if_lidar_only` and `if_init_filter` under
-`m_buff` in one transaction (`RESPLE.cpp:1575-1594`). This is the fix for a
-prior crash where the callback could see `if_init_filter == true` before the
-spline pointer was actually initialized. The ordering requirement is:
+`m_buff` in one transaction (`RESPLE.cpp` `getImuCallback`). This is the fix
+for a prior crash where the callback could see `if_init_filter == true`
+before the spline pointer was actually initialized. The ordering requirement
+is:
 
 1. Fully construct the `SplineState`.
 2. Point `spline` at it.
 3. Flip `if_init_filter = true` under `m_buff`.
 
-**Do not reorder.** The current state machine is a bool pair, not an enum —
-it is fragile. A cleaner refactor (atomic state enum with explicit transitions)
-is tracked in the hardening plan (see Hazards below).
+**Do not reorder.** The state flags `if_init_filter`, `if_init_map`,
+`if_lidar_only`, `localmap_initialized_` are now `std::atomic<bool>`
+(Phase 1.5 Fix C). This closes the bare-bool data race the worker had on
+`if_init_filter` / `imu_int_buff.empty()` reads. The `m_buff` snapshot
+discipline above is still required for the IMU callback's own LO/LIO branch
+selection — atomicity alone doesn't give a coherent multi-flag transition.
+
+The full atomic-enum state machine refactor (Phase 2.2) is no longer urgent
+but is still a code-clarity win.
+
+### Callback-drain barrier on `on_deactivate`
+
+Both `RESPLE` and `Mapping` `on_deactivate` sleep for **100 ms** after
+resetting subscriptions, before returning. Reason: `Subscription::reset()`
+drops the application's strong ref but the executor still holds one for any
+callback already in flight on another thread (sensor_cb_group is
+MutuallyExclusive, so at most one). Without this barrier, `on_cleanup`'s
+state teardown (`lidars_data.clear()` etc.) can deallocate a `LidarData` /
+TF buffer / publisher while a callback is mid-execution holding a reference
+to it → SIGSEGV. Temporary fix until Jazzy exposes `wait_for_callbacks` on
+`CallbackGroup`.
+
+### Lifecycle re-entry safety
+
+`declare_parameter` throws `ParameterAlreadyDeclaredException` if called
+twice. All param reads in this package go through `CommonUtils::readParam`
+(which guards with `has_parameter`) **except** three direct `declare_parameter`
+calls in RESPLE.cpp's `on_configure` (`num_threads`, `num_match_points`) and
+`on_activate` (`lidars`). These three are now guarded with `has_parameter`
+checks (Phase 1.5 R1+R2) so a `deactivate → cleanup → configure → activate`
+cycle does not crash.
+
+When adding a new direct `declare_parameter` call, **either** wrap with a
+`has_parameter` guard, **or** use `CommonUtils::readParam` instead. The
+latter is preferred (matches everything else in `readParameters()`).
+
+`on_activate` also refuses to overwrite a still-joinable `processing_thread_`
+(would call `std::terminate` via `std::thread` move-onto-joinable). If the
+ERROR fires, the previous deactivate didn't complete cleanly — investigate
+that, don't paper over.
 
 ## Locking and lock ordering
 
@@ -143,6 +181,25 @@ and hands those to the async map update (`RESPLE.cpp:459-490`). The wait on
 `map_update_future_` before the swap serializes back-to-back map updates —
 the next cycle cannot race a still-running previous one.
 
+### `getPositionLiDAR` is pure-read (no `propRCP` side-effect)
+
+Phase 1.5 (Pass 3) removed a `propRCP` call from `getPositionLiDAR` that
+was mutating `Estimator::cov_rcp` from inside the async map-update lambda,
+which holds only `mtx_map_` (unique) — not `spline_mutex_`. The mutation
+was race-free only because the IEKF needs `mtx_map_` shared and was
+blocked, but the implicit lock-coupling was fragile. The function is now
+pure-read; lock discipline matches the documented contract. If you re-add
+a mutating call here, take `spline_mutex_` first or refactor the caller.
+
+### ikd-Tree `Nearest_Search` always takes the shared lock
+
+Phase 1.5 (K1) removed the lock-free fast-path that checked
+`Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node` racy with the
+rebuild thread's subtree swap. `Nearest_Search` now unconditionally takes
+`search_rw_mutex_` shared. Cost: one uncontended atomic-increment per call
+(rebuild only takes unique briefly during the swap). Worth it — the racy
+fast-path was a HIGH-severity UAF window in the IEKF k-NN parallel-for.
+
 ## Build configuration
 
 Flags are defined in `src/packages/localization/resple/resple/CMakeLists.txt`.
@@ -175,29 +232,42 @@ directory). Summary:
 
 | Phase | Title | Status |
 | --- | --- | --- |
-| 0 | Instrumentation + sanitizer builds | code complete (`74f9078`); bag replay pending |
-| 1 | Safety fixes | complete (`512da1d`) |
-| 2 | Concurrency hardening | pending Phase 0 data |
-| 3 | Spline / mapping accuracy | pending Phase 0 data |
-| 4 | Diagnostics publisher | after Phase 3 begins |
-| 5 | Regression tests | last |
+| 0   | Instrumentation + sanitizer builds | code complete (`74f9078`); bag replay pending |
+| 1   | Safety fixes (initial)             | complete (`512da1d`) |
+| 1.5 | Defensive crash-hardening          | complete (uncommitted) — 13 fixes across 3 passes |
+| 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 still pending Phase 0 data |
+| 3   | Spline / mapping accuracy          | pending Phase 0 data |
+| 4   | Diagnostics publisher              | after Phase 3 begins |
+| 5   | Regression tests                   | last |
 
 ### Known hazards (compact view)
 
-The full audit identified 10 concrete issues. Quick reference:
+The original audit identified 10 issues; Phase 1.5 added several more. Quick
+reference (status as of latest pass):
 
 | # | Hazard | Status | Phase |
 | --- | --- | --- | --- |
-| 1 | ikd-Tree `Nearest_Search` lock contract unverified | open | 2.1 |
-| 2 | Init state machine is a bool pair (fragile) | open | 2.2 |
-| 3 | `map_update_future_.valid()` racy read | **fixed** | 1 |
-| 4 | Unbounded knot growth | open, measuring | 3.1 |
-| 5 | Unbounded input buffers | open, measuring | 2.3 |
-| 6 | `assert()` in hot paths → silent UB under `-DNDEBUG` | **fixed** | 1 |
-| 7 | No divergence detection | partial (failure counter) | 0 → 3.3 |
-| 8 | Plane-fit outlier rejection incomplete | open | 3.2 |
-| 9 | Deskew out-of-window extrapolation | **fixed (detection)** | 1 |
+| 1  | ikd-Tree `Nearest_Search` lock contract unverified | **fixed** (always-shared-lock) | 1.5 K1 |
+| 2  | Init state machine is a bool pair (fragile) | **race fixed** (atomic bools); enum refactor optional | 1.5 C / 2.2 |
+| 3  | `map_update_future_.valid()` racy read | **fixed** | 1 |
+| 4  | Unbounded knot growth | open, measuring | 3.1 |
+| 5  | Unbounded input buffers | open, measuring | 2.3 |
+| 6  | `assert()` in hot paths → silent UB under `-DNDEBUG` | **fixed** | 1 |
+| 7  | No divergence detection | partial (failure counter) | 0 → 3.3 |
+| 8  | Plane-fit outlier rejection incomplete | open | 3.2 |
+| 9  | Deskew out-of-window extrapolation | **fixed (clamp + counter)** | 1 + 1.5 A/B |
 | 10 | `-ffast-math` on | **fixed** | 1 |
+| 11 | `pointBodyToWorld` OOB on out-of-range t_ns (logged but not clamped by Phase 1) | **fixed** | 1.5 A |
+| 12 | `SplineState::itpPose` / `prepareInterpolation` indexed `t_knots[idx0+i]` without bounds | **fixed** (defensive clamp + n_active cap) | 1.5 B |
+| 13 | Worker read `imu_int_buff.empty()` without `m_buff` (deque-internals data race) | **fixed** | 1.5 C |
+| 14 | Sensor callbacks throw `std::out_of_range` from `lidars.at()` → `std::terminate` | **fixed** (try/catch in 7 callbacks) | 1.5 D |
+| 15 | `lidars_data.clear()` in `on_cleanup` while a callback is mid-execution | **fixed** (100ms drain barrier) | 1.5 E + M3 |
+| 16 | `on_activate` re-launching a still-joinable `processing_thread_` → `std::terminate` | **fixed** (joinable guard) | 1.5 F |
+| 17 | `declare_parameter` re-call on lifecycle re-cycle → SIGABRT | **fixed** (has_parameter guards) | 1.5 R1+R2 |
+| 18 | Resource leak (`save_map_action_server_`, `tf_buffer_`, `tf_listener_`) on re-cycle | **fixed** | 1.5 R3 |
+| 19 | Mapping `if_init_succeed` bare bool race + `spline_active_.init()` race | **fixed** (atomic + m_spline) | 1.5 M1+M2 |
+| 20 | `getPositionLiDAR` mutated `cov_rcp` outside `spline_mutex_` (implicit lock-coupling) | **fixed** | 1.5 (Pass 3) |
+| 21 | `lock_mappings()` non-RAII → throw between → deadlock | **fixed** (`ScopedMappingsLock`) | 1.5 M4 |
 
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7
@@ -231,12 +301,52 @@ the source.
 - **Do modify the workspace config** at `src/settings/params/localization/resple.yaml`.
 - When adding a new sensor type, wire the callback through `sensor_cb_group`
   (not the default group) and push to a per-sensor `LidarData` struct with its
-  own `mtx_pc` — do not add heavy work inline in the callback.
+  own `mtx_pc` — do not add heavy work inline in the callback. **Wrap the
+  callback body in `try { ... } catch (const std::exception& e) {
+  RCLCPP_WARN_THROTTLE(...); }`** — every existing callback follows this
+  pattern (Phase 1.5 D). `lidars.at(name)` throws `std::out_of_range` for an
+  unexpected frame_id; without the catch the executor turns that into
+  `std::terminate` → SIGABRT.
 - When adding shared state read by `processData` and any callback, decide
   which existing mutex covers it. Do not introduce a fifth mutex without
   updating the lock-ordering rule above.
+- When adding new bool flags shared between worker and callback threads,
+  use `std::atomic<bool>` (matches the Phase 1.5 C pattern). Operator T()
+  and operator= preserve existing call sites; cost is one atomic per
+  read/write.
+- When adding a `declare_parameter` call, prefer `CommonUtils::readParam`
+  (which has a `has_parameter` guard built in) over the direct API. Direct
+  `declare_parameter` calls must be guarded with `if (!has_parameter(...))`
+  to survive lifecycle re-cycles.
+- When adding a new spline reader (anything that calls `spline->itp*` or
+  reads knot data), take `spline_mutex_` first. If you only need the
+  current pose at `maxTimeNs()`, prefer `getPositionLiDAR(spline->maxTimeNs(), ...)`
+  which is now pure-read (Phase 1.5 Pass 3).
+- When adding state to `Mapping.cpp`'s `process()` loop, hold all per-map
+  mutexes via `ScopedMappingsLock maps_lock(vis_maps);` — RAII, exception-safe.
+  The bare `lock_mappings()` / `unlock_mappings()` pair is gone.
 - Build commands (from `rovermax_ws/` inside the container):
   ```bash
   ./scripts/colcon/colcon_build_pkg.sh resple
   ```
   CUDA builds: `colcon build --packages-select resple --cmake-args -DENABLE_CUDA=ON`.
+
+### Sanitizer builds (recommended after substantial concurrency edits)
+
+```bash
+# TSan: catches data races. Worker + executor + async lambda + ikd-Tree
+# rebuild thread are all in scope.
+./scripts/docker/docker_exec.sh \
+    bash -lc 'colcon build --packages-select resple \
+              --cmake-args -DENABLE_TSAN=ON -DENABLE_NATIVE_ARCH=OFF'
+
+# ASan + UBSan: catches UAF, OOB, signed overflow. Especially useful for
+# verifying lifecycle deactivate/cleanup paths and ikd-Tree concurrent access.
+./scripts/docker/docker_exec.sh \
+    bash -lc 'colcon build --packages-select resple \
+              --cmake-args -DENABLE_ASAN=ON -DENABLE_NATIVE_ARCH=OFF'
+```
+
+Run a representative bag and pipe stderr to a file. Any sanitizer hit prints
+the offending stack — those are gold and almost always reveal a real bug,
+not a false positive. See `HARDENING.md` Phase 0 for full operator workflow.

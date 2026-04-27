@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <iostream>
@@ -29,23 +30,32 @@ public:
     template<class PointType>
     static void pointBodyToWorld(int64_t t_ns, const SplineState* spline, const PointType& pi, PointType& po, const Eigen::Vector3d& t_bl, const Eigen::Quaterniond& q_bl)
     {
-        // Bounds check against the current spline support. We still call
-        // itpPose so the output point is deterministic — itpPose's own
-        // out-of-range guard (Phase 1) returns identity, which yields
-        // body-frame coords translated by t_bl. This is still wrong for map
-        // insertion, but it's deterministic and NaN-free; the counter lets
-        // the operator decide whether to tighten the upstream window check.
-        if (t_ns < spline->minTimeNs() || t_ns > spline->maxTimeNs()) {
+        // Clamp t_ns to the spline's active support before calling itpPose.
+        //
+        // The Phase-1 fix logged out-of-range queries but still passed the
+        // bad t_ns through — itpPose's interior knot loop indexes
+        // t_knots[idx0 + i] without a bound check (SplineState.h around
+        // line 393), and for t_ns > maxTimeNs() that index can equal or
+        // exceed num_knot, OOB-reading the deque → SIGSEGV. Clamping here
+        // converts a deterministic crash into a deterministic boundary
+        // evaluation: the deskew uses the pose at the spline edge instead
+        // of an extrapolated one. Geometrically slightly off, never UB.
+        // The counter still increments so operators can see when scan
+        // timestamps drift outside the active window.
+        const int64_t t_min = spline->minTimeNs();
+        const int64_t t_max = spline->maxTimeNs();
+        const int64_t t_ns_safe = std::clamp(t_ns, t_min, t_max);
+        if (t_ns_safe != t_ns) {
             if (out_of_range_queries_.fetch_add(1, std::memory_order_relaxed) == 0) {
                 std::cerr << "[Association] pointBodyToWorld: t_ns=" << t_ns
-                          << " outside spline range [" << spline->minTimeNs()
-                          << "," << spline->maxTimeNs() << "]; "
-                          << "further occurrences silent, see diagnostics counter.\n";
+                          << " outside spline range [" << t_min << "," << t_max
+                          << "]; clamping to " << t_ns_safe
+                          << ". Further occurrences silent, see diagnostics counter.\n";
             }
         }
         Eigen::Quaterniond q;
         Eigen::Vector3d pos;
-        spline->itpPose(t_ns, &pos, nullptr, &q, nullptr);
+        spline->itpPose(t_ns_safe, &pos, nullptr, &q, nullptr);
         Eigen::Vector3f p_body(pi.x, pi.y, pi.z);
         Eigen::Vector3f p_global = q.cast<float>() * (q_bl.cast<float>() * p_body + t_bl.cast<float>()) + pos.cast<float>();
         po.x = p_global(0);

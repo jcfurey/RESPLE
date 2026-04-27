@@ -82,21 +82,33 @@ public:
         imu_to_baselink_ = geometry_msgs::msg::TransformStamped();
         
         // Parameter validation with constraints
-        auto num_threads_desc = rcl_interfaces::msg::ParameterDescriptor{};
-        num_threads_desc.description = "Number of OpenMP threads for parallel processing";
-        num_threads_desc.integer_range.resize(1);
-        num_threads_desc.integer_range[0].from_value = 1;
-        num_threads_desc.integer_range[0].to_value = 16;
-        num_threads_desc.integer_range[0].step = 1;
-        num_threads_ = this->declare_parameter<int>("num_threads", 5, num_threads_desc);
-        
-        auto num_match_points_desc = rcl_interfaces::msg::ParameterDescriptor{};
-        num_match_points_desc.description = "Number of nearest neighbor points for matching";
-        num_match_points_desc.integer_range.resize(1);
-        num_match_points_desc.integer_range[0].from_value = 3;
-        num_match_points_desc.integer_range[0].to_value = 10;
-        num_match_points_desc.integer_range[0].step = 1;
-        num_match_points_ = this->declare_parameter<int>("num_match_points", 5, num_match_points_desc);
+        // Guard direct declare_parameter calls with has_parameter checks so a
+        // second on_configure (after on_cleanup) doesn't throw
+        // ParameterAlreadyDeclaredException. The other params in
+        // readParameters() use CommonUtils::readParam which already does this.
+        if (!this->has_parameter("num_threads")) {
+            auto num_threads_desc = rcl_interfaces::msg::ParameterDescriptor{};
+            num_threads_desc.description = "Number of OpenMP threads for parallel processing";
+            num_threads_desc.integer_range.resize(1);
+            num_threads_desc.integer_range[0].from_value = 1;
+            num_threads_desc.integer_range[0].to_value = 16;
+            num_threads_desc.integer_range[0].step = 1;
+            num_threads_ = this->declare_parameter<int>("num_threads", 5, num_threads_desc);
+        } else {
+            num_threads_ = this->get_parameter("num_threads").as_int();
+        }
+
+        if (!this->has_parameter("num_match_points")) {
+            auto num_match_points_desc = rcl_interfaces::msg::ParameterDescriptor{};
+            num_match_points_desc.description = "Number of nearest neighbor points for matching";
+            num_match_points_desc.integer_range.resize(1);
+            num_match_points_desc.integer_range[0].from_value = 3;
+            num_match_points_desc.integer_range[0].to_value = 10;
+            num_match_points_desc.integer_range[0].step = 1;
+            num_match_points_ = this->declare_parameter<int>("num_match_points", 5, num_match_points_desc);
+        } else {
+            num_match_points_ = this->get_parameter("num_match_points").as_int();
+        }
         
         RCLCPP_INFO(this->get_logger(), "Using %d threads for parallel processing", num_threads_);
         RCLCPP_INFO(this->get_logger(), "Using %d nearest neighbor points for matching", num_match_points_);
@@ -147,7 +159,21 @@ public:
     on_activate(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Activating RESPLE...");
-        
+
+        // Refuse to overwrite a still-joinable worker thread. Lifecycle
+        // normally enforces deactivate-before-activate, but a failed
+        // transition or external lifecycle client can land us here while the
+        // previous processing_thread_ is still alive; the assignment below
+        // would invoke std::terminate (move-onto-joinable-thread). Fail the
+        // transition cleanly instead.
+        if (processing_thread_.joinable()) {
+            RCLCPP_ERROR(this->get_logger(),
+                "on_activate called while a previous worker thread is still joinable; "
+                "refusing to overwrite (would call std::terminate). "
+                "Deactivate first.");
+            return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::FAILURE;
+        }
+
         // Activate publishers
         pub_est->on_activate();
         pub_start_time->on_activate();
@@ -168,8 +194,15 @@ public:
         sub_imu = this->create_subscription<sensor_msgs::msg::Imu>(
             imu_type, imu_qos, std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1), sensor_sub_opt);
         
-        auto lidar_names = this->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
-        assert(this->get_parameter("lidars", lidar_names));
+        // Guard with has_parameter so re-activate (after deactivate) doesn't
+        // throw ParameterAlreadyDeclaredException → SIGABRT.
+        std::vector<std::string> lidar_names;
+        if (!this->has_parameter("lidars")) {
+            lidar_names = this->declare_parameter<std::vector<std::string>>(
+                "lidars", std::vector<std::string>());
+        } else {
+            lidar_names = this->get_parameter("lidars").as_string_array();
+        }
         if (lidar_names.empty()) {
             LidarConfig lidar(this->get_node_parameters_interface(), "");
             lidars.emplace(lidar.type, lidar);
@@ -254,7 +287,18 @@ public:
         sub_livox_avia.reset();
         sub_hesai.reset();
         sub_livox_mid360_boxi.reset();
-        
+
+        // Drain any in-flight callbacks before on_cleanup tears down lidars_data
+        // / m_buff state. Subscription::reset() drops the application's strong
+        // ref but the executor still holds one for any callback already in
+        // flight on another thread (sensor_cb_group is MutuallyExclusive, so at
+        // most one). Without this barrier, on_cleanup's lidars_data.clear()
+        // can deallocate a LidarData while a callback is mid-execution holding
+        // a reference to its mtx_pc → SIGSEGV. 100 ms is generous: a single
+        // callback completes in ~1 ms on this hardware. This is a temporary
+        // fix until rclcpp exposes a callback-group wait_for API in Jazzy.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
         RCLCPP_INFO(this->get_logger(), "RESPLE deactivated successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
@@ -290,7 +334,17 @@ public:
         pub_odom.reset();
         pub_cur_scan.reset();
         br.reset();
-        
+
+        // Reset action server: created in on_configure, must be released so a
+        // re-configure cycle doesn't orphan the original (and re-creation
+        // doesn't conflict on the same goal namespace).
+        save_map_action_server_.reset();
+
+        // Reset TF buffer/listener: created in on_configure with the node clock.
+        // Holding them across cleanup pins the listener thread.
+        tf_listener_.reset();
+        tf_buffer_.reset();
+
         RCLCPP_INFO(this->get_logger(), "RESPLE cleaned up successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
@@ -351,7 +405,21 @@ public:
             }            
             // Drain IMU buffer: always during init (gravity alignment needs it),
             // and during ongoing processing in LIO mode.
-            if ((!if_lidar_only || !if_init_filter) && !imu_int_buff.empty()) {
+            //
+            // The empty()-check used to read imu_int_buff without m_buff,
+            // racing with getImuCallback's push_back on the deque internals
+            // (a real data race that TSan flags). Take m_buff briefly to
+            // snapshot the size, then re-acquire it for the swap. Splitting
+            // the locks (instead of holding one across the whole block) keeps
+            // the IMU callback latency bounded — drains of large buffers don't
+            // block the next IMU push.
+            bool drain_imu = false;
+            {
+                std::lock_guard<std::mutex> lock(m_buff);
+                drain_imu = (!if_lidar_only.load() || !if_init_filter.load())
+                            && !imu_int_buff.empty();
+            }
+            if (drain_imu) {
                 Eigen::aligned_vector<sensor_msgs::msg::Imu::SharedPtr> imu_buff_msg;
                 {
                     std::lock_guard<std::mutex> lock(m_buff);
@@ -617,8 +685,13 @@ private:
     double cube_len = 2000; 
     const float MOV_THRESHOLD = 1.5f;
     float det_range = 100.0;
-    bool if_init_map = false;
-    bool localmap_initialized_ = false;
+    // Atomic so cross-thread reads (worker, async map-update lambda, IMU
+    // callback, lidar callbacks) are not data races. All write sites already
+    // happen under one of the existing mutexes; making these atomic only
+    // removes the bare-bool unsynchronized reads. Implicit conversion +
+    // assignment lets the rest of the code stay unchanged.
+    std::atomic<bool> if_init_map{false};
+    std::atomic<bool> localmap_initialized_{false};
     struct LidarData {
         Eigen::aligned_deque<Eigen::aligned_vector<pcl::PointXYZINormal>> pc_buff;
         std::deque<int64_t> t_buff;
@@ -629,7 +702,10 @@ private:
     std::map<std::string, LidarData> lidars_data;    
     Eigen::aligned_deque<PointData> pt_meas;    
 
-    bool if_lidar_only;
+    // Atomic: worker reads this in processData without m_buff. Set once during
+    // readParameters() (configure phase) and not again, but the read race is
+    // still a race; atomic resolves it cheaply.
+    std::atomic<bool> if_lidar_only{false};
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu;
     Eigen::aligned_deque<ImuData> imu_buff;
     Eigen::aligned_deque<ImuData> imu_meas;
@@ -668,7 +744,11 @@ private:
     Eigen::Vector<double, 6> cov_pose;        
     Eigen::Vector3d gravity;
 
-    bool if_init_filter = false;
+    // Atomic: written under m_buff (initialization), read without m_buff
+    // (worker's processData drain decision and initialization()'s early-return).
+    // The write site at initialization() keeps m_buff because the IMU callback
+    // depends on a coherent flip with imu_int_buff state — see comment there.
+    std::atomic<bool> if_init_filter{false};
     Estimator<24> estimator_lo;
     Estimator<30> estimator_lio;
     SplineState* spline;
@@ -1012,6 +1092,7 @@ private:
     
     void getImuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg)
     {
+      try {
         // Snapshot both flags ONCE under m_buff so they can't flip mid-callback.
         // Previously we double-checked if_init_filter — first unlocked, then
         // under the lock — and in LO mode the worker could flip if_init_filter
@@ -1054,8 +1135,12 @@ private:
             // Transform not yet available — pass through (assumes IMU already in base_link frame)
             imu_int_buff.push_back(imu_msg);
         }
+      } catch (const std::exception& e) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+              "[RESPLE] getImuCallback exception: %s", e.what());
+      }
     }
-    
+
     // Diagnostic updater callback
     void updateDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& stat)
     {
@@ -1154,6 +1239,11 @@ private:
     template<typename T>
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
     {
+        // Wrap entire body: lidars.at()/lidars_data.at() throw std::out_of_range
+        // for an unexpected frame, which propagates through the executor to
+        // std::terminate → SIGABRT. PCL/TF calls can also throw. Convert to a
+        // throttled warning so a single bad message can't take the node down.
+        try {
         // Find the Ouster lidar config
         std::string name = "Ouster";
         if (lidars.find(name) == lidars.end()) {
@@ -1208,10 +1298,15 @@ private:
             lidar_buffs.t_buff.push_back(time_begin);
         }
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] ousterLidarCallback exception: %s", e.what());
+        }
     }
 
     void livoxLidarCallback(const livox_ros_driver::msg::CustomMsg::SharedPtr livox_msg_in)
     {
+        try {
         std::string name = "Mid70Avia";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1264,10 +1359,15 @@ private:
             lidar_buffs.t_buff.push_back(time_begin);
         }
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] livoxLidarCallback exception: %s", e.what());
+        }
     }
 
     void livoxLidar2Callback(const livox_ros_driver2::msg::CustomMsg::SharedPtr livox_msg_in)
     {
+        try {
         std::string name = "HAP360";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1319,10 +1419,15 @@ private:
             lidar_buffs.t_buff.push_back(time_begin);
         }
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] livoxLidar2Callback exception: %s", e.what());
+        }
     }
 
      void livoxAVIACallback(const livox_interfaces::msg::CustomMsg::SharedPtr livox_msg_in)
      {
+        try {
         std::string name = "AviaResple";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1375,10 +1480,15 @@ private:
             lidar_buffs.t_buff.push_back(time_begin);
         }
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] livoxAVIACallback exception: %s", e.what());
+        }
      }
 
     void hesaiLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr hesai_msg_in)
 	{
+        try {
         std::string name = "Hesai";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1426,10 +1536,15 @@ private:
             lidar_buffs_hesai.t_buff.push_back(time_begin);
         }
         lidar_buffs_hesai.last_t_ns.store(time_begin + max_ofs_ns);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] hesaiLidarCallback exception: %s", e.what());
+        }
 	}
 
     void livoxMid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
 	{
+        try {
         std::string name = "Mid360Boxi";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1475,6 +1590,10 @@ private:
             lidar_buffs_boxi.t_buff.push_back(time_begin);
         }
         lidar_buffs_boxi.last_t_ns.store(time_begin + max_ofs_ns);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] livoxMid360BoxiCallback exception: %s", e.what());
+        }
 	}
 
     void publishFrameWorld(pcl::PointCloud<pcl::PointXYZINormal>& pc)
@@ -1805,11 +1924,18 @@ private:
 
     Eigen::Vector3d getPositionLiDAR(int64_t t_ns, const Eigen::Vector3d& t_bl)
     {
-        if (if_lidar_only) {
-            estimator_lo.propRCP(t_ns);
-        } else {
-            estimator_lio.propRCP(t_ns);
-        }
+        // Pure read: interpolate position+orientation at t_ns and project the
+        // LiDAR mount offset.
+        //
+        // Previously this called propRCP(t_ns), which mutates Estimator::cov_rcp
+        // (adds cov_sys) and may extend the spline. The only caller is
+        // lasermapFovSegment, which always passes spline->maxTimeNs() — so the
+        // spline never grew, but cov_rcp got bumped on every map-update tick,
+        // and the mutation happened from the async map-update lambda WITHOUT
+        // holding spline_mutex_ (only mtx_map_ unique). It happened to be
+        // race-free because the IEKF needs mtx_map_ shared and so was blocked,
+        // but the implicit contract was fragile. Removing the side effect
+        // makes the lock discipline correct: this function is now const-like.
         Eigen::Quaterniond orient_interp;
         Eigen::Vector3d t_interp = spline->itpPosition(t_ns);
         spline->itpQuaternion(t_ns, &orient_interp);

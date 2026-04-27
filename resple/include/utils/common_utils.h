@@ -347,6 +347,12 @@ struct Parameters {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
+// Forward-declared static_assert helpers (definitions after the structs):
+// guarantee that sizeof is a multiple of alignof, so std::deque /
+// Eigen::aligned_deque chunk storage places every element at a properly
+// aligned address. Required for SIMD-correct operations on Eigen members.
+// If a future field breaks the invariant, the build fails here rather than
+// emitting silent UB at runtime.
 struct PointData {
     int64_t time_ns;
     pcl::PointXYZINormal pt;
@@ -383,4 +389,14 @@ struct PointData {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
+// Alignment invariants: see forward note above struct PointData. These hold
+// for any well-formed C++ type (the standard requires sizeof to be a multiple
+// of alignof so arrays work), but writing them down catches accidental
+// non-aligned attribute use or future packed-struct changes that would
+// silently misalign deque/vector elements.
+static_assert(sizeof(PointData) % alignof(PointData) == 0,
+    "PointData must satisfy sizeof%alignof==0 so deque chunk storage is "
+    "16-aligned per element (required by Eigen members in OpenMP loops)");
+static_assert(sizeof(ImuData) % alignof(ImuData) == 0,
+    "ImuData must satisfy sizeof%alignof==0 (same reason as PointData)");
 

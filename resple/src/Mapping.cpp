@@ -720,7 +720,17 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         // Reset subscriptions
         sub_start.reset();
         sub_est.reset();
-        
+
+        // Clear init flag so a re-activation starts in the unitialized state.
+        // Worker is joined; safe to write without ordering concerns.
+        if_init_succeed.store(false, std::memory_order_relaxed);
+
+        // Drain in-flight callbacks before on_cleanup tears down related state.
+        // Mirror of the RESPLE on_deactivate barrier; same rationale (rclcpp
+        // Subscription::reset() does not synchronize with executor-dispatched
+        // callbacks).
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
         RCLCPP_INFO(this->get_logger(), "Mapping deactivated successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
@@ -760,17 +770,25 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
 
-    void lock_mappings() {
-        for (auto vis_map : vis_maps) {
-            vis_map->mtx.lock();
+    // RAII helper: locks every per-map mtx on construction, releases them on
+    // destruction (in reverse order). Replaces the prior lock_mappings() /
+    // unlock_mappings() pair, which leaked locks if anything between them
+    // threw — next iteration would deadlock on its own mtx_pc.acquire().
+    class ScopedMappingsLock {
+    public:
+        explicit ScopedMappingsLock(std::vector<MappingBase<pcl::PointXYZINormal>*>& maps)
+            : maps_(maps)
+        {
+            for (auto* m : maps_) m->mtx.lock();
         }
-    }
-
-    void unlock_mappings() {
-        for (auto vis_map : vis_maps) {
-            vis_map->mtx.unlock();
+        ~ScopedMappingsLock() {
+            for (auto it = maps_.rbegin(); it != maps_.rend(); ++it) (*it)->mtx.unlock();
         }
-    }
+        ScopedMappingsLock(const ScopedMappingsLock&) = delete;
+        ScopedMappingsLock& operator=(const ScopedMappingsLock&) = delete;
+    private:
+        std::vector<MappingBase<pcl::PointXYZINormal>*>& maps_;
+    };
 
     void process() {
         // RCLCPP_INFO(this->get_logger(), "process");
@@ -781,23 +799,27 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             if (spline_pending_ready_.load()) {
                 std::lock_guard<std::mutex> lock(m_spline);
                 if (spline_pending_ready_.load()) {
-                    lock_mappings();
+                    ScopedMappingsLock maps_lock(vis_maps);
                     spl_window_st_ns = spl_window_st_ns_pending_;
                     spline_active_.setTimeIntervalNs(spline_pending_.getKnotTimeIntervalNs());
                     spline_active_.updateKnots(&spline_pending_);
                     spline_pending_ready_.store(false);
-                    unlock_mappings();
                 }
             }
-            if (if_init_succeed && spline_active_.numKnots() > num_knot) {
-                lock_mappings();
+            // Acquire-load on if_init_succeed so the startCallBack init()
+            // writes (release-store on the flag) are visible before we read
+            // spline_active_'s state. After this gate, all subsequent reads
+            // happen on the same worker thread as the swap above, so they
+            // are single-threaded with respect to spline_active_ mutation —
+            // no further m_spline coverage needed for steady state.
+            if (if_init_succeed.load(std::memory_order_acquire) && spline_active_.numKnots() > num_knot) {
+                ScopedMappingsLock maps_lock(vis_maps);
                 publishPath();
                 displayControlPoints();
                 pubOdom();
                 num_knot = spline_active_.numKnots();
-                unlock_mappings();
             }
-            if (!if_init_succeed) {
+            if (!if_init_succeed.load(std::memory_order_acquire)) {
                 if (rclcpp::ok()) {
                     rate.sleep();
                 }
@@ -840,7 +862,12 @@ private:
     Eigen::Vector<double, 6> cov_twist;
     bool publish_tf, invert_tf;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
-    bool if_init_succeed = false;
+    // Atomic so process() (worker thread) reads the flag without racing with
+    // startCallBack (executor thread) writing it. The store in startCallBack
+    // happens AFTER spline_active_.init(); using release ordering on the
+    // store + acquire on the loads ensures the worker observes the fully
+    // initialized spline_active_ when it sees the flag true.
+    std::atomic<bool> if_init_succeed{false};
     int64_t path_t_ns_ = 0;
     std::mutex m_spline;
 
@@ -1033,9 +1060,17 @@ private:
 
     void startCallBack(const std_msgs::msg::Int64::SharedPtr start_time_msg)
     {
+        // Init under m_spline so a concurrent process() iteration that's
+        // mid-swap (lock_guard<mutex>(m_spline)) can't observe a partially
+        // constructed spline_active_. The release-store on if_init_succeed
+        // pairs with process()'s acquire-load to guarantee the init writes
+        // are visible.
         int64_t bag_start_time = start_time_msg->data;
-        spline_active_.init(1, 0, bag_start_time, 0);  // dt=1 placeholder; overridden by getEstCallback
-        if_init_succeed = true;
+        {
+            std::lock_guard<std::mutex> lock(m_spline);
+            spline_active_.init(1, 0, bag_start_time, 0);  // dt=1 placeholder; overridden by getEstCallback
+        }
+        if_init_succeed.store(true, std::memory_order_release);
     }
 
     void publishPath() {

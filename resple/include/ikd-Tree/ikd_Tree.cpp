@@ -401,11 +401,14 @@ void KD_TREE<PointType>::Nearest_Search(PointType point, int k_nearest, PointVec
 {
     MANUAL_HEAP q(2 * k_nearest);
     q.clear();
-    if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
-    {
-        Search(Root_Node, k_nearest, point, q, max_dist);
-    }
-    else
+    // Always take search_rw_mutex_ shared. The previous fast-path checked
+    // `Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node` lock-free, but the
+    // background rebuild thread can NULL Rebuild_Ptr and swap a subtree
+    // (multi_thread_rebuild → unique_lock at lines 259/293) at any instant —
+    // a Search that started after the racy check sees freed nodes → UAF →
+    // SIGSEGV. The shared lock is uncontended unless the rebuild thread is
+    // actively holding the unique lock (only briefly during the swap), so
+    // this costs a relaxed atomic increment per call. Worth it.
     {
         std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
         Search(Root_Node, k_nearest, point, q, max_dist);

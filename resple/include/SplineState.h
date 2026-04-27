@@ -374,6 +374,20 @@ class SplineState
                  Eigen::Vector3d* p_out, Jacobian* J_p,
                  Eigen::Quaterniond* q_out, Jacobian43* J_q) const
     {
+        // Defensive clamp: callers should not query outside [minTimeNs, maxTimeNs],
+        // but if t_ns overshoots maxTimeNs() then idx_l > num_knot-2, and
+        // t_knots[idx0 + i] / ort_delta[idx0 + i] / q_knots[idx0-1] below
+        // OOB-read the deque → SIGSEGV. Clamping here yields a degraded but
+        // numerically defined boundary evaluation. Association::pointBodyToWorld
+        // is the primary upstream clamp; this one is belt-and-braces.
+        const int64_t t_min = minTimeNs();
+        const int64_t t_max = maxTimeNs();
+        if (t_ns < t_min || t_ns > t_max) {
+            RESPLE_LOG_INVARIANT_ONCE("itpPose t_ns=" << t_ns << " outside ["
+                << t_min << "," << t_max << "] (num_knot=" << num_knot
+                << "); clamping to spline range");
+            t_ns = std::max(t_min, std::min(t_max, t_ns));
+        }
         int64_t t_ns_rel = t_ns - start_t_ns;
         int idx_l = floor(double(t_ns_rel) / double(dt_ns));
         int idx_r = idx_l + 1;
@@ -567,6 +581,17 @@ class SplineState
                               const Eigen::aligned_deque<_KnotT>& knots, int64_t& idx0, double& u,
                               std::array<_KnotT,4>& cps, int& idx_r) const
     {
+        // Defensive clamp (mirrors itpPose). Without this, an out-of-range
+        // t_ns lets idx_l + 2 exceed num_knot, OOB-reading the deque at
+        // knots[idx0 + i]. Clamping yields a boundary evaluation instead.
+        const int64_t t_min = minTimeNs();
+        const int64_t t_max = maxTimeNs();
+        if (t_ns < t_min || t_ns > t_max) {
+            RESPLE_LOG_INVARIANT_ONCE("prepareInterpolation t_ns=" << t_ns << " outside ["
+                << t_min << "," << t_max << "] (num_knot=" << num_knot
+                << "); clamping to spline range");
+            t_ns = std::max(t_min, std::min(t_max, t_ns));
+        }
         int64_t t_ns_rel = t_ns - start_t_ns;
         int idx_l = floor(double(t_ns_rel) / double(dt_ns));
         idx_r = idx_l + 1;
@@ -576,7 +601,13 @@ class SplineState
             cps[i] = knots_idle[i + idx_l + 1];
         }
         int idx_window = std::max(0, 2 - idx_l);
-        for (int i = 0; i < std::min(idx_l + 2, 4); i++) {
+        // Defensive: cap n_active so idx0 + i cannot exceed num_knot, in case
+        // the upstream clamp is bypassed (e.g. by a future caller that holds
+        // a stale t_ns across a deque shrink). knots.size() == num_knot.
+        const int n_active_safe =
+            std::min<int>(std::min(idx_l + 2, 4),
+                          std::max<int>(0, static_cast<int>(knots.size()) - static_cast<int>(idx0)));
+        for (int i = 0; i < n_active_safe; i++) {
             cps[i + idx_window] = knots[idx0 + i];
         }
         u = (t_ns - start_t_ns - idx_l * dt_ns) / double(dt_ns);
