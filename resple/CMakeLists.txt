@@ -12,6 +12,25 @@ option(ENABLE_CUDA "Enable CUDA k-NN acceleration (requires nvcc)" OFF)
 # then run a bag under TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1.
 option(ENABLE_TSAN "Enable ThreadSanitizer (mutually exclusive with ASan)" OFF)
 option(ENABLE_ASAN "Enable AddressSanitizer + UndefinedBehaviorSanitizer (mutually exclusive with TSan)" OFF)
+# Debug-O0 build: -O0 -g, no native arch, no fast-math. Use when chasing
+# heap corruption / SIGSEGV in __libc_free where -O3 inlining hides the
+# real source line. Mutually exclusive with sanitizers (which set their
+# own opt level). At -O0 the worker loop is too slow to keep up with
+# 10 Hz scans — the async map-update lambda runs longer than 100 ms,
+# the next worker cycle blocks on map_update_future_.wait() forever, and
+# /localization/resple/odometry stops publishing. Use only for diagnosis.
+option(ENABLE_DEBUG_O0 "Build with -O0 -g for crash-line resolution" OFF)
+# Debug-O1 build: -O1 -g, no native arch. Enables basic optimizations
+# (constant fold, simple inline of trivial getters) but skips vectorization,
+# loop unrolling, and strict-aliasing assumptions — the most common
+# UB-triggering optimizations. Used as a "safe enough" runtime when -O3
+# crashes due to UB and -O0 is too slow to meet realtime deadlines.
+option(ENABLE_DEBUG_O1 "Build with -O1 -g (UB-safe but near-release perf)" OFF)
+# Debug-O3G build: -O3 -g3, full optimization with debug info. Use to keep
+# the bug reproducing while also getting addr2line to resolve the exact
+# source line. The crashing offset is at -O3 inlining boundaries; -g3
+# preserves the symbol→line mapping inside inlined code.
+option(ENABLE_DEBUG_O3G "Build with -O3 -g3 (production-speed crash with line numbers)" OFF)
 if(ENABLE_TSAN AND ENABLE_ASAN)
 	message(FATAL_ERROR "resple: ENABLE_TSAN and ENABLE_ASAN are mutually exclusive")
 endif()
@@ -99,6 +118,34 @@ target_include_directories(${PROJECT_NAME}
 		${PCL_INCLUDE_DIRS}
 )
 
+# 2026-05-01 Eigen aligned-allocator ABI fix.
+#
+# Production SIGSEGV (reproducible at -O3, addr2line resolved):
+#   __libc_free  ←  Eigen::internal::handmade_aligned_free  (Memory.h:118)
+#                ←  Eigen::internal::aligned_free            (Memory.h:206)
+#                ←  Eigen::aligned_allocator::deallocate     (Memory.h:921)
+#                ←  std::vector<PointXYZINormal,
+#                              Eigen::aligned_allocator>::~vector()
+#                ←  KD_TREE::Add_Points  (ikd_Tree.cpp:485, the
+#                              `PointVector().swap(Downsample_Storage)` site)
+#
+# The free is dispatching through `handmade_aligned_free`, which assumes the
+# pointer was returned by `handmade_aligned_malloc` and reads `ptr - sizeof(void*)`
+# to recover the original malloc'd address. If allocation went through a
+# different Eigen path (posix_memalign, _mm_malloc) — which can happen due to
+# per-TU preprocessor inconsistency in Eigen's allocator selection — the
+# bytes before `ptr` are garbage and `std::free(garbage)` faults.
+#
+# Pin both selectors PUBLIC so every TU that pulls in our headers (resple
+# library + RESPLE/Mapping executables) sees the same Eigen allocator
+# dispatch. EIGEN_HAS_POSIX_MEMALIGN=1 forces the malloc/free pair onto
+# posix_memalign + std::free (matching, ABI-stable). EIGEN_HAS_MM_MALLOC=0
+# disables the SSE intrinsic alternative so it can't be picked instead.
+target_compile_definitions(${PROJECT_NAME} PUBLIC
+	EIGEN_HAS_POSIX_MEMALIGN=1
+	EIGEN_HAS_MM_MALLOC=0
+)
+
 # Enforce C++17 and apply optimization flags to the library target
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 # Warning set matches the workspace's colcon_defaults where practical. -Wshadow
@@ -131,6 +178,30 @@ elseif(ENABLE_ASAN)
 	set(RESPLE_OPT_FLAGS -O1 -g -fno-omit-frame-pointer)
 	set(RESPLE_SAN_FLAGS -fsanitize=address -fsanitize=undefined)
 	message(STATUS "resple: AddressSanitizer + UBSan enabled; optimizations reduced to -O1")
+elseif(ENABLE_DEBUG_O0)
+	# -O0 keeps every line on its own; -g3 emits maximum debug info so
+	# addr2line resolves source line numbers cleanly. Drop -march=native
+	# to remove SIMD-induced inlining variance.
+	set(RESPLE_OPT_FLAGS -O0 -g3 -fno-omit-frame-pointer)
+	message(STATUS "resple: Debug-O0 build for crash-line resolution")
+elseif(ENABLE_DEBUG_O1)
+	# Basic optimization, no aggressive transforms. -fno-strict-aliasing
+	# disables type-based alias analysis (a common UB-trigger if any code
+	# punning is happening). -fno-tree-vectorize disables auto-vectorization
+	# (the other common UB-trigger when code reads/writes via mismatched
+	# alignment). Result: closer to release perf than -O0 but with the two
+	# UB-exposing classes of optimization disabled.
+	set(RESPLE_OPT_FLAGS -O1 -g -fno-omit-frame-pointer
+	                     -fno-strict-aliasing -fno-tree-vectorize)
+	message(STATUS "resple: Debug-O1 build (UB-safe but near-release perf)")
+elseif(ENABLE_DEBUG_O3G)
+	# Production-speed binary WITH debug info. Same -O3 inlining/vectorization
+	# that triggers the production SIGSEGV is preserved, but -g3 emits the
+	# debug info needed for addr2line to resolve the exact source line at
+	# Add_Points + 0xNNN. Use this when you need to localize a -O3-only crash
+	# without changing optimization level.
+	set(RESPLE_OPT_FLAGS -O3 -g3 -fno-omit-frame-pointer)
+	message(STATUS "resple: -O3 -g3 build for crash-line resolution at production speed")
 elseif(ENABLE_NATIVE_ARCH)
 	set(RESPLE_OPT_FLAGS -O3 -march=native)
 else()

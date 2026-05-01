@@ -3,6 +3,7 @@
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <lifecycle_msgs/msg/transition.hpp>
+#include <lifecycle_msgs/msg/state.hpp>
 #include <std_msgs/msg/int64.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -378,6 +379,17 @@ public:
         int64_t max_spl_knots = 0;
         int64_t t_last_map_upd = 0;
         while (processing_active_ && rclcpp::ok()) {
+            // Wrap each iteration in try/catch. Without this, an exception
+            // anywhere in the IEKF / collect / deskew / map-update code path
+            // unwinds out of the worker thread, terminating it silently. The
+            // node then looks "alive but doing nothing": no /odometry
+            // publishes, no logs, no crash banner, just stalled. With the
+            // wrap, a single bad iteration is logged (throttled, since the
+            // root cause likely repeats every cycle) and the worker proceeds
+            // to the next scan. This is defense-in-depth — not a replacement
+            // for fixing root causes, but ensures the node degrades visibly
+            // rather than silently.
+            try {
             for (auto& [lidar_name, lidar_data] : lidars_data) {
                 while (!lidar_data.t_buff.empty()) {
                     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame(new pcl::PointCloud<pcl::PointXYZINormal>());
@@ -542,8 +554,34 @@ public:
                     // Wait for any prior async map update before swapping buffers.
                     // Gated on map_update_pending_ so the worker never reads the
                     // future until a prior launch was observed here.
+                    //
+                    // Use wait_for with a generous timeout instead of plain wait().
+                    // If the lambda hangs (slow build, blocking I/O in PCL, kd-tree
+                    // pathological case), plain wait() permanently locks the worker:
+                    // no further IEKF cycles, no /localization/resple/odometry
+                    // publishes, node looks alive but is silent. Skipping this map
+                    // update cycle is the safer failure mode — the next cycle
+                    // re-checks pending and will either wait again (lambda made
+                    // progress) or skip again (still hung), keeping the worker
+                    // responsive to shutdown signals at minimum. 5 seconds is well
+                    // above the worst-case observed lambda duration (~150 ms at -O3
+                    // on a well-loaded sim) but still bounded.
                     if (map_update_pending_.load(std::memory_order_acquire)) {
-                        map_update_future_.wait();
+                        if (map_update_future_.wait_for(std::chrono::seconds(5))
+                            == std::future_status::timeout) {
+                            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                "[RESPLE] async map update did not complete within 5s; "
+                                "skipping this cycle's map update. Worker remains responsive. "
+                                "If this fires repeatedly, the lambda is hung "
+                                "(check for kd-tree infinite loop or PCL blocking I/O).");
+                            // Bail out of the map-update branch entirely: do NOT swap
+                            // buffers (the prior lambda still owns pc_world_bg_) and
+                            // do NOT launch a new lambda (we'd leak the future-shared-
+                            // state when the next assignment overwrites the still-
+                            // running one). Continue accumulating in pc_world for
+                            // next cycle.
+                            continue;
+                        }
                     }
                     pc_world_bg_.points.swap(pc_world.points);
                     accum_nearest_points_bg_.swap(accum_nearest_points);
@@ -564,22 +602,47 @@ public:
                     // finished.
                     map_update_pending_.store(true, std::memory_order_release);
                     map_update_future_ = std::async(std::launch::async, [this]() {
-                        {
-                            std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
-                            mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
-                            lasermapFovSegment();
+                        // Wrap the entire body. Any throw here (PCL OOM,
+                        // pub_*->publish failure on a torn-down lifecycle
+                        // publisher, kd-tree internal exception) would
+                        // otherwise:
+                        //   (a) leave map_update_pending_ stuck at true →
+                        //       every subsequent processData cycle blocks on
+                        //       the (already-completed) future.wait();
+                        //   (b) be silently captured by the future and dropped
+                        //       by the destructor when the next cycle assigns
+                        //       a new future to map_update_future_.
+                        // Net effect: silent stop of map updates → kd-tree
+                        // goes stale → IEKF k-NN starts returning bad neighbors
+                        // → NaN cov / divergence / SIGSEGV downstream.
+                        // Catch, log, and clear the pending flag so the next
+                        // cycle proceeds cleanly.
+                        try {
+                            {
+                                std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
+                                mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
+                                lasermapFovSegment();
 #ifdef RESPLE_USE_CUDA
-                            ikdtree.PCL_Storage.clear();
-                            ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
-                            g_cuda_map.update(ikdtree.PCL_Storage.data(), ikdtree.PCL_Storage.size());
+                                ikdtree.PCL_Storage.clear();
+                                ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
+                                g_cuda_map.update(ikdtree.PCL_Storage.data(), ikdtree.PCL_Storage.size());
 #endif
-                        }
-                        // publishFrameWorld only touches the spline; guard it
-                        // with spline_mutex_ rather than the (released) map
-                        // lock so IEKF can proceed in parallel with the publish.
-                        {
-                            std::lock_guard<std::mutex> spline_lock(spline_mutex_);
-                            publishFrameWorld(pc_world_bg_);
+                            }
+                            // publishFrameWorld only touches the spline; guard it
+                            // with spline_mutex_ rather than the (released) map
+                            // lock so IEKF can proceed in parallel with the publish.
+                            {
+                                std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                                publishFrameWorld(pc_world_bg_);
+                            }
+                        } catch (const std::exception& e) {
+                            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                "[RESPLE] async map update threw: %s. Map this cycle dropped; "
+                                "next cycle will proceed.", e.what());
+                        } catch (...) {
+                            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                "[RESPLE] async map update threw unknown exception type. "
+                                "Map this cycle dropped; next cycle will proceed.");
                         }
                         map_update_pending_.store(false, std::memory_order_release);
                     });
@@ -597,6 +660,19 @@ public:
                     diagnostics_.force_update();
                     last_process_time_ = this->now();
                 }
+            }
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] processData iteration threw: %s. Worker continues. "
+                    "If this fires repeatedly, the underlying bug needs fixing — "
+                    "this catch only prevents silent worker-thread death.", e.what());
+                // Brief sleep so we don't tight-loop if the throw fires every cycle.
+                if (rclcpp::ok()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } catch (...) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] processData iteration threw unknown exception type. "
+                    "Worker continues.");
+                if (rclcpp::ok()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         }
     }
@@ -1314,7 +1390,12 @@ private:
 
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         int plsize = livox_msg_in->point_num;
-        if (plsize == 0) return;
+        // Belt-and-braces: gate on the actual vector size, not just the
+        // point_num field. A misbehaving publisher (or transport corruption)
+        // can ship point_num > 0 with an empty points vector → points[0]
+        // below would be OOB. Doesn't affect Ouster (we don't take this
+        // callback path), but is a real fix for the Livox variants.
+        if (plsize == 0 || livox_msg_in->points.empty()) return;
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
         LidarData& lidar_buffs = lidars_data.at(name);
@@ -1375,7 +1456,12 @@ private:
 
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         int plsize = livox_msg_in->point_num;
-        if (plsize == 0) return;
+        // Belt-and-braces: gate on the actual vector size, not just the
+        // point_num field. A misbehaving publisher (or transport corruption)
+        // can ship point_num > 0 with an empty points vector → points[0]
+        // below would be OOB. Doesn't affect Ouster (we don't take this
+        // callback path), but is a real fix for the Livox variants.
+        if (plsize == 0 || livox_msg_in->points.empty()) return;
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
         LidarData& lidar_buffs = lidars_data.at(name);
@@ -1435,7 +1521,12 @@ private:
 
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         int plsize = livox_msg_in->point_num;
-        if (plsize == 0) return;
+        // Belt-and-braces: gate on the actual vector size, not just the
+        // point_num field. A misbehaving publisher (or transport corruption)
+        // can ship point_num > 0 with an empty points vector → points[0]
+        // below would be OOB. Doesn't affect Ouster (we don't take this
+        // callback path), but is a real fix for the Livox variants.
+        if (plsize == 0 || livox_msg_in->points.empty()) return;
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
         LidarData& lidar_buffs = lidars_data.at(name);
@@ -1948,8 +2039,12 @@ private:
         cub_needrm.shrink_to_fit();
         Eigen::Vector3d pos_lidar_min(std::numeric_limits<double>::max(), std::numeric_limits<double>::max(),
             std::numeric_limits<double>::max());
-        Eigen::Vector3d pos_lidar_max(std::numeric_limits<double>::min(), std::numeric_limits<double>::min(),
-                std::numeric_limits<double>::min());
+        // lowest(), not min(): numeric_limits<double>::min() is the smallest
+        // POSITIVE normal (~2.2e-308), not the most negative double. With
+        // min() the .max() reduction below silently fails for any pos with
+        // negative components, biasing the local-map cube ~500m off-axis.
+        Eigen::Vector3d pos_lidar_max(std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(),
+                std::numeric_limits<double>::lowest());
         for (const auto& [lidar_name, lidar] : lidars) {
             Eigen::Vector3d pos_lidar = getPositionLiDAR(spline->maxTimeNs(), lidar.t_bl);
             pos_lidar_min = pos_lidar_min.array().min(pos_lidar.array()).matrix();
@@ -2005,8 +2100,22 @@ private:
         int feats_down_size = pc.points.size();
         PointToAdd.reserve(feats_down_size);
         PointNoNeedDownsample.reserve(feats_down_size);
+        // Defense: count non-finite (NaN/Inf) points encountered. ikd-Tree's
+        // Add_by_point recursion uses calc_dist (Euclidean diff) and compares
+        // with `<` against zero/threshold. If a coordinate is NaN, every
+        // comparison is false, the recursion takes the wrong branch each
+        // level, and downsample-mid-point math (floor(x/ds)*ds) yields NaN —
+        // which then writes NaN into the tree's bbox and into Downsample
+        // results. From there, Search_by_range's bbox checks all return
+        // false, and tree state degrades silently. Skip non-finite points
+        // upstream of the kd-tree; surface a counter so the operator sees it.
+        size_t nan_skipped = 0;
         for(int i = 0; i < feats_down_size; i++) {
             const pcl::PointXYZINormal& point = pc.points[i];
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+                ++nan_skipped;
+                continue;
+            }
             if (!nearest_pts[i].empty()) {
                 const Eigen::aligned_vector<pcl::PointXYZINormal> &points_near = nearest_pts[i];
                 bool need_add = true;
@@ -2029,6 +2138,13 @@ private:
             } else {
                 PointNoNeedDownsample.emplace_back(point);
             }
+        }
+        if (nan_skipped > 0) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] mapIncremental: skipped %zu non-finite point(s) this scan. "
+                "Most often a sign of bad spline-extrapolation in pointBodyToWorld; "
+                "check Association::out_of_range_queries_ counter and DLIO/Ouster timestamps.",
+                nan_skipped);
         }
         // Caller (async map task) holds mtx_map_ unique_lock.
         ikdtree.Add_Points(PointToAdd, true);
@@ -2090,13 +2206,41 @@ int main(int argc, char *argv[])
     auto node = std::make_shared<RESPLE>(options);
     RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE LifecycleNode created");
 
-    // Transition to configured state
-    node->configure();
-    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE configured");
-    
+    // Transition to configured state. Wrap each lifecycle call so an exception
+    // thrown inside on_configure/on_activate is logged here instead of
+    // propagating to terminate (where the crash handler prints a backtrace
+    // but the user has no clue WHY it threw).
+    {
+        auto state = node->configure();
+        const auto label = state.label();
+        RCLCPP_INFO_STREAM(node->get_logger(),
+            "RESPLE configure() returned id=" << static_cast<int>(state.id())
+            << " label=" << label);
+        if (state.id() != lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+            RCLCPP_FATAL_STREAM(node->get_logger(),
+                "RESPLE configure() failed (state=" << label
+                << "); refusing to activate. Exiting non-zero.");
+            rclcpp::shutdown();
+            return 2;
+        }
+    }
+
     // Transition to active state (starts processing)
-    node->activate();
-    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE activated - processing started");
+    {
+        auto state = node->activate();
+        const auto label = state.label();
+        RCLCPP_INFO_STREAM(node->get_logger(),
+            "RESPLE activate() returned id=" << static_cast<int>(state.id())
+            << " label=" << label);
+        if (state.id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+            RCLCPP_FATAL_STREAM(node->get_logger(),
+                "RESPLE activate() failed (state=" << label
+                << "); the executor would have spun on a half-init node. Exiting non-zero.");
+            rclcpp::shutdown();
+            return 3;
+        }
+    }
+    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE active - entering executor spin");
 
     rclcpp::executors::MultiThreadedExecutor exec;
     exec.add_node(node->get_node_base_interface());

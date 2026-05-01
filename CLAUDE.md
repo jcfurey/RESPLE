@@ -10,12 +10,19 @@ hazards you need to understand before editing.
 
 RESPLE is a recursive B-spline state estimator for 6-DoF odometry from one or
 more LiDARs, optionally fused with an IMU. Four modes are supported upstream
-(LO / LIO / MLO / MLIO). **On the Rover MAX 150 we currently run LIO** —
-`if_lidar_only: false` in `src/settings/params/localization/resple.yaml`. The
-IMU is fused into the IEKF continuously (not just for gravity init), and
-Sierra consumes the resulting odometry on top of that.
+(LO / LIO / MLO / MLIO). On the Rover MAX 150 it would run **LIO** —
+`if_lidar_only: false` in `src/settings/params/localization/resple.yaml`,
+with the Ouster IMU fused into the IEKF continuously (not just gravity init).
 
-Integration point in the stack:
+**Current production state (2026-05-01): RESPLE is OFF.**
+`env.d/20-features.env` has `run_resple=False`. The active LiDAR-inertial
+odometry source is DLIO, feeding the `robot_localization` odom EKF. RESPLE
+remains fully wired for one-line revert (`run_resple=True` in
+`20-features.env`) and was the production source through the Sierra-stack
+era. See `rovermax_ws/CLAUDE.md` "Localization Architecture" for the active
+stack diagram.
+
+Integration point **when enabled** (Sierra-stack era; one-line revert):
 
 ```text
 Ouster OS1-16 points (10 Hz) ─┐
@@ -28,9 +35,17 @@ Ouster IMU (100 Hz) ──────────┴─→ RESPLE (B-spline LIO
                                                        TF: odom → base_footprint
 ```
 
-Sierra owns the TF. RESPLE publishes `odom` as a sensor source with
-`odom/publish_tf: false`. See `src/settings/params/localization/sierra.yaml`
-for the consumer side (`resple_odom` plugin, trust 0.85, heading reference).
+Sierra owns the TF in this configuration. RESPLE publishes `odom` as a sensor
+source with `odom/publish_tf: false`. See
+`src/settings/params/localization/sierra.yaml` for the consumer side
+(`resple_odom` plugin, trust 0.85, heading reference).
+
+Bug-chasing this package today therefore means either: (a) replaying recorded
+production bags from the Sierra era under sanitizer builds, or (b) flipping
+`run_resple=True` (and likely `run_sierra=True` + `run_dlio=False` /
+`run_odom_localization=False` to avoid the TF-owner conflict the master
+launch hard-fails on) to reproduce live. Pick (a) first — it's
+deterministic.
 
 ## Directory layout
 
@@ -234,7 +249,7 @@ directory). Summary:
 | --- | --- | --- |
 | 0   | Instrumentation + sanitizer builds | code complete (`74f9078`); bag replay pending |
 | 1   | Safety fixes (initial)             | complete (`512da1d`) |
-| 1.5 | Defensive crash-hardening          | complete (uncommitted) — 13 fixes across 3 passes |
+| 1.5 | Defensive crash-hardening          | complete (`14e9be8`) — 13 fixes across 3 passes |
 | 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 still pending Phase 0 data |
 | 3   | Spline / mapping accuracy          | pending Phase 0 data |
 | 4   | Diagnostics publisher              | after Phase 3 begins |
@@ -268,6 +283,18 @@ reference (status as of latest pass):
 | 19 | Mapping `if_init_succeed` bare bool race + `spline_active_.init()` race | **fixed** (atomic + m_spline) | 1.5 M1+M2 |
 | 20 | `getPositionLiDAR` mutated `cov_rcp` outside `spline_mutex_` (implicit lock-coupling) | **fixed** | 1.5 (Pass 3) |
 | 21 | `lock_mappings()` non-RAII → throw between → deadlock | **fixed** (`ScopedMappingsLock`) | 1.5 M4 |
+| 22 | ikd-Tree `Add_Points`/`Add_Point_Boxes`/`Delete_Points`/`Delete_Point_Boxes`/`Box_Search`/`Radius_Search` had the same K1 race as `Nearest_Search` (rebuild thread can free old subtree between lock-free check and operation) | **fixed** (per-branch shared lock around fast-path; slow path still uses working_flag_mutex to avoid lock-order inversion) | 1.5 K1 extension |
+| 23 | Async map-update lambda had no try/catch → throw stuck `map_update_pending_=true`, exception silently dropped by future destructor → silent map staleness → eventual k-NN against stale tree → SIGSEGV downstream | **fixed** (try/catch + always clear pending) | post-1.5 |
+| 24 | `Mapping::main()` LidarConfig ctor + buffs construction unguarded; `q_lb_v.at(3)` throw escapes `main()` → `std::terminate` → SIGABRT with no log | **fixed** (try/catch + RCLCPP_FATAL + clean exit) | post-1.5 |
+| 25 | `lasermapFovSegment` `pos_lidar_max` initialized with `numeric_limits<double>::min()` (smallest *positive*, not most negative) → silent local-map drift for any pose with negative components | **fixed** (`::lowest()`) | post-1.5 |
+| 26 | `SplineState::if_first` set true in `init()` and never cleared → `minTimeNs()` always returns `start_t_ns`, `start_t_ns - dt_ns` branch dead | **fixed** (flag + dead branch removed; comment notes intent if reintroduced) | post-1.5 |
+| 27 | `getRCPs()` indexes `t_knots[num_knot - 4 + i]` — UB if `num_knot < 4`. Safe today (no pruning) but a Phase 3.1 trap | **fixed** (defensive zero return + invariant log) | post-1.5 |
+| 28 | Livox callbacks (`livoxLidarCallback`, `livoxLidar2Callback`, `livoxAVIACallback`) read `livox_msg_in->points[0]` after gating only on `point_num` field — empty-vector OOB if publisher misbehaves | **fixed** (also check `points.empty()`) | post-1.5 |
+| 29 | `RESPLE/Mapping main()` ignored `configure()`/`activate()` returns → executor spun on half-init node → confusing downstream SIGSEGV | **fixed** (return-value check + RCLCPP_FATAL + non-zero exit) | post-1.5 |
+| 30 | `map_update_future_.wait()` had no timeout → if lambda hangs, worker permanently locks (no IEKF, no publishes, node alive but silent) | **fixed** (`wait_for(5s)` + skip cycle on timeout + ERROR log) | post-1.5 |
+| 31 | `processData` worker loop body unwrapped → throw anywhere kills worker thread silently → "alive but doing nothing" | **fixed** (try/catch around iteration body, log + 50ms sleep + continue) | post-1.5 |
+| 32 | `mapIncremental` passed NaN/Inf points straight to ikd-Tree `Add_by_point`, where `calc_dist` returns NaN, `<` comparisons all false, recursion takes wrong branch, tree state corrupts silently | **fixed** (skip non-finite points; surface counter via WARN_THROTTLE) | post-1.5 |
+| 33 | `ikd-Tree::Push_Down` writes to children's flag fields holding only the parent's per-node lock → races on overlapping subtree paths | **documented** (inherited from upstream HKU-MARS; mitigated via `num_threads=1` if symptomatic) | post-1.5 |
 
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7

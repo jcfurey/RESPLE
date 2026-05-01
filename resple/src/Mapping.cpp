@@ -12,6 +12,7 @@
 #include <rclcpp/qos.hpp>
 #include <rclcpp/service.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include <lifecycle_msgs/msg/state.hpp>
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/io/pcd_io.h>
@@ -1142,48 +1143,114 @@ int main(int argc, char** argv) {
     
     std::vector<LidarConfig> lidars;
     auto lidar_names = temp_nh->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
-    assert(temp_nh->get_parameter({"lidars"}, lidar_names));
-    if (lidar_names.empty()) {
-        lidars.emplace_back(temp_nh->get_node_parameters_interface(), "");
-    } else {
-        for (const auto& lidar_name : lidar_names) {
-            lidars.emplace_back(temp_nh->get_node_parameters_interface(), lidar_name + ".");
+    // Use the bool return + log on failure rather than assert(): assert is a
+    // no-op under -DNDEBUG (workspace default), so the original code silently
+    // ignored a missing 'lidars' parameter and proceeded with empty names.
+    if (!temp_nh->get_parameter({"lidars"}, lidar_names)) {
+        RCLCPP_WARN(temp_nh->get_logger(),
+            "Mapping: 'lidars' parameter not loadable; defaulting to empty (single anonymous lidar will be used).");
+    }
+    // LidarConfig ctor calls .at(N) on q_lb / t_lb vectors and will throw
+    // std::out_of_range on truncated YAML. Without try/catch the throw
+    // propagates through main() → std::terminate → SIGABRT, with the only
+    // backtrace from the crash handler. Catch here so the failure is logged
+    // with the offending lidar name.
+    try {
+        if (lidar_names.empty()) {
+            lidars.emplace_back(temp_nh->get_node_parameters_interface(), "");
+        } else {
+            for (const auto& lidar_name : lidar_names) {
+                lidars.emplace_back(temp_nh->get_node_parameters_interface(), lidar_name + ".");
+            }
         }
+    } catch (const std::exception& e) {
+        RCLCPP_FATAL(temp_nh->get_logger(),
+            "Mapping: LidarConfig construction failed: %s. "
+            "Check 'lidars' / per-lidar params (topic_lidar, lidar_type, q_lb=[w,x,y,z], t_lb=[x,y,z]). Exiting.",
+            e.what());
+        rclcpp::shutdown();
+        return 4;
     }
     // Create callback group for sensor processing
     auto sensor_cb_group = temp_nh->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    
+
     std::vector<MappingBase<pcl::PointXYZINormal>*> buffs;
-    for (const auto& lidar : lidars) {
-        if (!lidar.type.compare("Ouster")) {
-            buffs.push_back(new OusterBuff(temp_nh, lidar, sensor_cb_group));
-        } else if (!lidar.type.compare("Mid70Avia")) {
-            buffs.push_back(new Mid70AviaBuff(temp_nh, lidar, sensor_cb_group));
-        } else if (!lidar.type.compare("HAP360")) {
-            buffs.push_back(new HAP360Buff(temp_nh, lidar, sensor_cb_group));
-        } else if (!lidar.type.compare("AviaResple")) {
-            buffs.push_back(new AviaRespleBuff(temp_nh, lidar, sensor_cb_group));
-        } else if (!lidar.type.compare("Hesai")) {
-            buffs.push_back(new HesaiBuff(temp_nh, lidar, sensor_cb_group));
-        } else if (!lidar.type.compare("Mid360Boxi")) {
-            buffs.push_back(new Mid360BoxiBuff(temp_nh, lidar, sensor_cb_group));
-        } else {
-            exit(1);
+    try {
+        for (const auto& lidar : lidars) {
+            if (!lidar.type.compare("Ouster")) {
+                buffs.push_back(new OusterBuff(temp_nh, lidar, sensor_cb_group));
+            } else if (!lidar.type.compare("Mid70Avia")) {
+                buffs.push_back(new Mid70AviaBuff(temp_nh, lidar, sensor_cb_group));
+            } else if (!lidar.type.compare("HAP360")) {
+                buffs.push_back(new HAP360Buff(temp_nh, lidar, sensor_cb_group));
+            } else if (!lidar.type.compare("AviaResple")) {
+                buffs.push_back(new AviaRespleBuff(temp_nh, lidar, sensor_cb_group));
+            } else if (!lidar.type.compare("Hesai")) {
+                buffs.push_back(new HesaiBuff(temp_nh, lidar, sensor_cb_group));
+            } else if (!lidar.type.compare("Mid360Boxi")) {
+                buffs.push_back(new Mid360BoxiBuff(temp_nh, lidar, sensor_cb_group));
+            } else {
+                // exit(1) bypassed the crash handler and gave no log of why.
+                RCLCPP_FATAL(temp_nh->get_logger(),
+                    "Mapping: unknown lidar type '%s'. Supported: Ouster, Mid70Avia, HAP360, "
+                    "AviaResple, Hesai, Mid360Boxi. Exiting.", lidar.type.c_str());
+                for (auto* buff : buffs) delete buff;
+                rclcpp::shutdown();
+                return 5;
+            }
         }
+    } catch (const std::exception& e) {
+        RCLCPP_FATAL(temp_nh->get_logger(),
+            "Mapping: per-lidar buffer construction threw: %s. Exiting.", e.what());
+        for (auto* buff : buffs) delete buff;
+        rclcpp::shutdown();
+        return 6;
     }
     
     // Lifecycle node initialization
     rclcpp::NodeOptions options;
     auto node = std::make_shared<Mapping>(options, buffs);
     RCLCPP_INFO(node->get_logger(), "Mapping LifecycleNode created");
-    
-    // Transition to configured state
-    node->configure();
-    RCLCPP_INFO(node->get_logger(), "Mapping configured");
-    
+
+    // Transition to configured state. Wrap each lifecycle call so an exception
+    // thrown inside on_configure / on_activate is logged here instead of
+    // silently leaving the node in Unconfigured/ErrorProcessing while the
+    // executor spins on a half-init node — which is the most plausible cause
+    // of "no backtrace" startup crashes (the eventual SIGSEGV from a null
+    // publisher / subscription has no useful prior log).
+    {
+        auto state = node->configure();
+        const auto label = state.label();
+        RCLCPP_INFO_STREAM(node->get_logger(),
+            "Mapping configure() returned id=" << static_cast<int>(state.id())
+            << " label=" << label);
+        if (state.id() != lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+            RCLCPP_FATAL_STREAM(node->get_logger(),
+                "Mapping configure() failed (state=" << label
+                << "); refusing to activate. Exiting non-zero.");
+            for (auto buff : buffs) delete buff;
+            rclcpp::shutdown();
+            return 2;
+        }
+    }
+
     // Transition to active state (starts processing)
-    node->activate();
-    RCLCPP_INFO(node->get_logger(), "Mapping activated - processing started");
+    {
+        auto state = node->activate();
+        const auto label = state.label();
+        RCLCPP_INFO_STREAM(node->get_logger(),
+            "Mapping activate() returned id=" << static_cast<int>(state.id())
+            << " label=" << label);
+        if (state.id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+            RCLCPP_FATAL_STREAM(node->get_logger(),
+                "Mapping activate() failed (state=" << label
+                << "); the executor would have spun on a half-init node. Exiting non-zero.");
+            for (auto buff : buffs) delete buff;
+            rclcpp::shutdown();
+            return 3;
+        }
+    }
+    RCLCPP_INFO(node->get_logger(), "Mapping active - entering executor spin");
     
     rclcpp::executors::MultiThreadedExecutor exec;
     exec.add_node(node->get_node_base_interface());

@@ -429,6 +429,12 @@ template <typename PointType>
 void KD_TREE<PointType>::Box_Search(const BoxPointType &Box_of_Point, PointVector &Storage)
 {
     Storage.clear();
+    // Same UAF race as Nearest_Search (Phase 1.5 K1): the rebuild thread can
+    // free old subtree nodes via delete_tree_nodes() while we recurse through
+    // them. Always take search_rw_mutex_ shared. Cost: one uncontended atomic
+    // increment per call; rebuild thread only contends briefly during its
+    // unique-locked subtree swap.
+    std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
     Search_by_range(Root_Node, Box_of_Point, Storage);
 }
 
@@ -436,14 +442,28 @@ template <typename PointType>
 void KD_TREE<PointType>::Radius_Search(PointType point, const float radius, PointVector &Storage)
 {
     Storage.clear();
+    // Same race / fix as Box_Search above.
+    std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
     Search_by_radius(Root_Node, point, radius, Storage);
 }
 
 template <typename PointType>
 int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
 {
-    // int NewPointSize = PointToAdd.size();
-    // int tree_size = size();
+    // Race fix: extends Phase 1.5 K1's Nearest_Search hardening.
+    //
+    // CANNOT just take search_rw_mutex_ shared for the whole function — the
+    // slow path (rebuild active on Root_Node) takes working_flag_mutex,
+    // and the rebuild thread holds working_flag_mutex continuously while
+    // taking search_rw_mutex_ unique (multi_thread_rebuild lines 239→325).
+    // Holding shared while trying to take working_flag = lock-order inversion
+    // → deadlock.
+    //
+    // Strategy: shared lock around the fast path's check + mutating call.
+    // Slow path is left unchanged — it's already serialized via
+    // working_flag_mutex which excludes the rebuild thread's swap. The
+    // unconditional Search_by_range(Root_Node, ...) below was the most
+    // dangerous unguarded call; it now runs under the shared lock.
     BoxPointType Box_of_Point;
     PointType downsample_result, mid_point;
     bool downsample_switch = downsample_on && DOWNSAMPLE_SWITCH;
@@ -463,7 +483,12 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
             mid_point.y = Box_of_Point.vertex_min[1] + (Box_of_Point.vertex_max[1] - Box_of_Point.vertex_min[1]) / 2.0;
             mid_point.z = Box_of_Point.vertex_min[2] + (Box_of_Point.vertex_max[2] - Box_of_Point.vertex_min[2]) / 2.0;
             PointVector().swap(Downsample_Storage);
-            Search_by_range(Root_Node, Box_of_Point, Downsample_Storage);
+            {
+                // Race-protect the unconditional read; rebuild thread can swap
+                // Root_Node's subtree at any instant.
+                std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+                Search_by_range(Root_Node, Box_of_Point, Downsample_Storage);
+            }
             min_dist = calc_dist(PointToAdd[i], mid_point);
             downsample_result = PointToAdd[i];
             for (int index = 0; index < (int)Downsample_Storage.size(); index++)
@@ -475,17 +500,27 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
                     downsample_result = Downsample_Storage[index];
                 }
             }
-            if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+            // Fast vs slow path: try fast under shared lock so the rebuild
+            // thread cannot swap Root_Node between the check and the call.
+            // If rebuild IS active on Root_Node, fall through to the slow
+            // path which uses working_flag_mutex (must NOT be acquired while
+            // holding shared lock — that's lock-order inversion → deadlock).
+            bool fast_path_taken = false;
             {
-                if (Downsample_Storage.size() > 1 || same_point(PointToAdd[i], downsample_result))
+                std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+                if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
                 {
-                    if (Downsample_Storage.size() > 0)
-                        Delete_by_range(&Root_Node, Box_of_Point, true, true);
-                    Add_by_point(&Root_Node, downsample_result, true, Root_Node->division_axis);
-                    tmp_counter++;
+                    if (Downsample_Storage.size() > 1 || same_point(PointToAdd[i], downsample_result))
+                    {
+                        if (Downsample_Storage.size() > 0)
+                            Delete_by_range(&Root_Node, Box_of_Point, true, true);
+                        Add_by_point(&Root_Node, downsample_result, true, Root_Node->division_axis);
+                        tmp_counter++;
+                    }
+                    fast_path_taken = true;
                 }
             }
-            else
+            if (!fast_path_taken)
             {
                 if (Downsample_Storage.size() > 1 || same_point(PointToAdd[i], downsample_result))
                 {
@@ -513,11 +548,17 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
         }
         else
         {
-            if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+            // Same fast/slow split as the downsample branch above.
+            bool fast_path_taken = false;
             {
-                Add_by_point(&Root_Node, PointToAdd[i], true, Root_Node->division_axis);
+                std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+                if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+                {
+                    Add_by_point(&Root_Node, PointToAdd[i], true, Root_Node->division_axis);
+                    fast_path_taken = true;
+                }
             }
-            else
+            if (!fast_path_taken)
             {
                 Operation_Logger_Type operation;
                 operation.point = PointToAdd[i];
@@ -540,13 +581,21 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
 template <typename PointType>
 void KD_TREE<PointType>::Add_Point_Boxes(vector<BoxPointType> &BoxPoints)
 {
+    // Same UAF race / fix as Add_Points. See that function for the
+    // lock-order rationale (shared lock fast-path only; slow path uses
+    // working_flag_mutex which inverts with shared_mutex).
     for (int i = 0; i < (int)BoxPoints.size(); i++)
     {
-        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+        bool fast_path_taken = false;
         {
-            Add_by_range(&Root_Node, BoxPoints[i], true);
+            std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+            if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+            {
+                Add_by_range(&Root_Node, BoxPoints[i], true);
+                fast_path_taken = true;
+            }
         }
-        else
+        if (!fast_path_taken)
         {
             Operation_Logger_Type operation;
             operation.boxpoint = BoxPoints[i];
@@ -568,13 +617,19 @@ void KD_TREE<PointType>::Add_Point_Boxes(vector<BoxPointType> &BoxPoints)
 template <typename PointType>
 void KD_TREE<PointType>::Delete_Points(PointVector &PointToDel)
 {
+    // Same UAF race / fix as Add_Points.
     for (int i = 0; i < (int)PointToDel.size(); i++)
     {
-        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+        bool fast_path_taken = false;
         {
-            Delete_by_point(&Root_Node, PointToDel[i], true);
+            std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+            if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+            {
+                Delete_by_point(&Root_Node, PointToDel[i], true);
+                fast_path_taken = true;
+            }
         }
-        else
+        if (!fast_path_taken)
         {
             Operation_Logger_Type operation;
             operation.point = PointToDel[i];
@@ -596,14 +651,23 @@ void KD_TREE<PointType>::Delete_Points(PointVector &PointToDel)
 template <typename PointType>
 int KD_TREE<PointType>::Delete_Point_Boxes(vector<BoxPointType> &BoxPoints)
 {
+    // Same UAF race / fix as Add_Points. Called from RESPLE.cpp's
+    // lasermapFovSegment in the async map-update lambda — fires every time
+    // the LiDAR moves past the local-map edge. A rebuild swap concurrent
+    // with this Delete_by_range walk is exactly the production crash signature.
     int tmp_counter = 0;
     for (int i = 0; i < (int)BoxPoints.size(); i++)
     {
-        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+        bool fast_path_taken = false;
         {
-            tmp_counter += Delete_by_range(&Root_Node, BoxPoints[i], true, false);
+            std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+            if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+            {
+                tmp_counter += Delete_by_range(&Root_Node, BoxPoints[i], true, false);
+                fast_path_taken = true;
+            }
         }
-        else
+        if (!fast_path_taken)
         {
             Operation_Logger_Type operation;
             operation.boxpoint = BoxPoints[i];
@@ -701,6 +765,12 @@ template <typename PointType>
 void KD_TREE<PointType>::Rebuild(KD_TREE_NODE **root)
 {
     KD_TREE_NODE *father_ptr;
+    // 2026-05-01 diagnostic (force always-multi-thread) reverted: did NOT
+    // eliminate the production SIGSEGV. The crash now appears in BOTH the
+    // worker (Add_Points → __libc_free) and the rebuild thread
+    // (multi_thread_rebuild → __libc_free) simultaneously. That signature
+    // points at upstream heap corruption surfacing on the first free that
+    // happens to fire — not at the inline rebuild path itself.
     if ((*root)->TreeSize >= Multi_Thread_Rebuild_Point_Num)
     {
         if (!pthread_mutex_trylock(&rebuild_ptr_mutex_lock))
@@ -1163,6 +1233,42 @@ bool KD_TREE<PointType>::Criterion_Check(KD_TREE_NODE *root)
     return false;
 }
 
+// Push_Down: propagates 'tree_deleted' / 'point_deleted' / downsample flags from
+// `root` to its immediate children, then marks the children as needing further
+// push-down. Called from Search and from every kd-tree mutator before they
+// proceed past `root`.
+//
+// CONCURRENCY HAZARD (inherited from upstream HKU-MARS ikd-Tree, NOT introduced
+// by this fork): Push_Down acquires only the PARENT's push_down_mutex_lock
+// (via the trylock pattern at every caller site). It then writes to the
+// immediate CHILDREN's flag fields (tree_downsample_deleted, point_downsample_deleted,
+// tree_deleted, point_deleted, down_del_num, invalid_point_num,
+// need_push_down_to_left, need_push_down_to_right) without holding any
+// per-child lock. Two threads concurrently calling Push_Down on different
+// parents whose children-paths overlap WILL race on those child fields.
+//
+// Why we have not fixed it:
+//   - Per-child locking would require restructuring every Push_Down call site
+//     to take a lock on TWO nodes (parent + child) in a consistent order, with
+//     careful avoidance of self-deadlock when the same node is both parent
+//     and child in different traversals.
+//   - The race is on integer-and-bool struct fields aligned naturally on x86_64;
+//     individual writes are tearing-free, only the COMBINATION of writes is
+//     non-atomic. In practice this manifests as occasional flag transients
+//     that self-heal on the next Push_Down (the writes are idempotent: any
+//     subsequent Push_Down with the same root state writes the same values).
+//   - Fixing it cleanly probably requires rewriting Push_Down to use atomic
+//     RMWs on individual flags rather than read-modify-write of the whole
+//     bool field. That's a substantial change to ikd-Tree internals.
+//
+// Mitigation in our fork:
+//   - num_threads parameter caps OpenMP fan-out in the IEKF (findCorresp's
+//     parallel for is the dominant concurrent caller). Setting num_threads=1
+//     in resple.yaml eliminates this race entirely at the cost of
+//     parallelism. Used during diagnostic runs.
+//
+// If you suspect this race is causing production issues, set num_threads=1
+// and see if the symptom persists. If yes, the race is not your bug.
 template <typename PointType>
 void KD_TREE<PointType>::Push_Down(KD_TREE_NODE *root)
 {

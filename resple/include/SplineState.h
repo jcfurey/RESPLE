@@ -46,7 +46,13 @@ class SplineState
             std::cerr << "[SplineState] init() called with dt_ns=" << dt_ns_ << " (must be > 0), using dt_ns=1 as placeholder\n";
             dt_ns_ = 1;
         }
-        if_first = true;
+        // Note: the historical `if_first` flag was set true here and never
+        // set false anywhere, making the !if_first branch in minTimeNs() dead
+        // code. The flag and its branch were removed; minTimeNs() now always
+        // returns start_t_ns. If a future change needs to extend the queryable
+        // range one knot before start_t_ns (the original intent), reintroduce
+        // the flag with a clear flip site (e.g., after the first
+        // addOneStateKnot call, or when num_knot exceeds the spline order).
         dt_ns = dt_ns_;
         start_t_ns = start_t_ns_;
         num_knot = num_knot_;
@@ -74,10 +80,21 @@ class SplineState
     Eigen::Matrix<double, 24, 1> getRCPs()
     {
         Eigen::Matrix<double, 24, 1> RCPs;
+        // num_knot < 4 makes (num_knot - 4 + i) negative for i=0, OOB-reading
+        // the deque. Today num_knot is monotonically growing (no pruning yet),
+        // so steady-state safe — but Phase 3.1 sliding-window pruning would
+        // make this fire. Defensive zero return matches the IEKF's behaviour
+        // when state is unavailable; the IEKF then sees no change and the
+        // numerical-failure counter eventually trips.
+        if (num_knot < 4) {
+            RESPLE_LOG_INVARIANT_ONCE("getRCPs called with num_knot=" << num_knot << " < 4; returning zero");
+            RCPs.setZero();
+            return RCPs;
+        }
         for (int i = 0; i < 4; i++) {
             RCPs.block<3, 1>(i*6, 0) = t_knots[num_knot - 4 + i];
             RCPs.block<3, 1>(i*6+3, 0) = ort_delta[num_knot - 4 + i];
-        }      
+        }
         return RCPs;
     }
 
@@ -220,7 +237,11 @@ class SplineState
 
     int64_t minTimeNs() const
     {
-        return start_t_ns + dt_ns * (!if_first ?  -1 : 0);
+        // Was: start_t_ns + dt_ns * (!if_first ? -1 : 0)
+        // The `if_first` flag was always true (set in init(), never cleared
+        // anywhere). The negative-offset branch was dead. See init() for the
+        // rationale and the path to restore the original-intent behaviour.
+        return start_t_ns;
     }
 
     int64_t numKnots() const
@@ -531,7 +552,6 @@ class SplineState
 
   private:
 
-    bool if_first;
     static const Eigen::Matrix4d blending_matrix;
     static const Eigen::Matrix4d base_coefficients;
     static const Eigen::Matrix4d cumulative_blending_matrix;

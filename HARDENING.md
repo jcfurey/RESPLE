@@ -16,8 +16,9 @@ Companion docs:
 | --- | --- | --- | --- |
 | 0   | Instrument before changing code | **Complete (code); user bag-replay pending** | `74f9078` |
 | 1   | Safety fixes (initial) | **Complete** | `512da1d` |
-| 1.5 | Defensive crash-hardening (3-pass) | **Complete (uncommitted)** | — |
-| 2   | Concurrency hardening | **Largely subsumed by 1.5** — see below | — |
+| 1.5 | Defensive crash-hardening (3-pass) | **Complete** | `14e9be8` |
+| 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete (this commit)** — see "Phase 1.6" below | this commit |
+| 2   | Concurrency hardening | **Largely subsumed by 1.5/1.6** — see below | — |
 | 3   | Spline / mapping accuracy | Pending Phase 0 data | — |
 | 4   | Diagnostics publisher | Can start after Phase 3 begins | — |
 | 5   | Regression tests | Last | — |
@@ -152,7 +153,8 @@ Phase 2/3 decisions.
 
 ## Phase 1.5 — Defensive crash-hardening (3-pass)
 
-**Status: complete, uncommitted.**
+**Status: complete.**
+**Commit: `14e9be8`.**
 
 Triggered by an operator report of a deterministic mid-run SIGSEGV after
 Phase 0+1 landed. No backtrace available. Three review passes covered every
@@ -234,6 +236,142 @@ Files: `RESPLE.cpp`, `common_utils.h`, `Mapping.cpp`.
 - **Phase 2.3 bounded input buffers** — Pass 0 diagnostics need to fire
   first to confirm buffers actually grow under load.
 - **Phase 3.x and Phase 4** — unchanged; these need data + design discussion.
+
+---
+
+## Phase 1.6 — Bug-chase session, 2026-05-01
+
+**Status: complete in this commit. Did NOT eliminate the production
+SIGSEGV; root cause localized via `addr2line`, fix targeted at last edit.**
+
+### Trigger
+
+User attempted to switch the active production stack from DLIO to RESPLE
+(env.d/20-features.env: `run_resple=True`, env.d/30-algorithms.env:
+`run_dlio=False`, odom_localization.yaml: odom1 → /localization/resple/odometry).
+RESPLE crashed reproducibly with exit code -11 (SIGSEGV) on the first
+`mapIncremental` call after gravity alignment. Crash signature stable
+across all configurations (sim/hw not relevant — sim was used throughout).
+
+### Diagnostic timeline (what we ruled out, in order)
+
+1. **`respleCrashHandler` was firing** — backtrace was being captured but
+   getting buried by the `respawn=True` log-loop. Once visible, every
+   crash had the same stack: `__libc_free` ← inside `KD_TREE::Add_Points`
+   at offset `+0x267`, called from `mapIncremental + 0x389` (later +0x3d0
+   after the NaN-skip code expanded the function).
+2. **Lifecycle return-value path** — patched `RESPLE.cpp` and `Mapping.cpp`
+   `main()` to check `configure()` / `activate()` returns and exit non-zero
+   on failure. Confirmed lifecycle reached `active` cleanly; not the issue.
+3. **AVX / `-march=native` PCL alignment mismatch** — disabled
+   `-DENABLE_NATIVE_ARCH=OFF`. Same crash. Not it.
+4. **OpenMP-concurrent kd-tree access** — set `num_threads=1` in
+   resple.yaml. Worker crash unchanged; rebuild thread crash gone (so OMP
+   races are real but not THIS bug).
+5. **Inline `Rebuild` path in `Add_by_point`** — diagnostic patch to force
+   `Rebuild` always onto multi-thread queue. Worker crash unchanged
+   (inline rebuild bypassed; another path hit the same free).
+6. **Try `-O0` build** — added `ENABLE_DEBUG_O0`. NO crash, but worker too
+   slow to keep up with 10 Hz scans → `map_update_future_.wait()` deadlock.
+   Confirmed UB-exposed-by-O3. Added `wait_for(5s)` timeout (Fix #10) and
+   try/catch around worker iteration body (Fix #11) so future stalls
+   degrade visibly instead of silent freeze.
+7. **`-O1` build** — added `ENABLE_DEBUG_O1` with
+   `-fno-strict-aliasing -fno-tree-vectorize`. Build was a no-op (CMake
+   cache held the previous flag); user docker broke before retesting.
+8. **`-O3 -g3` build** — added `ENABLE_DEBUG_O3G`. Crash reproduced with
+   line numbers preserved. **`addr2line` resolved the inlined chain**:
+
+```
+KD_TREE<PointXYZINormal>::Add_Points          ikd_Tree.cpp:485
+↑ std::vector<...>::~vector()                 stl_vector.h:738
+↑ std::_Vector_base<...>::_M_deallocate       stl_vector.h:390
+↑ Eigen::aligned_allocator::deallocate        Memory.h:921
+↑ Eigen::internal::aligned_free               Memory.h:206
+↑ Eigen::internal::handmade_aligned_free      Memory.h:118  ← faults here
+↑ __libc_free
+```
+
+Line 485 is `PointVector().swap(Downsample_Storage)` — temp's destructor
+tried to free Downsample_Storage's previously-held storage.
+
+### Root cause (working theory, supported by the symbolicated trace)
+
+`Eigen::internal::handmade_aligned_free` recovers the original malloc'd
+pointer by reading `*(reinterpret_cast<void**>(ptr) - 1)` — i.e., it
+assumes the user pointer was returned by `handmade_aligned_malloc`,
+which stored a header word at offset `-sizeof(void*)`.
+
+If the matching ALLOCATION instead went through any other Eigen path
+(`posix_memalign` or `_mm_malloc`), the bytes immediately before `ptr`
+are not a stored header — they're either the previous chunk's trailing
+data or padding from the system allocator. Reading that as a pointer
+yields garbage, and `std::free(garbage)` faults inside `__libc_free`.
+
+This dispatch mismatch can occur when Eigen's preprocessor gating for
+`EIGEN_HAS_POSIX_MEMALIGN` / `EIGEN_HAS_MM_MALLOC` evaluates differently
+across translation units. With ODR-merged template instantiations (the
+allocator's allocate/deallocate are inline templates), the linker can
+pick one TU's `allocate` and another TU's `deallocate` — different
+paths, incompatible at the chunk-header level.
+
+The trace confirms `aligned_free` is dispatching to `handmade_aligned_free`
+in our build, which means at least one TU sees neither
+`EIGEN_HAS_POSIX_MEMALIGN` nor `EIGEN_HAS_MM_MALLOC` defined. That
+inconsistency is the bug.
+
+### Fix landed
+
+`resple/CMakeLists.txt`: `target_compile_definitions(${PROJECT_NAME} PUBLIC
+EIGEN_HAS_POSIX_MEMALIGN=1 EIGEN_HAS_MM_MALLOC=0)`. Forces every TU that
+pulls in our headers (resple library + RESPLE/Mapping executables) to see
+the same Eigen allocator dispatch — `posix_memalign` for allocation,
+`std::free` for deallocation. No mismatch possible.
+
+**Status of the fix at commit time: built and installed; not yet
+verified to eliminate the crash in a sim run** (user moved on to commit
+the work in progress). If re-run shows the SIGSEGV gone, this is the fix.
+If it still fires, fall back to the more aggressive
+`EIGEN_MALLOC_ALREADY_ALIGNED=1` which forces plain `std::malloc` /
+`std::free` everywhere.
+
+### Other defensive fixes landed alongside (also in this commit)
+
+These don't address the root SIGSEGV but harden RESPLE against related
+classes of failure that surfaced during the bug-chase. All have
+standalone justification.
+
+| Fix | File | Hazard addressed |
+| --- | --- | --- |
+| K1 extension | `ikd_Tree.cpp` (Add_Points / Add_Point_Boxes / Delete_Points / Delete_Point_Boxes / Box_Search / Radius_Search) | Same UAF race as Phase 1.5 K1 in `Nearest_Search`: lock-free fast-path check vs rebuild-thread subtree swap. Per-branch shared lock pattern; slow path still uses `working_flag_mutex` to avoid lock-order inversion |
+| Async lambda try/catch | `RESPLE.cpp` async map-update lambda | Throw inside `mapIncremental` / `lasermapFovSegment` / `publishFrameWorld` would silently stick `map_update_pending_=true` and lose the exception in the future destructor. Now logged + always cleared |
+| `Mapping::main()` LidarConfig try/catch | `Mapping.cpp` | `LidarConfig` ctor `q_lb_v.at(3)` throws on truncated YAML → uncaught → terminate → SIGABRT with no log. Now `RCLCPP_FATAL` + clean exit code |
+| Lifecycle return-value check | `RESPLE.cpp` + `Mapping.cpp` `main()` | `configure()` / `activate()` ignored returns; failed transitions left executor spinning on half-init node. Now check id, log id+label, exit non-zero on failure |
+| `numeric_limits::lowest()` | `RESPLE.cpp` `lasermapFovSegment` | `pos_lidar_max` was init'd with `min()` (smallest positive), not `lowest()` (most negative). Silent local-map drift for negative-coord poses |
+| Removed dead `if_first` | `SplineState.h` | Flag was set true in `init()` and never cleared. The `start_t_ns - dt_ns` branch in `minTimeNs()` was dead code |
+| `getRCPs()` bounds check | `SplineState.h` | `t_knots[num_knot - 4 + i]` underflows for `num_knot < 4`. Safe today (no pruning) but a Phase 3.1 trap |
+| Livox callback `points.empty()` check | `RESPLE.cpp` (3 callback variants) | Read `points[0]` after gating only on `point_num` field. Doesn't affect Ouster (we don't use Livox) |
+| `wait_for(5s)` on map-update future | `RESPLE.cpp` `processData` | Plain `wait()` permanently locks the worker if lambda hangs. Now skips a cycle on timeout, logs ERROR, stays responsive |
+| Worker iteration try/catch | `RESPLE.cpp` `processData` | Throw anywhere in IEKF / collect / deskew killed worker thread silently. Now logs + 50 ms sleep + continues |
+| NaN/Inf input filter | `RESPLE.cpp` `mapIncremental` | NaN points fed to `Add_by_point` → `calc_dist` returns NaN → comparisons all false → tree corruption. Now skipped + WARN_THROTTLE |
+| `Push_Down` race documentation | `ikd_Tree.cpp` | Inherited HKU-MARS race (parent-only lock when writing children's flags); documented with mitigation pointer (`num_threads=1`) |
+| `ENABLE_DEBUG_O0` / `ENABLE_DEBUG_O1` / `ENABLE_DEBUG_O3G` build options | `CMakeLists.txt` | Diagnostic flags retained for future bug-chases; harmless when off |
+
+### What's still open
+
+- **Verify the Eigen-macro fix** by running sim post-commit. If gone, close
+  this entry. If still firing, switch to `EIGEN_MALLOC_ALREADY_ALIGNED=1`.
+- **Phase 2.3** (bounded input buffers) — Pass 0 diagnostic data still
+  needed before tuning.
+- **Phase 3.x** — unchanged; gated on Phase 0 trajectory benchmarks.
+- **Push_Down race** (now documented) — fix would require a substantial
+  refactor of upstream HKU-MARS code; deferred.
+- **Operational safety net** — Mapping receives `est_window` from RESPLE.
+  When RESPLE crashes and respawns, Mapping holds a stale spline window
+  and queries it with timestamps far outside the new spline's range. The
+  Phase 1.5 B clamp catches this safely, but it floods the log. Worth
+  adding a "spline-discontinuity" reset in Mapping's `getEstCallback`
+  when start_t jumps backward.
 
 ---
 
