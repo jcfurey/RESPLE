@@ -1,3 +1,16 @@
+// 2026-05-01 Eigen aligned-allocator ABI fix — MUST be the first thing in this
+// TU, before any header that pulls in Eigen. See RESPLE.cpp top-of-file block
+// and HARDENING.md Phase 1.6 for context.
+#ifndef EIGEN_MALLOC_ALREADY_ALIGNED
+#define EIGEN_MALLOC_ALREADY_ALIGNED 1
+#endif
+#ifndef EIGEN_DEFAULT_ALIGN_BYTES
+#define EIGEN_DEFAULT_ALIGN_BYTES 16
+#endif
+#ifndef EIGEN_MAX_ALIGN_BYTES
+#define EIGEN_MAX_ALIGN_BYTES 16
+#endif
+
 #include <thread>
 #include <iostream>
 #include <queue>

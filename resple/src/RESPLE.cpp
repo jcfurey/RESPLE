@@ -1,3 +1,20 @@
+// 2026-05-01 Eigen aligned-allocator ABI fix — MUST be the first thing in this
+// translation unit, before any header that pulls in Eigen (rclcpp + PCL both do
+// transitively). See HARDENING.md Phase 1.6 and ikd_Tree.h's matching block for
+// the full rationale. Short version: pin EIGEN_MALLOC_ALREADY_ALIGNED=1 so
+// Eigen's aligned_malloc/aligned_free both use std::malloc/std::free directly,
+// eliminating the handmade-allocator dispatch path that was crashing in
+// __libc_free at ikd_Tree.cpp:485.
+#ifndef EIGEN_MALLOC_ALREADY_ALIGNED
+#define EIGEN_MALLOC_ALREADY_ALIGNED 1
+#endif
+#ifndef EIGEN_DEFAULT_ALIGN_BYTES
+#define EIGEN_DEFAULT_ALIGN_BYTES 16
+#endif
+#ifndef EIGEN_MAX_ALIGN_BYTES
+#define EIGEN_MAX_ALIGN_BYTES 16
+#endif
+
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>

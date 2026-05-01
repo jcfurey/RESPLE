@@ -118,7 +118,7 @@ target_include_directories(${PROJECT_NAME}
 		${PCL_INCLUDE_DIRS}
 )
 
-# 2026-05-01 Eigen aligned-allocator ABI fix.
+# 2026-05-01 Eigen aligned-allocator ABI fix — second attempt.
 #
 # Production SIGSEGV (reproducible at -O3, addr2line resolved):
 #   __libc_free  ←  Eigen::internal::handmade_aligned_free  (Memory.h:118)
@@ -129,21 +129,46 @@ target_include_directories(${PROJECT_NAME}
 #                ←  KD_TREE::Add_Points  (ikd_Tree.cpp:485, the
 #                              `PointVector().swap(Downsample_Storage)` site)
 #
-# The free is dispatching through `handmade_aligned_free`, which assumes the
-# pointer was returned by `handmade_aligned_malloc` and reads `ptr - sizeof(void*)`
-# to recover the original malloc'd address. If allocation went through a
-# different Eigen path (posix_memalign, _mm_malloc) — which can happen due to
-# per-TU preprocessor inconsistency in Eigen's allocator selection — the
-# bytes before `ptr` are garbage and `std::free(garbage)` faults.
+# Free dispatches through `handmade_aligned_free`, which recovers the
+# original malloc'd pointer by reading `ptr - sizeof(void*)`. If the matching
+# allocation went through any other path (posix_memalign or _mm_malloc),
+# those bytes are garbage and `std::free(garbage)` faults.
 #
-# Pin both selectors PUBLIC so every TU that pulls in our headers (resple
-# library + RESPLE/Mapping executables) sees the same Eigen allocator
-# dispatch. EIGEN_HAS_POSIX_MEMALIGN=1 forces the malloc/free pair onto
-# posix_memalign + std::free (matching, ABI-stable). EIGEN_HAS_MM_MALLOC=0
-# disables the SSE intrinsic alternative so it can't be picked instead.
+# First attempt (this commit's predecessor) tried pinning EIGEN_HAS_POSIX_MEMALIGN=1
+# and EIGEN_HAS_MM_MALLOC=0 from the command line — DID NOT work, dispatch
+# still hits handmade_aligned_free. Eigen's Memory.h defines those macros
+# unconditionally (no #ifndef guard) based on its own feature-test of
+# _GNU_SOURCE / _POSIX_ADVISORY_INFO, so a -D from the command line gets
+# overwritten when Memory.h is preprocessed. _GNU_SOURCE is what we'd need
+# to set instead of pinning the result macros.
+#
+# Second attempt (this block): two complementary defines.
+#   _GNU_SOURCE                          : satisfies Eigen's posix_memalign
+#                                          feature test inside Memory.h, so
+#                                          its own #define of
+#                                          EIGEN_HAS_POSIX_MEMALIGN evaluates
+#                                          to 1 instead of 0.
+#   EIGEN_MALLOC_ALREADY_ALIGNED=1       : safety net — tells Eigen to treat
+#                                          std::malloc as already returning
+#                                          16-byte-aligned memory (true on
+#                                          x86_64 glibc). aligned_free then
+#                                          short-circuits to std::free,
+#                                          bypassing the handmade path
+#                                          regardless of which other macros
+#                                          Memory.h sets.
+#   EIGEN_DEFAULT_ALIGN_BYTES=16         : pin alignment to 16 to match what
+#                                          PCL was compiled with (per the
+#                                          PCL build warning) and what
+#                                          std::malloc actually delivers.
+#                                          Prevents Eigen from over-aligning
+#                                          types to 32 (AVX) when the
+#                                          underlying malloc only guarantees
+#                                          16, which would re-trigger the
+#                                          aligned-malloc dispatch logic.
 target_compile_definitions(${PROJECT_NAME} PUBLIC
-	EIGEN_HAS_POSIX_MEMALIGN=1
-	EIGEN_HAS_MM_MALLOC=0
+	_GNU_SOURCE
+	EIGEN_MALLOC_ALREADY_ALIGNED=1
+	EIGEN_DEFAULT_ALIGN_BYTES=16
 )
 
 # Enforce C++17 and apply optimization flags to the library target

@@ -1,4 +1,44 @@
 #pragma once
+
+// 2026-05-01 Eigen aligned-allocator ABI fix.
+//
+// The kd-tree's PointVector (defined below) is std::vector<PointType, Eigen::aligned_allocator>.
+// Eigen's aligned_malloc/aligned_free dispatch on EIGEN_MALLOC_ALREADY_ALIGNED, which Eigen
+// auto-detects in Memory.h:
+//   - If EIGEN_DEFAULT_ALIGN_BYTES == 16 AND glibc 64-bit AND no ASan → MALLOC_ALREADY_ALIGNED=1
+//     → both malloc/free use std::malloc/std::free directly (matched, ABI-stable)
+//   - Otherwise → MALLOC_ALREADY_ALIGNED=0 → both go through handmade_aligned_malloc/free
+//
+// With -march=native enabling AVX, Eigen sets EIGEN_DEFAULT_ALIGN_BYTES=32, which fails the
+// auto-detect's `==16` check, so MALLOC_ALREADY_ALIGNED stays 0 and BOTH alloc/free dispatch
+// to the handmade path. handmade_aligned_malloc stores the original malloc'd address at
+// `ptr - sizeof(void*)` and handmade_aligned_free reads it back. They should match.
+//
+// The production SIGSEGV (Add_Points line 485 → ~vector → handmade_aligned_free → __libc_free)
+// is consistent with cross-TU inconsistency: SOME TU sees MALLOC_ALREADY_ALIGNED=1 (and
+// allocates via std::malloc), another TU sees =0 (and frees via handmade_aligned_free, which
+// reads garbage at ptr-8). The linker picks one TU's instantiation per template, mismatched.
+//
+// Forcing the macros HERE — before any other include — guarantees that every TU pulling in
+// this header (which is every TU that touches the kd-tree) sees the same Eigen allocator
+// dispatch. The same defines exist in CMakeLists.txt as `target_compile_definitions PUBLIC`,
+// but PUBLIC propagation can fail to reach all TUs (e.g., when included transitively via
+// PCL or another header before the consumer applies our compile flags).
+//
+// EIGEN_MALLOC_ALREADY_ALIGNED=1 forces aligned_malloc/free to be std::malloc/free.
+// EIGEN_DEFAULT_ALIGN_BYTES=16 caps Eigen's alignment to what std::malloc actually delivers
+// on x86_64 glibc, preventing AVX-promoted 32-byte alignment expectations from being violated
+// when std::malloc returns 16-byte-aligned storage.
+#ifndef EIGEN_MALLOC_ALREADY_ALIGNED
+#define EIGEN_MALLOC_ALREADY_ALIGNED 1
+#endif
+#ifndef EIGEN_DEFAULT_ALIGN_BYTES
+#define EIGEN_DEFAULT_ALIGN_BYTES 16
+#endif
+#ifndef EIGEN_MAX_ALIGN_BYTES
+#define EIGEN_MAX_ALIGN_BYTES 16
+#endif
+
 #include <stdio.h>
 #include <queue>
 #include <pthread.h>
