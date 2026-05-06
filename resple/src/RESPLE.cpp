@@ -584,8 +584,31 @@ public:
                     // above the worst-case observed lambda duration (~150 ms at -O3
                     // on a well-loaded sim) but still bounded.
                     if (map_update_pending_.load(std::memory_order_acquire)) {
-                        if (map_update_future_.wait_for(std::chrono::seconds(5))
-                            == std::future_status::timeout) {
+                        // Poll the future in 100ms slices instead of one 5s wait so
+                        // the worker checks rclcpp::ok() and processing_active_
+                        // between slices. Without this, a SIGINT delivered while
+                        // the worker is mid-wait blocks shutdown for up to 5s
+                        // (then SIGTERM fires, then SIGKILL — observed 15s+
+                        // teardown latency in the master launch). Same overall
+                        // 5s budget, just chunked.
+                        constexpr auto kSlice = std::chrono::milliseconds(100);
+                        constexpr int kSlices = 50;  // 50 × 100 ms = 5 s
+                        bool completed = false;
+                        for (int i = 0; i < kSlices; ++i) {
+                            if (!processing_active_.load() || !rclcpp::ok()) {
+                                // Shutdown requested mid-wait. Bail out of the
+                                // worker loop entirely; the future destructor in
+                                // on_deactivate / on_shutdown still waits for the
+                                // lambda before reset, so we don't leak.
+                                return;
+                            }
+                            if (map_update_future_.wait_for(kSlice)
+                                != std::future_status::timeout) {
+                                completed = true;
+                                break;
+                            }
+                        }
+                        if (!completed) {
                             RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                 "[RESPLE] async map update did not complete within 5s; "
                                 "skipping this cycle's map update. Worker remains responsive. "
