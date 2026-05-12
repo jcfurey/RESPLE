@@ -2,7 +2,8 @@ import os
 import launch
 import launch_ros.actions
 from ament_index_python.packages import get_package_share_directory
-from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.actions import DeclareLaunchArgument, TimerAction, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
 
@@ -11,10 +12,10 @@ def generate_launch_description():
         get_package_share_directory('resple'),
         'config',
         'config_demonstrator.yaml')
-    config_rviz = os.path.join(
+    viz_launch = os.path.join(
         get_package_share_directory('resple'),
-        'config',
-        'config.rviz')
+        'launch',
+        'resple_viz.launch.py')
 
     # Delay (seconds) before spawning RESPLE and Mapping. 0.0 = launch
     # immediately (original behavior). Useful when other nodes must come up
@@ -42,7 +43,7 @@ def generate_launch_description():
         emulate_tty=True,
         output='log',
         parameters=[config_yaml_fusion],
-        arguments=['--ros-args', '--log-level', 'warn'])
+        arguments=['--ros-args', '--log-level', 'info'])
 
     mapping_node = launch_ros.actions.Node(
         package='resple',
@@ -51,7 +52,7 @@ def generate_launch_description():
         emulate_tty=True,
         output='log',
         parameters=[config_yaml_fusion],
-        arguments=['--ros-args', '--log-level', 'warn'])
+        arguments=['--ros-args', '--log-level', 'info'])
 
     # Wrap each in a TimerAction. period accepts a Substitution that
     # resolves to a numeric string at launch time, so users can override
@@ -74,11 +75,8 @@ def generate_launch_description():
                 '--x', '0.011', '--y', '0.02329', '--z', '-0.04412',
                 '--qx', '0.0', '--qy', '0.0', '--qz', '0.0', '--qw', '1.0',
                 '--frame-id', 'base_link', '--child-frame-id', 'livox_frame']),
-        launch_ros.actions.Node(
-            package='rviz2',
-            executable='rviz2',
-            name='rviz2',
-            arguments=['-d', config_rviz, '--ros-args', '--log-level', 'WARN']),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(viz_launch)),
         delayed_resple,
         delayed_mapping,
     ])
