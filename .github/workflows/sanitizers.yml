@@ -1,0 +1,62 @@
+name: sanitizers
+
+# Compile-only check that the workspace still builds with AddressSanitizer +
+# UndefinedBehaviorSanitizer enabled. No bag replay, no runtime tests — that
+# would require a benchmark fixture we don't have. This catches some UB at
+# compile time (e.g. -fsanitize=undefined surfaces unaligned loads as warnings
+# under -Werror, and missing-noreturn, etc.).
+#
+# Jazzy only — the sanitizer paths in CMakeLists.txt were designed against
+# the GCC 13 / libstdc++ that Jazzy ships.
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+
+concurrency:
+  group: sanitizers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  asan-ubsan:
+    name: colcon build (ASan + UBSan, Jazzy)
+    runs-on: ubuntu-24.04
+    container:
+      image: osrf/ros:jazzy-desktop-full
+    steps:
+      - name: Checkout (into colcon src layout)
+        uses: actions/checkout@v4
+        with:
+          path: src/RESPLE
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            libeigen3-dev \
+            libomp-dev \
+            libpcl-dev \
+            libyaml-cpp-dev \
+            ros-jazzy-pcl-conversions \
+            ros-jazzy-pcl-msgs \
+            ros-jazzy-pcl-ros \
+            ros-jazzy-diagnostic-updater \
+            ros-jazzy-rosbag2-storage-mcap
+      - name: colcon build (ENABLE_ASAN)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/jazzy/setup.bash
+          colcon build \
+            --packages-up-to resple \
+            --event-handlers console_cohesion+ \
+            --cmake-args -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-build-log
+          path: log/
+          retention-days: 7

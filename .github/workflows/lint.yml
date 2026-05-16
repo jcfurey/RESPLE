@@ -1,0 +1,79 @@
+name: lint
+
+# Style / cmake / xml linting. Advisory only at first — the codebase
+# pre-dates this CI and almost certainly has style nits the linter will
+# surface. `continue-on-error: true` on each step means failures show up in
+# the job summary but don't block merges. Once the initial cleanup is done,
+# flip these to required.
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: cpplint / cmakelint / xmllint (advisory)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install linters
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxml2-utils \
+            python3-pip
+          # Pin versions so a transient upstream release can't break CI
+          # silently. Bump intentionally when the codebase is ready.
+          pip3 install --break-system-packages \
+            'cpplint==1.6.1' \
+            'cmakelint==1.4.3'
+      - name: cpplint (SLAM sources)
+        continue-on-error: true
+        shell: bash
+        run: |
+          # Scope to the SLAM source we author. Excludes the renamed Livox
+          # message-package forks (upstream code) and the vendored ikd-Tree
+          # implementation (also upstream).
+          cpplint \
+            --filter=-legal/copyright,-build/c++17,-runtime/references,-build/include_subdir,-whitespace/line_length \
+            --linelength=120 \
+            --recursive \
+            resple/src \
+            resple/include/Estimator.h \
+            resple/include/SplineState.h \
+            resple/include/Association.h \
+            resple/include/utils
+      - name: cmakelint (CMakeLists.txt)
+        continue-on-error: true
+        shell: bash
+        run: |
+          cmakelint \
+            --filter=-linelength,-readability/wonkycase \
+            resple/CMakeLists.txt \
+            estimate_msgs/CMakeLists.txt
+      - name: xmllint (package.xml)
+        continue-on-error: true
+        shell: bash
+        run: |
+          # Schema validation against the public format-3 schema. Catches
+          # malformed package.xml that would otherwise only fail at colcon
+          # parse time.
+          for pkg in \
+              resple/package.xml \
+              estimate_msgs/package.xml \
+              AviaResple_msgs/package.xml \
+              HAP360_msgs/package.xml \
+              Mid70Avia_msgs/package.xml ; do
+            echo "--- $pkg ---"
+            xmllint --noout --schema \
+              http://download.ros.org/schema/package_format3.xsd \
+              "$pkg"
+          done

@@ -1,0 +1,74 @@
+name: build
+
+# Build the workspace under colcon on each supported ROS 2 distro. This is the
+# baseline CI: catches link / compile / CMake regressions. Sanitizer build,
+# lint, and Dockerfile-smoke live in their own workflow files so a single slow
+# job doesn't gate the others.
+#
+# Runs on PRs and on pushes to develop.
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+
+# Cancel in-progress runs on the same ref when a new commit lands; saves CI
+# minutes when force-pushing PRs.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  colcon-build:
+    name: colcon build (${{ matrix.distro }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [jazzy, kilted]
+    container:
+      # osrf/ros publishes -desktop-full images for each released distro on
+      # Ubuntu 24.04 (Jazzy and Kilted both). They bundle rclcpp, tf2_*,
+      # sensor_msgs, etc. — most of the package.xml deps. We still need PCL,
+      # Eigen, and the rosbag2 mcap storage plugin.
+      image: osrf/ros:${{ matrix.distro }}-desktop-full
+    steps:
+      - name: Checkout (into colcon src layout)
+        uses: actions/checkout@v4
+        with:
+          # Place the repo at src/RESPLE so that the workspace looks like
+          # `<root>/src/RESPLE/{resple,estimate_msgs,AviaResple_msgs,...}`.
+          # colcon's recursive package.xml scan picks up every sub-package
+          # without any extra config.
+          path: src/RESPLE
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            libeigen3-dev \
+            libomp-dev \
+            libpcl-dev \
+            libyaml-cpp-dev \
+            ros-${{ matrix.distro }}-pcl-conversions \
+            ros-${{ matrix.distro }}-pcl-msgs \
+            ros-${{ matrix.distro }}-pcl-ros \
+            ros-${{ matrix.distro }}-diagnostic-updater \
+            ros-${{ matrix.distro }}-rosbag2-storage-mcap
+      - name: colcon build (Release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          colcon build \
+            --packages-up-to resple \
+            --event-handlers console_cohesion+ \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.distro }}
+          path: log/
+          retention-days: 7
