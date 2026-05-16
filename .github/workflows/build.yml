@@ -59,8 +59,13 @@ jobs:
       - name: colcon build (Release)
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
+          # `set -u` and ROS setup.bash don't mix on Kilted+ — the script
+          # references AMENT_TRACE_SETUP_FILES before defining it. Disable
+          # nounset just for the source line, re-enable for the build itself.
+          set +u
           source /opt/ros/${{ matrix.distro }}/setup.bash
+          set -u
           colcon build \
             --packages-up-to resple \
             --event-handlers console_cohesion+ \

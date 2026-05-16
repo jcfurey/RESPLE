@@ -47,8 +47,12 @@ jobs:
       - name: colcon build (ENABLE_ASAN)
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
+          # `set -u` and ROS setup.bash don't mix on Kilted+; same precaution
+          # for Jazzy in case the same change is backported.
+          set +u
           source /opt/ros/jazzy/setup.bash
+          set -u
           colcon build \
             --packages-up-to resple \
             --event-handlers console_cohesion+ \
