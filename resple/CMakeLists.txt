@@ -275,33 +275,45 @@ target_sources(RESPLE PRIVATE src/RESPLE.cpp)
 target_link_options(RESPLE  PRIVATE -rdynamic)
 target_link_options(Mapping PRIVATE -rdynamic)
 
-# ament_target_dependencies() is deprecated in Kilted (still functional, emits
-# warning) and slated for removal in a future distro. Replace with the modern
-# pattern: find_package() above (already done lines 41-66) populates
-# <pkg>_TARGETS with the imported targets, which we link via plain
-# target_link_libraries.
+# Restored to ament_target_dependencies() after the `${<pkg>_TARGETS}`
+# migration broke the Jazzy build: pcl_conversions does not export the
+# include directories through its imported targets variable on Jazzy, so
+# `target_link_libraries(${pcl_conversions_TARGETS})` left
+# `#include <pcl_conversions/pcl_conversions.h>` unresolved. The
+# ament_target_dependencies macro reads the legacy `<pkg>_INCLUDE_DIRS` /
+# `<pkg>_LIBRARIES` form and works uniformly across every package here.
+#
+# Yes, this emits a deprecation WARNING (not error) on Kilted+. We'll
+# re-attempt the migration when ament_cmake's _TARGETS coverage on
+# non-message packages catches up, or invididually wire problematic
+# packages via target_include_directories.
+ament_target_dependencies(${PROJECT_NAME}
+	rclcpp
+	rclcpp_components
+	std_msgs
+	geometry_msgs
+	nav_msgs
+	sensor_msgs
+	visualization_msgs
+	std_srvs
+	livox_interfaces
+	livox_ros_driver
+	livox_ros_driver2
+	estimate_msgs
+	pcl_conversions
+	tf2_ros
+	tf2_eigen
+	tf2_geometry_msgs
+	tf2_sensor_msgs
+	diagnostic_updater
+	rclcpp_action
+	rclcpp_lifecycle
+	rosbag2_cpp
+)
+
+# Plain-signature target_link_libraries for the non-ament deps. PCL and
+# yaml-cpp don't participate in the ament dep graph; link them directly.
 target_link_libraries(${PROJECT_NAME}
-	${rclcpp_TARGETS}
-	${rclcpp_components_TARGETS}
-	${std_msgs_TARGETS}
-	${geometry_msgs_TARGETS}
-	${nav_msgs_TARGETS}
-	${sensor_msgs_TARGETS}
-	${visualization_msgs_TARGETS}
-	${std_srvs_TARGETS}
-	${livox_interfaces_TARGETS}
-	${livox_ros_driver_TARGETS}
-	${livox_ros_driver2_TARGETS}
-	${estimate_msgs_TARGETS}
-	${pcl_conversions_TARGETS}
-	${tf2_ros_TARGETS}
-	${tf2_eigen_TARGETS}
-	${tf2_geometry_msgs_TARGETS}
-	${tf2_sensor_msgs_TARGETS}
-	${diagnostic_updater_TARGETS}
-	${rclcpp_action_TARGETS}
-	${rclcpp_lifecycle_TARGETS}
-	${rosbag2_cpp_TARGETS}
 	${PCL_LIBRARIES}
 	${YAML_CPP_LIBRARIES}
 )
