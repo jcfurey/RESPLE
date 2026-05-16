@@ -562,6 +562,10 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
             impl_->ensure_cub_temp(impl_->d_cub_scan, impl_->cub_scan_bytes, s_needed);
         }
 
+        // CUB's HistogramEven convention: `num_levels = L` produces `L - 1`
+        // output bins. We pass `kNumBuckets + 1` levels and get exactly
+        // `kNumBuckets` outputs — matching the `d_bucket_counts` allocation
+        // of `kNumBuckets * sizeof(int)`. Do NOT "simplify" the +1 away.
         cub::DeviceHistogram::HistogramEven(
             impl_->d_cub_hist, impl_->cub_hist_bytes,
             impl_->d_sorted_buckets, impl_->d_bucket_counts,

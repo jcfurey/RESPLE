@@ -347,16 +347,33 @@ install(TARGETS ${PROJECT_NAME}
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
 
-# Export only ament packages (yaml-cpp is not an ament package)
+# Export only ament packages (yaml-cpp / Eigen3 / PCL / OpenMP / BLAS are
+# not ament). Keep this list in sync with find_package() above so downstream
+# consumers that link against ${PROJECT_NAME} see the full transitive
+# dependency graph and CMake can resolve their headers.
 ament_export_dependencies(
 	rclcpp
+	rclcpp_components
+	rclcpp_action
+	rclcpp_lifecycle
+	std_msgs
+	geometry_msgs
+	nav_msgs
+	sensor_msgs
+	visualization_msgs
+	std_srvs
+	builtin_interfaces
+	tf2_ros
+	tf2_eigen
+	tf2_geometry_msgs
+	tf2_sensor_msgs
+	pcl_conversions
+	diagnostic_updater
+	rosbag2_cpp
 	livox_ros_driver
 	livox_ros_driver2
 	livox_interfaces
-	diagnostic_updater
-	rclcpp_action
-	rclcpp_lifecycle
-	rosbag2_cpp
+	estimate_msgs
 )
 ament_export_libraries(${PROJECT_NAME})
 ament_package()

@@ -141,14 +141,19 @@ public:
     static Eigen::Vector3d readVector3d(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_params, const std::string& name)
     {
         std::vector<double> v = CommonUtils::readParam<std::vector<double>>(node_params, name, {0.0, 0.0, 0.0});
+        // Defensive: readParam returns the default for missing params, but
+        // YAML can legally provide an empty / undersized list and bypass that
+        // path. v[0..2] would then be UB. Fall back to zero on undersized.
+        if (v.size() < 3) {
+            return Eigen::Vector3d::Zero();
+        }
         return Eigen::Vector3d(v[0], v[1], v[2]);
-    } 
-
-    static Eigen::Vector3d readVector3d(rclcpp::Node::SharedPtr &n, const std::string& name)
-    {
-        std::vector<double> v = CommonUtils::readParam<std::vector<double>>(n, name);
-        return Eigen::Vector3d(v[0], v[1], v[2]);
-    }          
+    }
+    // The Node::SharedPtr / no-default overload of readVector3d was removed
+    // 2026-05-16 — it called readParam<std::vector<double>>(n, name) (which
+    // exit(1)s on missing param) and then unconditionally indexed v[0..2],
+    // which is UB if a user supplies an empty list. No call sites existed.
+    // Use the NodeParametersInterface overload above (with its zero default).
 
     static Eigen::Vector3d R2ypr(const Eigen::Matrix3d &R)
     {
