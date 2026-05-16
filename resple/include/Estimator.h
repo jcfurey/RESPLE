@@ -21,6 +21,36 @@ class Estimator
     static const int BA_OFFSET = 24;
     static const int BG_OFFSET = 27;
     int n_iter = 1;
+    // IEKF inner-loop tunables — public so RESPLE.cpp can override the
+    // defaults from ROS params. Originally lived next to the H/innv/cov
+    // buffers below, but those are private members of the implementation.
+    //
+    //  max_iter : Maximum IEKF inner iterations per cycle. The loop exits
+    //             early when the per-component state-update norms drop
+    //             below eps_cp / eps_bias for n_iter cumulative iterations;
+    //             otherwise it caps here.
+    //  eps_cp   : L2 norm threshold on the 24-element control-point block
+    //             update (positions in metres, rotation-vector parts in
+    //             radians). 0.1 matches the previous mixed-eps default in
+    //             steady state.
+    //  eps_bias : L2 norm threshold on the 6-element bias block update
+    //             (accel in m/s², gyro in rad/s). Used only in LIO mode
+    //             (XSIZE=30); ignored in LO mode (XSIZE=24). 0.01 is
+    //             tighter than the CP block because biases ought to move
+    //             much less per iter.
+    //  imu_*_outlier_threshold : Hard outlier gates for IMU innovations
+    //             vs the spline-interpolated IMU. Above these magnitudes
+    //             the corresponding axis is zeroed out for this
+    //             measurement (its row of H and its innovation entry are
+    //             set to 0). The defaults match the previous hard-coded
+    //             values; tune up for aggressive-motion platforms
+    //             (drones, fast turns) so genuine high-rate samples
+    //             aren't silently dropped.
+    int max_iter = 5;
+    double eps_cp = 0.1;
+    double eps_bias = 0.01;
+    double imu_accel_outlier_threshold = 10.0;  // m/s²
+    double imu_gyro_outlier_threshold = 5.0;    // rad/s
 
     // Atomic because updateDiagnostics may read these from the ROS executor
     // thread while the worker is mid-IEKF. Monotonic; no reset — the diagnostics
@@ -396,32 +426,6 @@ class Estimator
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> cov_inv_buf_;
-    // Maximum IEKF inner iterations per cycle. The loop exits early when the
-    // state update norm drops below the per-component thresholds (eps_cp /
-    // eps_bias) for `n_iter` cumulative iterations; otherwise it caps here.
-    int max_iter = 5;
-    // Per-component convergence thresholds. A single mixed-units threshold
-    // (the old `eps`) lets one dominant component (typically position) drive
-    // the exit while orientation or IMU bias are still refining. Splitting
-    // by block keeps each scale's exit condition meaningful.
-    //
-    //  eps_cp   : L2 norm of the 24-element control-point block update
-    //             (positions in metres, rotation-vector parts in radians).
-    //             0.1 matches the previous mixed-eps default in steady state.
-    //  eps_bias : L2 norm of the 6-element bias block update (accel in m/s²,
-    //             gyro in rad/s). Used only in LIO mode (XSIZE=30); ignored
-    //             in LO mode (XSIZE=24). 0.01 is tighter than the CP block
-    //             because biases ought to move much less per iter.
-    double eps_cp = 0.1;
-    double eps_bias = 0.01;
-    // Hard outlier gates for IMU innovations vs the spline-interpolated IMU.
-    // Above these magnitudes the corresponding axis is zeroed out for this
-    // measurement (its row of H and its innovation entry are set to 0). The
-    // defaults match the previous hard-coded values; tune up for aggressive
-    // motion platforms (drones, fast turns) so genuine high-rate samples
-    // aren't silently dropped.
-    double imu_accel_outlier_threshold = 10.0;  // m/s²
-    double imu_gyro_outlier_threshold = 5.0;    // rad/s
 
     void prepIMU(ImuData& imu_data, const Eigen::Vector3d& g)
     {
