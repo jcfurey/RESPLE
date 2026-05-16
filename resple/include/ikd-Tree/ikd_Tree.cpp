@@ -1,3 +1,18 @@
+// 2026-05-01 Eigen aligned-allocator ABI fix — MUST land before any header
+// that pulls Eigen. ikd_Tree.h also stamps these macros, but PCL headers
+// pulled transitively from translation units that re-include this file
+// before ikd_Tree.h would otherwise win. Mirrors the block at the top of
+// RESPLE.cpp / Mapping.cpp / ikd_Tree.h. See HARDENING.md Phase 1.6.
+#ifndef EIGEN_MALLOC_ALREADY_ALIGNED
+#define EIGEN_MALLOC_ALREADY_ALIGNED 1
+#endif
+#ifndef EIGEN_DEFAULT_ALIGN_BYTES
+#define EIGEN_DEFAULT_ALIGN_BYTES 16
+#endif
+#ifndef EIGEN_MAX_ALIGN_BYTES
+#define EIGEN_MAX_ALIGN_BYTES 16
+#endif
+
 #include "ikd_Tree.h"
 
 /*

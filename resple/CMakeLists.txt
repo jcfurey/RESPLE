@@ -186,10 +186,15 @@ target_compile_definitions(${PROJECT_NAME} PUBLIC
 	_GNU_SOURCE
 	EIGEN_MALLOC_ALREADY_ALIGNED=1
 	EIGEN_DEFAULT_ALIGN_BYTES=16
+	EIGEN_MAX_ALIGN_BYTES=16
 )
 
-# Enforce C++17 and apply optimization flags to the library target
-target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
+# C++ standard. Bumped to C++20 for ROS 2 Lyrical Luth (Ubuntu 26.04, GCC 14)
+# which defaults its packages to C++20. Code is C++17-clean today; opting in
+# to C++20 keeps us aligned with the Lyrical distro policy and forward-
+# compatible. GCC 13 on Jazzy fully supports C++20, so the current target
+# build is unaffected.
+target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_20)
 # Warning set matches the workspace's colcon_defaults where practical. -Wshadow
 # catches the local/member name reuse that the audit flagged as the kind of
 # bug that would slip past code review. -Wextra is strictly more than -Wall.
@@ -270,32 +275,33 @@ target_sources(RESPLE PRIVATE src/RESPLE.cpp)
 target_link_options(RESPLE  PRIVATE -rdynamic)
 target_link_options(Mapping PRIVATE -rdynamic)
 
-ament_target_dependencies(${PROJECT_NAME} 
-	rclcpp
-	rclcpp_components
-	std_msgs
-	geometry_msgs
-	nav_msgs
-	sensor_msgs
-	visualization_msgs
-	std_srvs
-	livox_interfaces
-	livox_ros_driver
-	livox_ros_driver2
-	estimate_msgs
-	pcl_conversions
-	tf2_ros
-	tf2_eigen
-	tf2_geometry_msgs
-	tf2_sensor_msgs
-	diagnostic_updater
-	rclcpp_action
-	rclcpp_lifecycle
-	rosbag2_cpp
-)
-
-# Use plain signature consistently (ament_target_dependencies uses plain internally)
+# ament_target_dependencies() is deprecated in Kilted (still functional, emits
+# warning) and slated for removal in a future distro. Replace with the modern
+# pattern: find_package() above (already done lines 41-66) populates
+# <pkg>_TARGETS with the imported targets, which we link via plain
+# target_link_libraries.
 target_link_libraries(${PROJECT_NAME}
+	${rclcpp_TARGETS}
+	${rclcpp_components_TARGETS}
+	${std_msgs_TARGETS}
+	${geometry_msgs_TARGETS}
+	${nav_msgs_TARGETS}
+	${sensor_msgs_TARGETS}
+	${visualization_msgs_TARGETS}
+	${std_srvs_TARGETS}
+	${livox_interfaces_TARGETS}
+	${livox_ros_driver_TARGETS}
+	${livox_ros_driver2_TARGETS}
+	${estimate_msgs_TARGETS}
+	${pcl_conversions_TARGETS}
+	${tf2_ros_TARGETS}
+	${tf2_eigen_TARGETS}
+	${tf2_geometry_msgs_TARGETS}
+	${tf2_sensor_msgs_TARGETS}
+	${diagnostic_updater_TARGETS}
+	${rclcpp_action_TARGETS}
+	${rclcpp_lifecycle_TARGETS}
+	${rosbag2_cpp_TARGETS}
 	${PCL_LIBRARIES}
 	${YAML_CPP_LIBRARIES}
 )

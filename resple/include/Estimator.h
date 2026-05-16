@@ -9,6 +9,13 @@
 template<int XSIZE>
 class Estimator
 {
+    // Only two instantiations exist: XSIZE=24 (LO mode) and XSIZE=30 (LIO).
+    // The BA_OFFSET / BG_OFFSET writes below assume one of those shapes;
+    // any other instantiation would silently write out of the covariance
+    // matrix bounds.
+    static_assert(XSIZE == 24 || XSIZE == 30,
+        "Estimator only supports XSIZE=24 (LO) or XSIZE=30 (LIO)");
+
   public:
     static const int CP_SIZE = 24;
     static const int BA_OFFSET = 24;
@@ -19,6 +26,13 @@ class Estimator
     // thread while the worker is mid-IEKF. Monotonic; no reset — the diagnostics
     // publisher snapshots deltas.
     std::atomic<uint64_t> num_numerical_failures_{0};
+
+    // Set by every IEKF inner loop to the 1-based iteration count at the
+    // point the loop exited (via convergence break, numerical-failure break,
+    // or max_iter cap). Read by updateDiagnostics on the ROS executor thread,
+    // so atomic; relaxed because we don't need synchronization with other
+    // diagnostics counters.
+    std::atomic<int> last_iter_count_{0};
 
     Estimator() {};
 
@@ -71,6 +85,8 @@ class Estimator
         int num_tot_eff = 0;
         int t = 0;
         for (int i = 0; i < max_iter; i++) {
+            // 1-based count; last write wins when the loop breaks/exits.
+            last_iter_count_.store(i + 1, std::memory_order_relaxed);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
@@ -118,6 +134,8 @@ class Estimator
         int num_tot_eff = 0;
         int t = 0;
         for (int i = 0; i < max_iter; i++) {
+            // 1-based count; last write wins when the loop breaks/exits.
+            last_iter_count_.store(i + 1, std::memory_order_relaxed);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
@@ -162,6 +180,8 @@ class Estimator
         int num_tot_eff = 0;
         int t = 0;
         for (int i = 0; i < max_iter; i++) {
+            // 1-based count; last write wins when the loop breaks/exits.
+            last_iter_count_.store(i + 1, std::memory_order_relaxed);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
@@ -211,6 +231,8 @@ class Estimator
         int num_tot_eff = 0;
         int t = 0;
         for (int i = 0; i < max_iter; i++) {
+            // 1-based count; last write wins when the loop breaks/exits.
+            last_iter_count_.store(i + 1, std::memory_order_relaxed);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
@@ -398,7 +420,15 @@ class Estimator
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> cov_inv_buf_;
+    // Maximum IEKF inner iterations per cycle. The loop exits early when the
+    // state update norm drops below `eps` for two consecutive iterations
+    // (n_iter=1 + the `t++ > n_iter` check); otherwise it caps here.
     int max_iter = 5;
+    // Convergence threshold on the L2 norm of the per-iteration state update
+    // ‖x_{i+1} - x_i‖. Units are the same mixed-magnitude state vector
+    // (position metres, rotation rad, IMU biases m/s² and rad/s); 0.1 is a
+    // loose tolerance chosen so the loop nearly always converges in 2-3
+    // iterations and rarely reaches max_iter.
     double eps = 0.1;
 
     void prepIMU(ImuData& imu_data, const Eigen::Vector3d& g)

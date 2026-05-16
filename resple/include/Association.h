@@ -1,5 +1,20 @@
 #pragma once
 
+// 2026-05-01 Eigen aligned-allocator ABI fix — defensive stamp. This header
+// pulls Eigen directly (Geometry, Dense) and is included by .cpp files
+// that stamp these macros at the top. Repeating them here means new
+// includers don't have to know the rule. See ikd_Tree.h for the full
+// rationale and HARDENING.md Phase 1.6.
+#ifndef EIGEN_MALLOC_ALREADY_ALIGNED
+#define EIGEN_MALLOC_ALREADY_ALIGNED 1
+#endif
+#ifndef EIGEN_DEFAULT_ALIGN_BYTES
+#define EIGEN_DEFAULT_ALIGN_BYTES 16
+#endif
+#ifndef EIGEN_MAX_ALIGN_BYTES
+#define EIGEN_MAX_ALIGN_BYTES 16
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>

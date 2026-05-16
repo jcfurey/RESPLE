@@ -32,7 +32,7 @@
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
-#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_broadcaster.hpp>
 #include <tf2_ros/transform_listener.hpp>
 #include <tf2_ros/buffer.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -162,7 +162,13 @@ public:
             "pose_cov", rclcpp::QoS(1).transient_local().reliable());
         pub_odom = this->create_publisher<nav_msgs::msg::Odometry>(
             "odom", rclcpp::QoS(10).reliable());
-        pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
+        // /current_scan is high-rate bulk LiDAR data. SensorDataQoS (best-
+        // effort, small keep-last) matches default subscriber QoS in rviz2
+        // and common drivers; the previous reliable+depth=2 silently dropped
+        // messages whenever a best-effort subscriber connected (QoS-
+        // incompatible). Drops on heavy load are acceptable for visualization;
+        // downstream pose-critical paths use /odom / /pose, not /current_scan.
+        pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::SensorDataQoS());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -733,6 +739,18 @@ public:
                                 // worker loop entirely; the future destructor in
                                 // on_deactivate / on_shutdown still waits for the
                                 // lambda before reset, so we don't leak.
+                                //
+                                // Safety re: partial map-update state: this return
+                                // ends the worker loop, so no subsequent IEKF
+                                // iteration consumes the possibly-partial kd-tree
+                                // / CUDA map. The lambda body holds mtx_map_ as a
+                                // unique_lock for the duration of its writes, so
+                                // either (a) the lambda finishes before the
+                                // future destructor runs (no partial state), or
+                                // (b) destruction blocks until completion. The
+                                // try/catch around the lambda's body also clears
+                                // map_update_pending_ on exception, so the next
+                                // process lifetime restarts cleanly.
                                 return;
                             }
                             if (map_update_future_.wait_for(kSlice)

@@ -297,6 +297,12 @@ struct CudaMap::Impl {
     // cudaSetDevice.
     bool integrated = false;
     bool integrated_detected = false;
+    // Default stream by design — all kernel launches and cudaMemcpyAsync calls
+    // in this implementation use the default stream. If a future change adds
+    // cudaEvent_t synchronization, create a real stream first via
+    // cudaStreamCreate; cudaEventRecord on the default-stream handle is legal
+    // but couples the event to all default-stream work, which is rarely what
+    // callers want.
     cudaStream_t stream = 0;
 
     // GPU-resident sorted map (after hash-grid build).
@@ -400,19 +406,39 @@ struct CudaMap::Impl {
         staged_queries.free_all();
         staged_out_nbr.free_all();
         staged_out_dst.free_all();
-        if (d_sorted_points)   cudaFree(d_sorted_points);
-        if (d_sorted_cell_ids) cudaFree(d_sorted_cell_ids);
-        if (d_buckets)        cudaFree(d_buckets);
-        if (d_sorted_buckets) cudaFree(d_sorted_buckets);
-        if (d_cell_ids)       cudaFree(d_cell_ids);
-        if (d_input_indices)  cudaFree(d_input_indices);
-        if (d_sorted_indices) cudaFree(d_sorted_indices);
-        if (d_bucket_starts)  cudaFree(d_bucket_starts);
-        if (d_bucket_counts)  cudaFree(d_bucket_counts);
-        if (d_cub_sort)       cudaFree(d_cub_sort);
-        if (d_cub_hist)       cudaFree(d_cub_hist);
-        if (d_cub_scan)       cudaFree(d_cub_scan);
-        if (stream)           cudaStreamDestroy(stream);
+        // Destructor-safe CUDA cleanup: log on failure but never throw or
+        // abort. Silent ignores would mask VRAM leaks and driver state
+        // corruption that surface much later as cryptic cudaMalloc failures
+        // in unrelated callers.
+        #define RESPLE_CUDA_FREE_LOGGED(ptr) do {                              \
+            if ((ptr)) {                                                       \
+                if (auto err = cudaFree(ptr); err != cudaSuccess) {            \
+                    std::fprintf(stderr,                                       \
+                        "[CUDA] cudaFree(" #ptr ") failed: %s\n",              \
+                        cudaGetErrorString(err));                              \
+                }                                                              \
+            }                                                                  \
+        } while (0)
+        RESPLE_CUDA_FREE_LOGGED(d_sorted_points);
+        RESPLE_CUDA_FREE_LOGGED(d_sorted_cell_ids);
+        RESPLE_CUDA_FREE_LOGGED(d_buckets);
+        RESPLE_CUDA_FREE_LOGGED(d_sorted_buckets);
+        RESPLE_CUDA_FREE_LOGGED(d_cell_ids);
+        RESPLE_CUDA_FREE_LOGGED(d_input_indices);
+        RESPLE_CUDA_FREE_LOGGED(d_sorted_indices);
+        RESPLE_CUDA_FREE_LOGGED(d_bucket_starts);
+        RESPLE_CUDA_FREE_LOGGED(d_bucket_counts);
+        RESPLE_CUDA_FREE_LOGGED(d_cub_sort);
+        RESPLE_CUDA_FREE_LOGGED(d_cub_hist);
+        RESPLE_CUDA_FREE_LOGGED(d_cub_scan);
+        #undef RESPLE_CUDA_FREE_LOGGED
+        if (stream) {
+            if (auto err = cudaStreamDestroy(stream); err != cudaSuccess) {
+                std::fprintf(stderr,
+                    "[CUDA] cudaStreamDestroy(stream) failed: %s\n",
+                    cudaGetErrorString(err));
+            }
+        }
     }
 };
 
