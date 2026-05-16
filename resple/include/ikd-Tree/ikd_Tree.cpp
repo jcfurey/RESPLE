@@ -1233,6 +1233,12 @@ bool KD_TREE<PointType>::Criterion_Check(KD_TREE_NODE *root)
     KD_TREE_NODE *son_ptr = root->left_son_ptr;
     if (son_ptr == nullptr)
         son_ptr = root->right_son_ptr;
+    if (son_ptr == nullptr) {
+        // Unreachable for TreeSize > Minimal_Unbalanced_Tree_Size (a node with
+        // TreeSize > 1 must have at least one child), but cheap defense in
+        // case future refactors change the early-return threshold.
+        return false;
+    }
     delete_evaluation = float(root->invalid_point_num) / root->TreeSize;
     balance_evaluation = float(son_ptr->TreeSize) / (root->TreeSize - 1);
     if (delete_evaluation > delete_criterion_param)

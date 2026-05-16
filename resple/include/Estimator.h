@@ -81,37 +81,32 @@ class Estimator
     {
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
-        bool converged = true;
         int num_tot_eff = 0;
         int t = 0;
         for (int i = 0; i < max_iter; i++) {
-            // 1-based count; last write wins when the loop breaks/exits.
             last_iter_count_.store(i + 1, std::memory_order_relaxed);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
-            if (converged) {
-                num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, num_threads, num_match_points);
-            }
-            if (num_tot_eff > 0) {
-                if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
-                    std::cerr << "[Estimator] IEKF LiDAR update failed (numerical), resetting covariance to prior\n";
-                    num_numerical_failures_.fetch_add(1, std::memory_order_relaxed);
-                    cov_rcp = cov_prop;
-                    break;
-                }
-            } else {
+            // Canonical IEKF: relinearize at the current state estimate by
+            // re-finding correspondences every iteration. The previous form
+            // cached neighbors from the iteration where state had stabilized,
+            // which biases the update toward iter-0 pose when the prior is
+            // bad or motion is large.
+            num_tot_eff = 0;
+            Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, num_threads, num_match_points);
+            if (num_tot_eff <= 0) break;
+            if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
+                std::cerr << "[Estimator] IEKF LiDAR update failed (numerical), resetting covariance to prior\n";
+                num_numerical_failures_.fetch_add(1, std::memory_order_relaxed);
+                cov_rcp = cov_prop;
                 break;
             }
-            converged = true;
-            Eigen::Matrix<double, XSIZE, 1> state_af = getState();
-            if ((state_af - rcpi).norm() > eps) {
-                converged = false;
-            } else {
-                t++;
+            const Eigen::Matrix<double, XSIZE, 1> dx = getState() - rcpi;
+            bool converged_iter = dx.template head<24>().norm() <= eps_cp;
+            if constexpr (XSIZE > 24) {
+                converged_iter = converged_iter
+                    && dx.template tail<XSIZE - 24>().norm() <= eps_bias;
             }
-            if(!t && i == max_iter - 2) {
-                converged = true;
-            }
+            if (converged_iter) ++t;
             if ((t > n_iter) || (i == max_iter - 1)) {
                 // Joseph-form posterior was computed inside update(); just copy it out.
                 // Symmetrize defensively to clean up any FP roundoff from the matrix products.
@@ -130,37 +125,30 @@ class Estimator
     {
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
-        bool converged = true;
         int num_tot_eff = 0;
         int t = 0;
         for (int i = 0; i < max_iter; i++) {
-            // 1-based count; last write wins when the loop breaks/exits.
             last_iter_count_.store(i + 1, std::memory_order_relaxed);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
-            if (converged) {
-                num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, num_threads, num_match_points);
-            }
-            if (num_tot_eff > 0) {
-                if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
-                    std::cerr << "[Estimator] IEKF LiDAR update failed (numerical), resetting covariance to prior\n";
-                    num_numerical_failures_.fetch_add(1, std::memory_order_relaxed);
-                    cov_rcp = cov_prop;
-                    break;
-                }
-            } else {
+            // Canonical IEKF: relinearize every iteration (see ikdtree variant
+            // above for rationale). GPU findCorresp is batched and amortizes
+            // well across iterations.
+            num_tot_eff = 0;
+            Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, num_threads, num_match_points);
+            if (num_tot_eff <= 0) break;
+            if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
+                std::cerr << "[Estimator] IEKF LiDAR update failed (numerical), resetting covariance to prior\n";
+                num_numerical_failures_.fetch_add(1, std::memory_order_relaxed);
+                cov_rcp = cov_prop;
                 break;
             }
-            converged = true;
-            Eigen::Matrix<double, XSIZE, 1> state_af = getState();
-            if ((state_af - rcpi).norm() > eps) {
-                converged = false;
-            } else {
-                t++;
+            const Eigen::Matrix<double, XSIZE, 1> dx = getState() - rcpi;
+            bool converged_iter = dx.template head<24>().norm() <= eps_cp;
+            if constexpr (XSIZE > 24) {
+                converged_iter = converged_iter
+                    && dx.template tail<XSIZE - 24>().norm() <= eps_bias;
             }
-            if(!t && i == max_iter - 2) {
-                converged = true;
-            }
+            if (converged_iter) ++t;
             if ((t > n_iter) || (i == max_iter - 1)) {
                 cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
                 break;
@@ -176,17 +164,14 @@ class Estimator
     {
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
-        bool converged = true;
         int num_tot_eff = 0;
         int t = 0;
         for (int i = 0; i < max_iter; i++) {
-            // 1-based count; last write wins when the loop breaks/exits.
             last_iter_count_.store(i + 1, std::memory_order_relaxed);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
-            if (converged) {
-                num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, num_threads, num_match_points);
-            }
+            // Canonical IEKF: relinearize every iteration.
+            num_tot_eff = 0;
+            Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, num_threads, num_match_points);
             bool update_ok = false;
             if (num_tot_eff > 0 && imu_meas.empty()) {
                 update_ok = updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads);
@@ -201,16 +186,13 @@ class Estimator
                 cov_rcp = cov_prop;
                 break;
             }
-            converged = true;
-            Eigen::Matrix<double, XSIZE, 1> state_af = getState();
-            if ((state_af - rcpi).norm() > eps) {
-                converged = false;
-            } else {
-                t++;
+            const Eigen::Matrix<double, XSIZE, 1> dx = getState() - rcpi;
+            bool converged_iter = dx.template head<24>().norm() <= eps_cp;
+            if constexpr (XSIZE > 24) {
+                converged_iter = converged_iter
+                    && dx.template tail<XSIZE - 24>().norm() <= eps_bias;
             }
-            if(!t && i == max_iter - 2) {
-                converged = true;
-            }
+            if (converged_iter) ++t;
             if ((t > n_iter) || (i == max_iter - 1)) {
                 cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
                 break;
@@ -227,17 +209,14 @@ class Estimator
     {
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
-        bool converged = true;
         int num_tot_eff = 0;
         int t = 0;
         for (int i = 0; i < max_iter; i++) {
-            // 1-based count; last write wins when the loop breaks/exits.
             last_iter_count_.store(i + 1, std::memory_order_relaxed);
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
-            if (converged) {
-                num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, num_threads, num_match_points);
-            }
+            // Canonical IEKF: relinearize every iteration.
+            num_tot_eff = 0;
+            Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, num_threads, num_match_points);
             bool update_ok = false;
             if (num_tot_eff > 0 && imu_meas.empty()) {
                 update_ok = updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads);
@@ -252,16 +231,13 @@ class Estimator
                 cov_rcp = cov_prop;
                 break;
             }
-            converged = true;
-            Eigen::Matrix<double, XSIZE, 1> state_af = getState();
-            if ((state_af - rcpi).norm() > eps) {
-                converged = false;
-            } else {
-                t++;
+            const Eigen::Matrix<double, XSIZE, 1> dx = getState() - rcpi;
+            bool converged_iter = dx.template head<24>().norm() <= eps_cp;
+            if constexpr (XSIZE > 24) {
+                converged_iter = converged_iter
+                    && dx.template tail<XSIZE - 24>().norm() <= eps_bias;
             }
-            if(!t && i == max_iter - 2) {
-                converged = true;
-            }
+            if (converged_iter) ++t;
             if ((t > n_iter) || (i == max_iter - 1)) {
                 // Joseph-form posterior was computed inside update(); just copy it out.
                 // Symmetrize defensively to clean up any FP roundoff from the matrix products.
@@ -421,15 +397,31 @@ class Estimator
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> cov_inv_buf_;
     // Maximum IEKF inner iterations per cycle. The loop exits early when the
-    // state update norm drops below `eps` for two consecutive iterations
-    // (n_iter=1 + the `t++ > n_iter` check); otherwise it caps here.
+    // state update norm drops below the per-component thresholds (eps_cp /
+    // eps_bias) for `n_iter` cumulative iterations; otherwise it caps here.
     int max_iter = 5;
-    // Convergence threshold on the L2 norm of the per-iteration state update
-    // ‖x_{i+1} - x_i‖. Units are the same mixed-magnitude state vector
-    // (position metres, rotation rad, IMU biases m/s² and rad/s); 0.1 is a
-    // loose tolerance chosen so the loop nearly always converges in 2-3
-    // iterations and rarely reaches max_iter.
-    double eps = 0.1;
+    // Per-component convergence thresholds. A single mixed-units threshold
+    // (the old `eps`) lets one dominant component (typically position) drive
+    // the exit while orientation or IMU bias are still refining. Splitting
+    // by block keeps each scale's exit condition meaningful.
+    //
+    //  eps_cp   : L2 norm of the 24-element control-point block update
+    //             (positions in metres, rotation-vector parts in radians).
+    //             0.1 matches the previous mixed-eps default in steady state.
+    //  eps_bias : L2 norm of the 6-element bias block update (accel in m/s²,
+    //             gyro in rad/s). Used only in LIO mode (XSIZE=30); ignored
+    //             in LO mode (XSIZE=24). 0.01 is tighter than the CP block
+    //             because biases ought to move much less per iter.
+    double eps_cp = 0.1;
+    double eps_bias = 0.01;
+    // Hard outlier gates for IMU innovations vs the spline-interpolated IMU.
+    // Above these magnitudes the corresponding axis is zeroed out for this
+    // measurement (its row of H and its innovation entry are set to 0). The
+    // defaults match the previous hard-coded values; tune up for aggressive
+    // motion platforms (drones, fast turns) so genuine high-rate samples
+    // aren't silently dropped.
+    double imu_accel_outlier_threshold = 10.0;  // m/s²
+    double imu_gyro_outlier_threshold = 5.0;    // rad/s
 
     void prepIMU(ImuData& imu_data, const Eigen::Vector3d& g)
     {
@@ -590,16 +582,16 @@ class Estimator
                     imu.head<3>() = imu_data.accel;
                     imu.tail<3>() = imu_data.gyro;
                     for (int i = 0; i < 3; i++) {
-                        if (abs(imu(i) - imu_itp(i)) > 10.0) {
+                        if (abs(imu(i) - imu_itp(i)) > imu_accel_outlier_threshold) {
                             imu(i) = 0;
                             imu_itp(i) = 0;
                             Hi.row(i).setZero();
-                        } 
-                        if (abs(imu(i+3) - imu_itp(i+3)) > 5.0) {
+                        }
+                        if (abs(imu(i+3) - imu_itp(i+3)) > imu_gyro_outlier_threshold) {
                             imu(i+3) = 0;
                             imu_itp(i+3) = 0;
                             Hi.row(i+3).setZero();
-                        }                     
+                        }
                     }
                     innv_buf_.segment<6>(idx_offset) = imu - imu_itp;
                     H_buf_.block(idx_offset, 0, 6, XSIZE) = Hi;

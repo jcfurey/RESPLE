@@ -1221,6 +1221,28 @@ private:
         } else {
             estimator_lio.n_iter = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "n_iter", 1);
         }
+        // IEKF accuracy tuning (Phase 1.8): per-component convergence thresholds
+        // and IMU outlier gates. Defaults match the previous hard-coded values
+        // (eps_cp=0.1 matches the old mixed-units eps; gates 10/5 match the
+        // prior literals) so existing configs run unchanged. Tighten eps_cp /
+        // eps_bias for higher-accuracy regimes; widen the IMU gates for
+        // aggressive-motion platforms (drones, fast spinning).
+        const double iekf_eps_cp = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "iekf_eps_cp", 0.1);
+        const double iekf_eps_bias = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "iekf_eps_bias", 0.01);
+        const double imu_accel_thresh = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "imu_accel_outlier_threshold", 10.0);
+        const double imu_gyro_thresh = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "imu_gyro_outlier_threshold", 5.0);
+        estimator_lo.eps_cp = iekf_eps_cp;
+        estimator_lo.eps_bias = iekf_eps_bias;
+        estimator_lo.imu_accel_outlier_threshold = imu_accel_thresh;
+        estimator_lo.imu_gyro_outlier_threshold = imu_gyro_thresh;
+        estimator_lio.eps_cp = iekf_eps_cp;
+        estimator_lio.eps_bias = iekf_eps_bias;
+        estimator_lio.imu_accel_outlier_threshold = imu_accel_thresh;
+        estimator_lio.imu_gyro_outlier_threshold = imu_gyro_thresh;
         std::vector<double> cov_var = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
         cov_pose << cov_var.at(0), cov_var.at(1), cov_var.at(2), cov_var.at(3), cov_var.at(4), cov_var.at(5);
 

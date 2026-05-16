@@ -143,10 +143,14 @@ public:
         };
         bool operator<(const PointType_CMP &a) const
         {
-            if (fabs(dist - a.dist) < 1e-10)
-                return point.x < a.point.x;
-            else
-                return dist < a.dist;
+            if (fabs(dist - a.dist) >= 1e-10) return dist < a.dist;
+            // Lexicographic tie-break across all three coordinates so equidistant
+            // points produce a deterministic top-k ordering. Tying on x alone
+            // leaves the order of (x_tied, *, *) points dependent on heap
+            // history, which is reproducibility hostile for the IEKF.
+            if (point.x != a.point.x) return point.x < a.point.x;
+            if (point.y != a.point.y) return point.y < a.point.y;
+            return point.z < a.point.z;
         }
     };
 
