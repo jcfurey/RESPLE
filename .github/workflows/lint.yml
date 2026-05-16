@@ -1,10 +1,14 @@
 name: lint
 
-# Style / cmake / xml linting. Advisory only at first — the codebase
-# pre-dates this CI and almost certainly has style nits the linter will
-# surface. `continue-on-error: true` on each step means failures show up in
-# the job summary but don't block merges. Once the initial cleanup is done,
-# flip these to required.
+# Runs the ament_lint_auto suite (cppcheck, cpplint, lint_cmake, xmllint,
+# flake8, pep257) as colcon tests. The CMakeLists.txt BUILD_TESTING block
+# decides which checks are active — `copyright` and `uncrustify` are
+# skipped there because the legacy codebase doesn't conform to either
+# yet. Everything else runs.
+#
+# Advisory only at first (`continue-on-error: true`). Once the initial
+# backlog is cleared, flip continue-on-error to false to make these
+# required.
 
 on:
   pull_request:
@@ -16,64 +20,72 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    name: cpplint / cmakelint / xmllint (advisory)
+  ament-lint:
+    name: ament_lint_auto (advisory)
     runs-on: ubuntu-24.04
+    container:
+      image: osrf/ros:jazzy-desktop-full
     steps:
-      - name: Checkout
+      - name: Checkout (into colcon src layout)
         uses: actions/checkout@v4
-      - name: Install linters
+        with:
+          path: src/RESPLE
+      - name: Install build + lint dependencies
         shell: bash
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libxml2-utils \
-            python3-pip
-          # Pin versions so a transient upstream release can't break CI
-          # silently. Bump intentionally when the codebase is ready.
-          pip3 install --break-system-packages \
-            'cpplint==1.6.1' \
-            'cmakelint==1.4.3'
-      - name: cpplint (SLAM sources)
+          set -eo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            libeigen3-dev \
+            libomp-dev \
+            libpcl-dev \
+            libyaml-cpp-dev \
+            ros-jazzy-pcl-conversions \
+            ros-jazzy-pcl-msgs \
+            ros-jazzy-pcl-ros \
+            ros-jazzy-diagnostic-updater \
+            ros-jazzy-rosbag2-storage-mcap \
+            ros-jazzy-ament-lint-auto \
+            ros-jazzy-ament-lint-common
+      - name: colcon build (configure stage required for colcon test)
+        shell: bash
+        run: |
+          set -eo pipefail
+          set +u
+          source /opt/ros/jazzy/setup.bash
+          set -u
+          colcon build \
+            --packages-up-to resple \
+            --event-handlers console_cohesion+ \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+      - name: colcon test (ament_lint_auto suite)
         continue-on-error: true
         shell: bash
         run: |
-          # Scope to the SLAM source we author. Excludes the renamed Livox
-          # message-package forks (upstream code) and the vendored ikd-Tree
-          # implementation (also upstream).
-          cpplint \
-            --filter=-legal/copyright,-build/c++17,-runtime/references,-build/include_subdir,-whitespace/line_length \
-            --linelength=120 \
-            --recursive \
-            resple/src \
-            resple/include/Estimator.h \
-            resple/include/SplineState.h \
-            resple/include/Association.h \
-            resple/include/utils
-      - name: cmakelint (CMakeLists.txt)
+          set -eo pipefail
+          set +u
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          set -u
+          colcon test \
+            --packages-select resple \
+            --event-handlers console_direct+
+      - name: Print test results
+        if: always()
         continue-on-error: true
         shell: bash
         run: |
-          cmakelint \
-            --filter=-linelength,-readability/wonkycase \
-            resple/CMakeLists.txt \
-            estimate_msgs/CMakeLists.txt
-      - name: xmllint (package.xml)
-        continue-on-error: true
-        shell: bash
-        run: |
-          # Schema validation against the public format-3 schema. Catches
-          # malformed package.xml that would otherwise only fail at colcon
-          # parse time.
-          for pkg in \
-              resple/package.xml \
-              estimate_msgs/package.xml \
-              AviaResple_msgs/package.xml \
-              HAP360_msgs/package.xml \
-              Mid70Avia_msgs/package.xml ; do
-            echo "--- $pkg ---"
-            xmllint --noout --schema \
-              http://download.ros.org/schema/package_format3.xsd \
-              "$pkg"
-          done
+          set -eo pipefail
+          set +u
+          source /opt/ros/jazzy/setup.bash
+          set -u
+          colcon test-result --verbose --all
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ament-lint-results
+          path: |
+            log/
+            build/resple/test_results/
+          retention-days: 7

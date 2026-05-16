@@ -388,4 +388,25 @@ ament_export_dependencies(
 	estimate_msgs
 )
 ament_export_libraries(${PROJECT_NAME})
+
+# ament_lint_auto wires up the standard ROS 2 lint suite as colcon tests.
+# package.xml already declares ament_lint_auto / ament_lint_common as
+# test_depends; this block makes them actually run on `colcon test`.
+#
+# Two checks are explicitly skipped because the codebase pre-dates this
+# CI and won't pass them without a repo-wide cleanup:
+#   - copyright: no per-file copyright headers exist anywhere in src/include.
+#   - uncrustify: no .uncrustifycfg; auto-formatting would mass-rewrite
+#     thousands of lines and obliterate authorship history.
+# Everything else (cppcheck, cpplint, lint_cmake, xmllint, flake8, pep257)
+# stays on. CI currently runs the lint job with continue-on-error so
+# failures surface but don't block merges; flip that to strict once the
+# initial backlog is cleared.
+if(BUILD_TESTING)
+	find_package(ament_lint_auto REQUIRED)
+	set(ament_cmake_copyright_FOUND TRUE)
+	set(ament_cmake_uncrustify_FOUND TRUE)
+	ament_lint_auto_find_test_dependencies()
+endif()
+
 ament_package()
