@@ -349,7 +349,7 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (uint i = 1; i < plsize; i++) {
+        for (uint i = 0; i < plsize; i++) {
             pt.x = pc_last_ouster->points[i].x;
             pt.y = pc_last_ouster->points[i].y;
             pt.z = pc_last_ouster->points[i].z;
@@ -408,7 +408,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (int i = 1; i < plsize; i++) {
+        for (int i = 0; i < plsize; i++) {
             if ((livox_msg_in->points[i].tag & 0x30) == 0x10 || (livox_msg_in->points[i].tag & 0x30) == 0x00) {
                 pt.x = livox_msg_in->points[i].x;
                 pt.y = livox_msg_in->points[i].y;
@@ -465,7 +465,7 @@ public:
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (int i = 1; i < plsize; i++) {
+        for (int i = 0; i < plsize; i++) {
             if ((livox_msg_in->points[i].tag & 0x30) == 0x10 || (livox_msg_in->points[i].tag & 0x30) == 0x00) {
                 pt.x = livox_msg_in->points[i].x;
                 pt.y = livox_msg_in->points[i].y;
@@ -522,7 +522,7 @@ public:
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (int i = 1; i < plsize; i++) {
+        for (int i = 0; i < plsize; i++) {
             if ((livox_msg_in->points[i].tag & 0x30) == 0x10 || (livox_msg_in->points[i].tag & 0x30) == 0x00) {
                 pt.x = livox_msg_in->points[i].x;
                 pt.y = livox_msg_in->points[i].y;

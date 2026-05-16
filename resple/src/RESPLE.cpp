@@ -1199,7 +1199,17 @@ private:
             param.cov_gyro << gyro_var.at(0), gyro_var.at(1), gyro_var.at(2);
         }
 
-        dt_ns = 1e9 / CommonUtils::readParam<int>(this->get_node_parameters_interface(), "knot_hz", 100);
+        {
+            int knot_hz = CommonUtils::readParam<int>(
+                this->get_node_parameters_interface(), "knot_hz", 100);
+            if (knot_hz <= 0) {
+                RCLCPP_WARN(this->get_logger(),
+                    "knot_hz must be positive (got %d), falling back to default 100",
+                    knot_hz);
+                knot_hz = 100;
+            }
+            dt_ns = static_cast<int64_t>(1e9) / knot_hz;
+        }
         double dt_s = double(dt_ns) * 1e-9;
         cov_P0 = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "cov_P0", 0.02);
         cov_P0 *= (dt_s*dt_s);
@@ -1215,6 +1225,14 @@ private:
 
         cube_len = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "cube_len", 1000.0);
         point_filter_num = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "point_filter_num", 1);
+        if (point_filter_num < 1) {
+            // Used as a modulo divisor in six LiDAR ingest paths; zero or
+            // negative would be UB. Clamp here once instead of per-site.
+            RCLCPP_WARN(this->get_logger(),
+                "point_filter_num must be >= 1 (got %d), clamping to 1",
+                point_filter_num);
+            point_filter_num = 1;
+        }
         num_points_upd = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "num_points_upd", 100);
         if (if_lidar_only) {
             estimator_lo.n_iter = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "n_iter", 1);
