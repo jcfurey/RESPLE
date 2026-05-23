@@ -38,32 +38,13 @@ if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE "Release")
 endif()
 
-find_package(ament_cmake REQUIRED)
-find_package(builtin_interfaces REQUIRED)
-find_package(rclcpp REQUIRED)
-find_package(rclcpp_components REQUIRED)
+find_package(ament_cmake_auto REQUIRED)
+ament_auto_find_build_dependencies()
+
+# Non-ROS deps not picked up by ament_auto_find_build_dependencies()
 find_package(yaml-cpp REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(geometry_msgs REQUIRED)
-find_package(nav_msgs REQUIRED)
-find_package(sensor_msgs REQUIRED)
-find_package(visualization_msgs REQUIRED)
-find_package(std_srvs REQUIRED)
-find_package(livox_interfaces REQUIRED)
-find_package(livox_ros_driver REQUIRED)
-find_package(livox_ros_driver2 REQUIRED)
-find_package(estimate_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
-find_package(pcl_conversions REQUIRED)
-find_package(tf2_ros REQUIRED)
-find_package(tf2_geometry_msgs REQUIRED)
-find_package(tf2_eigen REQUIRED)
-find_package(tf2_sensor_msgs REQUIRED)
-find_package(diagnostic_updater REQUIRED)
-find_package(rclcpp_action REQUIRED)
-find_package(rclcpp_lifecycle REQUIRED)
-find_package(rosbag2_cpp REQUIRED)
 # OpenMP is optional and only required when ENABLE_OPENMP=ON
 if(ENABLE_OPENMP)
 	find_package(OpenMP REQUIRED)
@@ -102,7 +83,12 @@ if(ENABLE_CUDA)
 	list(APPEND RESPLE_LIB_SOURCES src/gpu/cuda_knn.cu)
 endif()
 
-add_library(${PROJECT_NAME} ${RESPLE_LIB_SOURCES})
+ament_auto_add_library(${PROJECT_NAME} SHARED ${RESPLE_LIB_SOURCES})
+
+# Suppress main() in RESPLE.cpp / Mapping.cpp when compiled into the shared lib;
+# the standalone executables below compile the same .cpp files without this
+# define, so their main() is retained for the binary entry point.
+target_compile_definitions(${PROJECT_NAME} PRIVATE RESPLE_LIB_BUILD)
 
 if(ENABLE_CUDA)
 	target_compile_definitions(${PROJECT_NAME} PUBLIC RESPLE_USE_CUDA)
@@ -253,30 +239,7 @@ target_sources(RESPLE PRIVATE src/RESPLE.cpp)
 target_link_options(RESPLE  PRIVATE -rdynamic)
 target_link_options(Mapping PRIVATE -rdynamic)
 
-ament_target_dependencies(${PROJECT_NAME} 
-	rclcpp
-	rclcpp_components
-	std_msgs
-	geometry_msgs
-	nav_msgs
-	sensor_msgs
-	visualization_msgs
-	std_srvs
-	livox_interfaces
-	livox_ros_driver
-	livox_ros_driver2
-	estimate_msgs
-	pcl_conversions
-	tf2_ros
-	tf2_eigen
-	tf2_geometry_msgs
-	tf2_sensor_msgs
-	diagnostic_updater
-	rclcpp_action
-	rclcpp_lifecycle
-	rosbag2_cpp
-)
-
+# ROS deps are linked into ${PROJECT_NAME} by ament_auto_add_library via package.xml.
 # Use plain signature consistently (ament_target_dependencies uses plain internally)
 target_link_libraries(${PROJECT_NAME}
 	${PCL_LIBRARIES}
@@ -319,21 +282,5 @@ install(TARGETS RESPLE
   DESTINATION lib/${PROJECT_NAME})
 install(TARGETS Mapping
   DESTINATION lib/${PROJECT_NAME})
-install(TARGETS ${PROJECT_NAME}
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin)
 
-# Export only ament packages (yaml-cpp is not an ament package)
-ament_export_dependencies(
-	rclcpp
-	livox_ros_driver
-	livox_ros_driver2
-	livox_interfaces
-	diagnostic_updater
-	rclcpp_action
-	rclcpp_lifecycle
-	rosbag2_cpp
-)
-ament_export_libraries(${PROJECT_NAME})
-ament_package()
+ament_auto_package()

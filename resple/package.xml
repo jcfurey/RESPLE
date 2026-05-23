@@ -11,7 +11,7 @@
   <maintainer email="ziyu.cao@liu.se">Ziyu Cao</maintainer>
   <maintainer email="kailai.li@rug.nl">Kailai Li</maintainer>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
   <build_depend>builtin_interfaces</build_depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>

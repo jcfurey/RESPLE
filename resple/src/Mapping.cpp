@@ -1139,6 +1139,7 @@ static void mappingCrashHandler(int sig)
     raise(sig);
 }
 
+#ifndef RESPLE_LIB_BUILD
 int main(int argc, char** argv) {
     signal(SIGSEGV, mappingCrashHandler);
     signal(SIGABRT, mappingCrashHandler);
@@ -1289,6 +1290,7 @@ int main(int argc, char** argv) {
     for (auto buff : buffs) {
         delete buff;
     }
-    
+
     rclcpp::shutdown();
 }
+#endif // RESPLE_LIB_BUILD

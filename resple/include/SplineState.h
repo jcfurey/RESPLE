@@ -703,6 +703,6 @@ class SplineState
     }
 };
 
-const Eigen::Matrix4d SplineState::base_coefficients = SplineState::computeBaseCoefficients();
-const Eigen::Matrix4d SplineState::blending_matrix = SplineState::computeBlendingMatrix();
-const Eigen::Matrix4d SplineState::cumulative_blending_matrix = SplineState::computeBlendingMatrix<true>();
+inline const Eigen::Matrix4d SplineState::base_coefficients = SplineState::computeBaseCoefficients();
+inline const Eigen::Matrix4d SplineState::blending_matrix = SplineState::computeBlendingMatrix();
+inline const Eigen::Matrix4d SplineState::cumulative_blending_matrix = SplineState::computeBlendingMatrix<true>();

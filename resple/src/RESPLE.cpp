@@ -2228,6 +2228,7 @@ static void respleCrashHandler(int sig)
     raise(sig);
 }
 
+#ifndef RESPLE_LIB_BUILD
 int main(int argc, char *argv[])
 {
     // Install before rclcpp::init so crashes during subscriber/publisher
@@ -2302,5 +2303,6 @@ int main(int argc, char *argv[])
     rclcpp::shutdown();
     return 0;
 }
+#endif // RESPLE_LIB_BUILD
 
 RCLCPP_COMPONENTS_REGISTER_NODE(RESPLE)
