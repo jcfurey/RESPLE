@@ -86,7 +86,7 @@ public:
         rclcpp::Rate rate(20);
         int64_t max_spl_knots = 0;
         int64_t t_last_map_upd = 0;
-        while (true) {      
+        while (rclcpp::ok()) {
             for (auto& [lidar_name, lidar_data] : lidars_data) {
                 while (!lidar_data.t_buff.empty()) {
                     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame(new pcl::PointCloud<pcl::PointXYZINormal>());
@@ -776,8 +776,8 @@ private:
         cub_needrm.shrink_to_fit();
         Eigen::Vector3d pos_lidar_min(std::numeric_limits<double>::max(), std::numeric_limits<double>::max(),
             std::numeric_limits<double>::max());
-        Eigen::Vector3d pos_lidar_max(std::numeric_limits<double>::min(), std::numeric_limits<double>::min(),
-                std::numeric_limits<double>::min());
+        Eigen::Vector3d pos_lidar_max(std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(),
+                std::numeric_limits<double>::lowest());
         for (const auto& [lidar_name, lidar] : lidars) {
             Eigen::Vector3d pos_lidar = getPositionLiDAR(spline->maxTimeNs(), lidar.t_bl);
             pos_lidar_min = pos_lidar_min.array().min(pos_lidar.array()).matrix();

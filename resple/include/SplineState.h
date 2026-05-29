@@ -323,7 +323,6 @@ class SplineState
 
     void getSplineMsg(estimate_msgs::msg::Spline& spline_msg, const int start_i)
     {
-        static int last_start_idx = 0;
         spline_msg.dt = dt_ns;
         int sidx = std::min(std::max((int)(num_knot - 5), 0), start_i);
         spline_msg.start_idx = std::min(sidx, last_start_idx+1);
@@ -365,6 +364,7 @@ class SplineState
   private:
 
     bool if_first;
+    int last_start_idx = 0;
     static const Eigen::Matrix4d blending_matrix;
     static const Eigen::Matrix4d base_coefficients;
     static const Eigen::Matrix4d cumulative_blending_matrix;
@@ -498,6 +498,6 @@ class SplineState
     }
 };
 
-const Eigen::Matrix4d SplineState::base_coefficients = SplineState::computeBaseCoefficients();
-const Eigen::Matrix4d SplineState::blending_matrix = SplineState::computeBlendingMatrix();
-const Eigen::Matrix4d SplineState::cumulative_blending_matrix = SplineState::computeBlendingMatrix<true>();
+inline const Eigen::Matrix4d SplineState::base_coefficients = SplineState::computeBaseCoefficients();
+inline const Eigen::Matrix4d SplineState::blending_matrix = SplineState::computeBlendingMatrix();
+inline const Eigen::Matrix4d SplineState::cumulative_blending_matrix = SplineState::computeBlendingMatrix<true>();

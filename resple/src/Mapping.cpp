@@ -442,7 +442,7 @@ Mapping(rclcpp::Node::SharedPtr &nh, std::vector<MappingBase<pcl::PointXYZINorma
     void process() {
         rclcpp::Rate rate(20);
         int64_t num_knot = 0;
-        while (true) {
+        while (rclcpp::ok()) {
             if (if_init_succeed && spline_global.numKnots() > num_knot) {
                 lock_mappings();
                 publishPath();

@@ -10,8 +10,8 @@
 
 #include "utils/eigen_utils.hpp"
 
-int NUM_OF_THREAD = 5;
-int NUM_MATCH_POINTS = 5;
+inline int NUM_OF_THREAD = 5;
+inline int NUM_MATCH_POINTS = 5;
 
 struct ImuData {
     int64_t time_ns;
