@@ -41,7 +41,7 @@ RUN mkdir -p $HOME/ros2_ws/src
 WORKDIR $HOME/ros2_ws
 RUN --mount=type=bind,destination=$HOME/ros2_ws/src/RESPLE source /opt/ros/jazzy/setup.bash && \
     colcon build \
-    --cmake-args -DCMAKE_BUILD_TYPE=Release \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release -DENABLE_NATIVE_ARCH=OFF \
     --packages-up-to resple
 
 # Add workspace to default source

@@ -386,7 +386,10 @@ struct PointData {
         time_ns = fr_start_time + CommonUtils::ms2ns(pt_in.intensity);
         if_valid = false;
         dist = 0;
-        var_pt = w_pt;
+        // Guard against w_pt == 0: var_pt feeds 1/(var_pt*scale) in the IEKF,
+        // so a zero weight yields +inf measurement information and a degenerate
+        // update. Floor it to a tiny positive value.
+        var_pt = (w_pt > 0.0) ? w_pt : 1e-9;
         normvec = Eigen::Vector3d::Zero();
         range_sensor = static_cast<float>((pt_b - sensor_origin_body).norm());
     }

@@ -274,12 +274,6 @@ install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config
   DESTINATION share/${PROJECT_NAME})
-# Register components for composition
-rclcpp_components_register_node(${PROJECT_NAME}
-  PLUGIN "RESPLE"
-  EXECUTABLE RESPLE_node
-)
-
 install(TARGETS RESPLE
   DESTINATION lib/${PROJECT_NAME})
 install(TARGETS Mapping

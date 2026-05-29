@@ -418,7 +418,12 @@ class Estimator
         int recur_st_id = spl.numKnots() - 4;
         for (int i = 0; i < (int) J_line_acc.d_val_d_knot.size(); i++) {
             int j = J_line_acc.start_idx + i - recur_st_id;
-            if (j >= 0) {
+            // Upper bound j < 4: Hi has only 4 knot-blocks. j is provably <= 3
+            // today (itpPose clamps t_ns), but a regression in that clamp would
+            // otherwise write j==4 onto the ba/bg bias columns (XSIZE==30) —
+            // silent estimation corruption — or off the end (XSIZE==24).
+            // Matches the explicit guard in getLastPose/TwistCovariance.
+            if (j >= 0 && j < 4) {
                 Hi.block(0, j*6, 3, 3) = RT * J_line_acc.d_val_d_knot[i];
                 Hi.block(0, j*6 + 3, 3, 3) = drot * J_ortdel.d_val_d_knot[i];
                 Hi.block(3, j*6 + 3, 3, 3) = J_gyro.d_val_d_knot[i];                
@@ -450,7 +455,10 @@ class Estimator
             int RCP_st_id = spl.numKnots() - 4;
             for (int i = 0; i < (int) J_pos.d_val_d_knot.size(); i++) {
                 int j = (int) J_pos.start_idx + i - RCP_st_id;
-                if (j >= 0) {
+                // Upper bound j < 4 (see prepIMU): defends the bias columns /
+                // deque end against a clamp regression. Matches the diagnostic
+                // covariance paths' guard.
+                if (j >= 0 && j < 4) {
                     Hi.block(0, j*6, 1, 3) = pt_data.normvec.transpose() * J_pos.d_val_d_knot[i];
                     Hi.block(0, j*6 + 3, 1, 3) = tmp * J_ortdel.d_val_d_knot[i];
                 }
@@ -646,6 +654,15 @@ class Estimator
             Eigen::Matrix<double, XSIZE, RSIZE> KR =
                 (K.array().rowwise() * R_inv.transpose().array().inverse()).matrix();
             cov_post_.noalias() += KR * K.transpose();
+        }
+        // Guard against NaN/Inf reaching the spline / cov_rcp. The LLT checks
+        // above validate the *inputs* (cov_prop, S); this catches a non-finite
+        // *result* (e.g. a zero R_inv entry making K*R = inf*0 = NaN in the
+        // Joseph K R K^T term). Returning false routes the caller to its
+        // reset-to-prior + numerical-failure-counter path.
+        if (!cov_post_.allFinite() || !RCPs_post.allFinite()) {
+            std::cerr << "[Estimator] non-finite posterior/state update, skipping\n";
+            return false;
         }
         updateState(RCPs_post);
         return true;

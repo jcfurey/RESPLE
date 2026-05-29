@@ -36,7 +36,6 @@
   <depend>diagnostic_updater</depend>
   <depend>rclcpp_action</depend>
   <depend>rclcpp_lifecycle</depend>
-  <depend>rosbag2_cpp</depend>
 
   <!-- Visualization: foxglove_bridge serves data to Trillium/Foxglove clients;
        rviz2 kept as an optional fallback via resple_viz.launch.py -->
