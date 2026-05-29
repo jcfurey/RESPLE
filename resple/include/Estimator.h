@@ -320,6 +320,63 @@ class Estimator
         return J * cov_rcp.template topLeftCorner<24, 24>() * J.transpose();
     }
 
+    // Returns the 6×6 IEKF posterior covariance for the body-frame twist at
+    // maxTimeNs(), layout [vx, vy, vz, wx, wy, wz].
+    //
+    // Linear block:  v_body = R(q)ᵀ · v_world. We propagate cov_rcp through
+    // the Jacobian of world-frame linear velocity (∂v_w/∂RCP via itpPosition<1>),
+    // then rotate the resulting 3×3 into the body frame:
+    //     P_v_body ≈ Rᵀ · (J_v · cov_rcp · J_vᵀ) · R
+    // This is exact up to the secondary coupling between pose uncertainty and
+    // the body-frame linear velocity (typically negligible for EKF fusion).
+    //
+    // Angular block: ω_body comes from the spline directly; J_ω is produced by
+    // itpQuaternion as Jacobian33 entries (3×3 per knot):
+    //     P_ω_body = J_ω · cov_rcp · J_ωᵀ
+    //
+    // Cross-terms (v,ω) are set to zero — robot_localization ignores them and
+    // including a noisy approximation hurts fusion quality more than it helps.
+    Eigen::Matrix<double, 6, 6> getLastTwistCovariance() const {
+        const int64_t t = spl.maxTimeNs();
+        const int RCP_st_id = static_cast<int>(spl.numKnots()) - 4;
+
+        // ── Linear velocity Jacobian (world frame, 3×24) ───────────────────
+        Jacobian J_vpos;
+        spl.itpPosition<1>(t, &J_vpos);
+
+        // ── Angular velocity Jacobian (body frame, 3×24) ──────────────────
+        Jacobian33 J_w;
+        Eigen::Quaterniond q_out;
+        Eigen::Vector3d w_out;
+        spl.itpQuaternion(t, &q_out, &w_out, nullptr, &J_w);
+
+        Eigen::Matrix<double, 3, 24> Jv = Eigen::Matrix<double, 3, 24>::Zero();
+        for (int i = 0; i < static_cast<int>(J_vpos.d_val_d_knot.size()); ++i) {
+            const int j = static_cast<int>(J_vpos.start_idx) + i - RCP_st_id;
+            if (j >= 0 && j < 4)
+                Jv.block<3, 3>(0, j * 6) =
+                    J_vpos.d_val_d_knot[i] * Eigen::Matrix3d::Identity();
+        }
+
+        Eigen::Matrix<double, 3, 24> Jw = Eigen::Matrix<double, 3, 24>::Zero();
+        for (int i = 0; i < static_cast<int>(J_w.d_val_d_knot.size()); ++i) {
+            const int j = static_cast<int>(J_w.start_idx) + i - RCP_st_id;
+            if (j >= 0 && j < 4)
+                Jw.block<3, 3>(0, j * 6 + 3) = J_w.d_val_d_knot[i];
+        }
+
+        const auto& P = cov_rcp.template topLeftCorner<24, 24>();
+        const Eigen::Matrix3d P_vw = Jv * P * Jv.transpose();
+        const Eigen::Matrix3d R = q_out.toRotationMatrix();
+        const Eigen::Matrix3d P_v_body = R.transpose() * P_vw * R;
+        const Eigen::Matrix3d P_w_body = Jw * P * Jw.transpose();
+
+        Eigen::Matrix<double, 6, 6> P_twist = Eigen::Matrix<double, 6, 6>::Zero();
+        P_twist.topLeftCorner<3, 3>()     = P_v_body;
+        P_twist.bottomRightCorner<3, 3>() = P_w_body;
+        return P_twist;
+    }
+
   private:
     SplineState spl;
     // Zero-initialized explicitly: the default workspace build uses

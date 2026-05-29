@@ -2,7 +2,8 @@ import os
 import launch
 import launch_ros.actions
 from ament_index_python.packages import get_package_share_directory
-from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.actions import DeclareLaunchArgument, TimerAction, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
 
@@ -23,10 +24,10 @@ def generate_launch_description():
         get_package_share_directory('resple'),
         'config',
         'config_nce_quad.yaml')
-    config_rviz = os.path.join(
+    viz_launch = os.path.join(
         get_package_share_directory('resple'),
-        'config',
-        'config.rviz')        
+        'launch',
+        'resple_viz.launch.py')
     return launch.LaunchDescription([
         start_delay_arg,
         mapping_delay_arg,
@@ -38,11 +39,8 @@ def generate_launch_description():
                 '--x', '-0.014', '--y', '0.012', '--z', '0.015',
                 '--qx', '0.0', '--qy', '0.0', '--qz', '0.0', '--qw', '1.0',
                 '--frame-id', 'base_link', '--child-frame-id', 'os_sensor']),
-        launch_ros.actions.Node(
-            package='rviz2',
-            executable='rviz2',
-            name='rviz2',
-            arguments=['-d', config_rviz, '--ros-args', '--log-level', 'WARN']),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(viz_launch)),
         TimerAction(
             period=_start_delay,
             actions=[
@@ -53,7 +51,7 @@ def generate_launch_description():
                 emulate_tty=True,
                 output='log',
                 parameters=[config_yaml_fusion],
-                arguments=['--ros-args', '--log-level', 'warn'])
+                arguments=['--ros-args', '--log-level', 'info'])
             ]),
         TimerAction(
             period=_mapping_delay,
@@ -65,7 +63,7 @@ def generate_launch_description():
                 emulate_tty=True,
                 output='log',
                 parameters=[config_yaml_fusion],
-                arguments=['--ros-args', '--log-level', 'warn'])
+                arguments=['--ros-args', '--log-level', 'info'])
             ])                
   ])
 

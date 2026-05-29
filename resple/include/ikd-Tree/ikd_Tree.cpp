@@ -198,7 +198,6 @@ void KD_TREE<PointType>::start_thread()
     pthread_mutex_init(&points_deleted_rebuild_mutex_lock, NULL);
     pthread_mutex_init(&working_flag_mutex, NULL);
     pthread_create(&rebuild_thread, NULL, multi_thread_ptr, (void *)this);
-    printf("Multi thread started \n");
 }
 
 template <typename PointType>
@@ -242,7 +241,7 @@ void KD_TREE<PointType>::multi_thread_rebuild()
             /* Traverse and copy */
             if (!Rebuild_Logger.empty())
             {
-                printf("\n\n\n\n\n\n\n\n\n\n\n ERROR!!! \n\n\n\n\n\n\n\n\n");
+                fprintf(stderr, "[ikd-Tree] rebuild logger non-empty when Rebuild_Ptr set — concurrency invariant violated\n");
             }
             rebuild_flag = true;
             if (*Rebuild_Ptr == Root_Node)
@@ -337,7 +336,6 @@ void KD_TREE<PointType>::multi_thread_rebuild()
         pthread_mutex_unlock(&termination_flag_mutex_lock);
         usleep(100);
     }
-    printf("Rebuild thread terminated normally\n");
 }
 
 template <typename PointType>

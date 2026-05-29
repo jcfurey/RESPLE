@@ -90,6 +90,23 @@ if(ENABLE_CUDA)
 	set_target_properties(${PROJECT_NAME} PROPERTIES
 		CUDA_SEPARABLE_COMPILATION ON
 	)
+	# NVTX (Tools Extension): header-only API in CUDA Toolkit. We only need
+	# the include path; the push/pop range API used in cuda_profile.h is
+	# inlined and does not require linking libnvToolsExt. Disable with
+	# -DENABLE_NVTX=OFF if a toolkit ships without nvtx3 headers.
+	option(ENABLE_NVTX "Emit NVTX ranges for nsys profiling" ON)
+	if(ENABLE_NVTX)
+		find_path(NVTX3_INCLUDE_DIR nvtx3/nvToolsExt.h
+			HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/local/cuda/include
+			PATH_SUFFIXES include)
+		if(NVTX3_INCLUDE_DIR)
+			target_include_directories(${PROJECT_NAME} PRIVATE ${NVTX3_INCLUDE_DIR})
+			target_compile_definitions(${PROJECT_NAME} PRIVATE RESPLE_NVTX_ENABLED)
+			message(STATUS "NVTX ranges enabled (include: ${NVTX3_INCLUDE_DIR})")
+		else()
+			message(STATUS "NVTX headers not found; profile macros will skip nsys ranges")
+		endif()
+	endif()
 endif()
 
 target_include_directories(${PROJECT_NAME}

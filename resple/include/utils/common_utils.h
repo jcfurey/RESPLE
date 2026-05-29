@@ -327,7 +327,6 @@ struct LidarConfig {
     LidarConfig() = default;
 
     LidarConfig(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_params, const std::string& prefix) {
-        std::cout << "Creating LidarConfig with prefix: \"" << prefix << "\"" << std::endl;
         topic = CommonUtils::readParam<std::string>(node_params, prefix + "topic_lidar", "");
         type = CommonUtils::readParam<std::string>(node_params, prefix + "lidar_type", "");
         scan_line = CommonUtils::readParam<int>(node_params, prefix + "scan_line", 0);

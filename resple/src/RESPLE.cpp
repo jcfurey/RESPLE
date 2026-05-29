@@ -53,6 +53,7 @@
 #include <chrono>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <csignal>
 #include <execinfo.h>
 #include <unistd.h>
@@ -154,7 +155,12 @@ public:
         
         // Create publishers (inactive until activated)
         pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
-        pub_start_time = this->create_publisher<std_msgs::msg::Int64>("start_time", rclcpp::QoS(50).reliable());
+        // transient_local: start_time is published once after gravity
+        // alignment; without late-joiner durability, a Mapping node that
+        // subscribes after publish() never sees it and `if_init_succeed`
+        // stays false → no path / no odom / Mapping appears dead.
+        pub_start_time = this->create_publisher<std_msgs::msg::Int64>(
+            "start_time", rclcpp::QoS(1).transient_local().reliable());
         // Use transient_local durability for pose to match Nav2 expectations and ensure late subscribers get last pose
         pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>(
             "pose", rclcpp::QoS(1).transient_local().reliable());
@@ -264,7 +270,7 @@ public:
         // Start processing thread
         processing_active_ = true;
         processing_thread_ = std::thread(&RESPLE::processData, this);
-        
+
         RCLCPP_INFO(this->get_logger(), "RESPLE activated successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
@@ -273,19 +279,16 @@ public:
     on_deactivate(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Deactivating RESPLE...");
-        
-        // Stop processing thread
-        processing_active_ = false;
-        if (processing_thread_.joinable()) {
-            processing_thread_.join();
-        }
 
-        // Worker is now joined; no writer to map_update_future_ remains. Gate
-        // on the atomic so we don't touch the future object at all when no
-        // async map update was ever launched.
-        if (map_update_pending_.load(std::memory_order_acquire) && map_update_future_.valid()) {
-            map_update_future_.wait();
-        }
+        // Stop processing thread with a bounded join so we can't hang the
+        // launcher when the worker is wedged inside a third-party lock
+        // (ikd-Tree rebuild, CUDA tear-down, FastDDS atexit). The worker
+        // loop polls processing_active_ + rclcpp::ok() in 100ms slices
+        // (see processData), so under normal conditions the join completes
+        // well within the 2s budget.
+        processing_active_ = false;
+        joinProcessingThreadBounded(std::chrono::seconds(2));
+        waitForMapUpdateBounded(std::chrono::seconds(2));
 
         // Wait for any in-flight SaveMap action
         {
@@ -332,11 +335,10 @@ public:
     {
         RCLCPP_INFO(this->get_logger(), "Cleaning up RESPLE...");
 
-        // Worker was joined during on_deactivate; gate the future check on
-        // the atomic pending flag (see field declaration for rationale).
-        if (map_update_pending_.load(std::memory_order_acquire) && map_update_future_.valid()) {
-            map_update_future_.wait();
-        }
+        // Worker was joined during on_deactivate; bounded wait on the
+        // map-update future (the helper checks valid() so this is a no-op
+        // when no async map update was ever launched).
+        waitForMapUpdateBounded(std::chrono::seconds(2));
 
         // Clear buffers and data structures
         lidars.clear();
@@ -349,6 +351,12 @@ public:
         if_init_filter = false;
         if_init_map = false;
         localmap_initialized_ = false;
+        imu_first_logged_.store(false);
+        imu_count_logged_.store(false);
+        lidar_first_logged_.store(false);
+        init_complete_logged_.store(false);
+        iekf_first_logged_.store(false);
+        est_window_first_logged_.store(false);
         
         // Reset publishers
         pub_est.reset();
@@ -377,12 +385,13 @@ public:
     on_shutdown(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Shutting down RESPLE...");
-        
-        // Ensure processing thread is stopped
+
         processing_active_ = false;
-        if (processing_thread_.joinable()) {
-            processing_thread_.join();
-        }
+        // Bounded join + bounded async wait: under SIGINT we have ~5s before
+        // the launcher escalates to SIGTERM. If a thread is wedged inside
+        // the third-party ikd-Tree, detach instead of hanging the shutdown.
+        joinProcessingThreadBounded(std::chrono::seconds(2));
+        waitForMapUpdateBounded(std::chrono::seconds(1));
 
         // Wait for any in-flight SaveMap action
         {
@@ -396,11 +405,60 @@ public:
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
 
+    // Bounded join: dispatch the join() onto an async future and wait
+    // with a deadline. Used during lifecycle teardown so that a wedged
+    // ikd-Tree (rebuild thread holding internal locks) can't hold up
+    // shutdown past the launcher's 5-second SIGINT→SIGTERM grace window.
+    void joinProcessingThreadBounded(std::chrono::milliseconds timeout)
+    {
+        if (!processing_thread_.joinable()) return;
+        auto join_done = std::async(std::launch::async,
+            [this]{ processing_thread_.join(); });
+        if (join_done.wait_for(timeout) != std::future_status::ready) {
+            if (processing_thread_.joinable()) {
+                // processing_active_ is already false; the worker is just
+                // wedged on a third-party lock and will tear down with the
+                // process. Detach so shutdown can proceed.
+                processing_thread_.detach();
+                RCLCPP_WARN(this->get_logger(),
+                    "processing thread did not exit within timeout; detached");
+            }
+        }
+    }
+
+    void waitForMapUpdateBounded(std::chrono::milliseconds timeout)
+    {
+        if (!map_update_future_.valid()) return;
+        if (map_update_future_.wait_for(timeout) != std::future_status::ready) {
+            RCLCPP_WARN(this->get_logger(),
+                "background map-update did not finish within timeout; "
+                "abandoning to avoid blocking shutdown");
+            // Move into a thread-local to keep the future alive (and the
+            // task running to completion in the background) without making
+            // the lifecycle callback wait on it.
+            static thread_local std::future<void> abandoned;
+            abandoned = std::move(map_update_future_);
+        }
+    }
+
     void processData()
     {
-        rclcpp::Rate rate(20);
+        // std::this_thread::sleep_for instead of rclcpp::Rate: rate.sleep()
+        // throws runtime_error("context cannot be slept with...") once SIGINT
+        // invalidates the rclcpp context, and the existing
+        // `if (rclcpp::ok()) rate.sleep()` guards aren't atomic with the
+        // sleep itself, so they don't prevent the throw under teardown.
+        constexpr auto kRatePeriod = std::chrono::milliseconds(50);  // ~20 Hz
         int64_t max_spl_knots = 0;
         int64_t t_last_map_upd = 0;
+        // Heartbeat: every ~2s, dump the worker-thread state so we can
+        // distinguish "RESPLE stalled inside a long lock" from "RESPLE
+        // is fine but starved of new sensor data" when /est_window goes
+        // quiet.
+        size_t hb_loop_count = 0;
+        size_t hb_iekf_count = 0;
+        size_t hb_collect_false_count = 0;
+        auto hb_last_log = this->get_clock()->now();
         while (processing_active_ && rclcpp::ok()) {
             // Wrap each iteration in try/catch. Without this, an exception
             // anywhere in the IEKF / collect / deskew / map-update code path
@@ -413,6 +471,40 @@ public:
             // for fixing root causes, but ensures the node degrades visibly
             // rather than silently.
             try {
+                ++hb_loop_count;
+                // Heartbeat dump: read current buffer / spline state every ~2s.
+                // Diagnostic only — read-only, no lock-order interactions.
+                {
+                    auto now_clk = this->get_clock()->now();
+                    if ((now_clk - hb_last_log).seconds() >= 2.0) {
+                        hb_last_log = now_clk;
+                        size_t pc_buff_total = 0, pt_buff_total = 0;
+                        for (auto& [n, d] : lidars_data) {
+                            pc_buff_total += d.pc_buff.size();
+                            pt_buff_total += d.pt_buff.size();
+                        }
+                        size_t imu_buff_size;
+                        {
+                            std::lock_guard<std::mutex> lock(m_buff);
+                            imu_buff_size = imu_int_buff.size();
+                        }
+                        const bool init_done = if_init_filter.load();
+                        int64_t spline_max = (init_done && spline) ? spline->maxTimeNs() : 0;
+                        int64_t spline_n   = (init_done && spline) ? spline->numKnots() : 0;
+                        bool map_busy = map_update_pending_.load(std::memory_order_acquire)
+                            && map_update_future_.valid()
+                            && map_update_future_.wait_for(std::chrono::seconds(0))
+                                != std::future_status::ready;
+                        RCLCPP_INFO(this->get_logger(),
+                            "[RESPLE] heartbeat: loops=%zu iekf=%zu coll_false=%zu "
+                            "pc_buff=%zu pt_buff=%zu imu_int=%zu "
+                            "spline_knots=%ld spline_max=%ld map_busy=%d",
+                            hb_loop_count, hb_iekf_count, hb_collect_false_count,
+                            pc_buff_total, pt_buff_total, imu_buff_size,
+                            spline_n, spline_max, int(map_busy));
+                        hb_loop_count = hb_iekf_count = hb_collect_false_count = 0;
+                    }
+                }
             for (auto& [lidar_name, lidar_data] : lidars_data) {
                 while (!lidar_data.t_buff.empty()) {
                     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame(new pcl::PointCloud<pcl::PointXYZINormal>());
@@ -472,11 +564,32 @@ public:
                 }
             }
             if(!initialization()) {
-                if (rclcpp::ok()) {
-                    rate.sleep();
+                if (if_init_filter && !if_init_map) {
+                    // We finished gravity alignment but the map seed isn't
+                    // happening — almost always feats_down_size < 100. Log
+                    // throttled so the cause is obvious in the launch log.
+                    size_t pt_buff_total = 0;
+                    for (const auto& [n, d] : lidars_data) pt_buff_total += d.pt_buff.size();
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                        "[RESPLE] init_map blocked: pt_buff total=%zu (need ≥100 in first 100ms)",
+                        pt_buff_total);
                 }
+                std::this_thread::sleep_for(kRatePeriod);
                 continue;
             }
+            // One-shot: confirm initialization() finally returned true and
+            // we entered the steady-state collectMeasurements loop. If this
+            // log never fires after gravity alignment, init_map is stuck
+            // (typically feats_down_size < 100 or pt_buff drained empty).
+            if (!init_complete_logged_.exchange(true)) {
+                size_t pt_buff_total = 0;
+                for (const auto& [n, d] : lidars_data) pt_buff_total += d.pt_buff.size();
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] initialization complete; entering steady state "
+                    "(spline knots=%ld, pt_buff total=%zu)",
+                    spline->numKnots(), pt_buff_total);
+            }
+            bool collected_any = false;
             while (true) {
                 bool have_meas;
                 {
@@ -484,7 +597,14 @@ public:
                     have_meas = collectMeasurements();
                 }
                 if (!have_meas) break;
+                collected_any = true;
                 if (pt_meas.empty() && imu_meas.empty()) { continue; }
+                ++hb_iekf_count;
+                if (!iekf_first_logged_.exchange(true)) {
+                    RCLCPP_INFO(this->get_logger(),
+                        "[RESPLE] first IEKF iteration (pt_meas=%zu, spline knots=%ld)",
+                        pt_meas.size(), spline->numKnots());
+                }
                 // Track computation time
                 auto frame_start = std::chrono::high_resolution_clock::now();
 
@@ -497,8 +617,8 @@ public:
                     // (async mapIncremental / lasermapFovSegment) is done.
                     std::shared_lock<std::shared_mutex> map_read_lock(mtx_map_);
                     // Separate lock for SplineState mutations — serializes the
-                    // IEKF's propRCP / updateIEKF writes against publishFrameWorld
-                    // reads in the async thread. Taken INSIDE the map read lock
+                    // IEKF's propRCP / updateIEKF writes against any other
+                    // spline reader. Taken INSIDE the map read lock
                     // so the lock ordering (mtx_map_ before spline_mutex_) is
                     // consistent with the async path (no spline_mutex_ under
                     // mtx_map_ unique) — no cross-lock cycle possible.
@@ -543,7 +663,7 @@ public:
                 }
                 {
                     // pointBodyToWorld reads spline; keep serialized with
-                    // publishFrameWorld / IEKF writes via spline_mutex_.
+                    // IEKF writes via spline_mutex_.
                     std::lock_guard<std::mutex> spline_lock(spline_mutex_);
                     #pragma omp parallel for num_threads(num_threads_)
                     for (size_t i = 0; i < pt_meas.size(); i++) {
@@ -572,7 +692,20 @@ public:
                     est_msg.if_full_window.data = (max_spl_knots >= 4);
                     est_msg.runtime.data = 0;
                     pub_est->publish(est_msg);
+                    if (!est_window_first_logged_.exchange(true)) {
+                        RCLCPP_INFO(this->get_logger(),
+                            "[RESPLE] first /est_window published (numKnots=%ld)",
+                            spline->numKnots());
+                    }
                 }
+                // Pose/odom/TF publish is INLINE and unconditional. Keeping
+                // it out of the async-map-update lambda means the odom frame
+                // keeps flowing even if the background map mutation is
+                // wedged inside ikd-Tree (rebuild can stall on big trees,
+                // and previously this also stalled processData itself
+                // because the loop blocked on map_update_future_.wait()).
+                publishPoseAndTf();
+
                 if (max_time_ns >= t_last_map_upd + 100000000LL) {
                     // Wait for any prior async map update before swapping buffers.
                     // Gated on map_update_pending_ so the worker never reads the
@@ -633,14 +766,12 @@ public:
                     accum_nearest_points_bg_.swap(accum_nearest_points);
                     pc_world.clear();
                     accum_nearest_points.clear();
-                    // Async map mutation + pose publish. Two separate mutexes:
-                    //   mtx_map_ (unique) — serializes kd-tree mutations against
-                    //     IEKF's shared_lock readers. Does NOT cover the pose publish.
-                    //   spline_mutex_ — serializes spline reads in publishFrameWorld
-                    //     against worker's propRCP / updateIEKF writes. Taken
-                    //     outside mtx_map_ so a slow ROS publish can't block
-                    //     the worker's next IEKF cycle.
-                    //
+                    // Cloud publish runs INLINE before the async kicks off so
+                    // /current_scan keeps flowing even if the background map
+                    // mutation wedges (rebuild, blocking I/O, etc.).
+                    // publishPoseAndTf already ran inline above; the async
+                    // lambda is now strictly map-mutation, no ROS I/O.
+                    publishCurrentScan(pc_world_bg_);
                     // Set map_update_pending_ BEFORE launching so on_deactivate's
                     // read (after worker join) sees the pending state. The
                     // lambda clears it on exit so the next loop iteration's
@@ -649,8 +780,7 @@ public:
                     map_update_pending_.store(true, std::memory_order_release);
                     map_update_future_ = std::async(std::launch::async, [this]() {
                         // Wrap the entire body. Any throw here (PCL OOM,
-                        // pub_*->publish failure on a torn-down lifecycle
-                        // publisher, kd-tree internal exception) would
+                        // kd-tree internal exception, GPU error) would
                         // otherwise:
                         //   (a) leave map_update_pending_ stuck at true →
                         //       every subsequent processData cycle blocks on
@@ -664,23 +794,22 @@ public:
                         // Catch, log, and clear the pending flag so the next
                         // cycle proceeds cleanly.
                         try {
-                            {
-                                std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
-                                mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
-                                lasermapFovSegment();
+                            // mapIncremental / lasermapFovSegment / GPU sync
+                            // all run under one unique_lock(mtx_map_) so the
+                            // IEKF (shared_lock) never races against either
+                            // the kd-tree mutators or the CUDA k-NN buffers.
+                            // (g_cuda_map.update writes the same device-side
+                            // d_buckets / d_sorted_points arrays that
+                            // batch_search reads — running them concurrently
+                            // produced an "illegal memory access" SIGABRT.)
+                            std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
+                            mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
+                            lasermapFovSegment();
 #ifdef RESPLE_USE_CUDA
-                                ikdtree.PCL_Storage.clear();
-                                ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
-                                g_cuda_map.update(ikdtree.PCL_Storage.data(), ikdtree.PCL_Storage.size());
+                            ikdtree.PCL_Storage.clear();
+                            ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
+                            g_cuda_map.update(ikdtree.PCL_Storage.data(), ikdtree.PCL_Storage.size());
 #endif
-                            }
-                            // publishFrameWorld only touches the spline; guard it
-                            // with spline_mutex_ rather than the (released) map
-                            // lock so IEKF can proceed in parallel with the publish.
-                            {
-                                std::lock_guard<std::mutex> spline_lock(spline_mutex_);
-                                publishFrameWorld(pc_world_bg_);
-                            }
                         } catch (const std::exception& e) {
                             RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                 "[RESPLE] async map update threw: %s. Map this cycle dropped; "
@@ -708,6 +837,16 @@ public:
                     last_process_ns_.store(this->now().nanoseconds(), std::memory_order_relaxed);
                 }
             }
+                if (!collected_any) {
+                    ++hb_collect_false_count;
+                    // Yield instead of busy-spinning. Without this the outer
+                    // while did ~10M iterations/sec when collectMeasurements
+                    // had nothing to return — pure CPU burn that competed
+                    // with the IEKF for cycles. 1ms sleep keeps end-to-end
+                    // latency well under the 10ms knot interval while
+                    // freeing the core for sensor callbacks.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
             } catch (const std::exception& e) {
                 RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "[RESPLE] processData iteration threw: %s. Worker continues. "
@@ -848,12 +987,13 @@ private:
     // serializes them against the async map update and SaveMap action.
     std::shared_mutex mtx_map_;
     // Serializes SplineState mutations (IEKF propRCP / updateIEKF /
-    // collectMeasurements propRCP / pointBodyToWorld read) against reads
-    // in publishFrameWorld (async thread). mtx_map_ only covers the
-    // kd-tree; the spline is logically separate, so it gets its own
-    // lock — this lets publishFrameWorld's ROS publishes run in parallel
-    // with the worker's next IEKF cycle (whereas putting the publish
-    // inside mtx_map_ unique blocks the filter if a subscriber lags).
+    // collectMeasurements propRCP / pointBodyToWorld read). The async
+    // map-update lambda no longer touches the spline (publishPoseAndTf
+    // and publishCurrentScan run inline on the worker thread instead),
+    // so today this mutex only serializes the worker's own multi-step
+    // spline mutations. Kept distinct from mtx_map_ so that future
+    // executor-thread spline readers can grab spline_mutex_ without
+    // contending with kd-tree writers.
     //
     // Lock ordering: when both are held, mtx_map_ is always acquired
     // first, then spline_mutex_, to avoid deadlocks.
@@ -879,6 +1019,26 @@ private:
     // The write site at initialization() keeps m_buff because the IMU callback
     // depends on a coherent flip with imu_int_buff state — see comment there.
     std::atomic<bool> if_init_filter{false};
+    // One-shot diagnostic flags (cuda-perf-nano post-1.5 additions). Each
+    // exchange(true) prints once at first occurrence so the launch log
+    // shows the IMU/LiDAR/IEKF startup sequence without spamming.
+    std::atomic<bool> imu_first_logged_{false};
+    std::atomic<bool> imu_count_logged_{false};
+    std::atomic<bool> lidar_first_logged_{false};
+    std::atomic<bool> init_complete_logged_{false};
+    std::atomic<bool> iekf_first_logged_{false};
+    std::atomic<bool> est_window_first_logged_{false};
+
+    // One-shot diagnostic: prints the first time *any* LiDAR callback fires,
+    // so the user can tell whether LiDAR data is actually flowing or whether
+    // the topic name is wrong. Pairs with the IMU first-received log.
+    void noteFirstLidar(const char* kind, const std::string& msg_frame_id, std::size_t pts) {
+        if (!lidar_first_logged_.exchange(true)) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] First LiDAR scan received (kind=%s, frame_id='%s', points=%zu)",
+                kind, msg_frame_id.c_str(), pts);
+        }
+    }
     Estimator<24> estimator_lo;
     Estimator<30> estimator_lio;
     SplineState* spline;
@@ -1114,8 +1274,17 @@ private:
     {
         if (!have_imu_transform_) {
             try {
-                geometry_msgs::msg::TransformStamped transform; 
-                if (tf_buffer_->canTransform(this->frame_id, source_frame_id, 
+                // Pre-check that both frames are known to the buffer before
+                // calling canTransform. canTransform itself logs a noisy
+                // `Invalid frame ID "X" passed to canTransform - frame does
+                // not exist` warning the moment either frame is missing
+                // (typical at startup before the static TF has propagated).
+                if (!tf_buffer_->_frameExists(this->frame_id) ||
+                    !tf_buffer_->_frameExists(source_frame_id)) {
+                    return false;
+                }
+                geometry_msgs::msg::TransformStamped transform;
+                if (tf_buffer_->canTransform(this->frame_id, source_frame_id,
                                                 rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
                         transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id, 
                                                                         rclcpp::Time(0));
@@ -1144,8 +1313,15 @@ private:
     {
         if (!have_lidar_transform_) {
             try {
-                geometry_msgs::msg::TransformStamped transform; 
-                if (tf_buffer_->canTransform(this->frame_id, source_frame_id, 
+                // Same pre-check as updateImuTransform — avoids tf2's
+                // "frame does not exist" warning while the static TF
+                // publisher is still coming up.
+                if (!tf_buffer_->_frameExists(this->frame_id) ||
+                    !tf_buffer_->_frameExists(source_frame_id)) {
+                    return false;
+                }
+                geometry_msgs::msg::TransformStamped transform;
+                if (tf_buffer_->canTransform(this->frame_id, source_frame_id,
                                                 rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
                         transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id, 
                                                                         rclcpp::Time(0));
@@ -1243,6 +1419,15 @@ private:
         // the worker raced the executor and crashed — bdab3dc fix).
         if (if_lidar_only && init_done) {
             return;
+        }
+
+        // One-shot confirmation that IMU data is actually flowing — pairs
+        // with the "Waiting for N IMU samples" warn so users can tell at a
+        // glance whether the bag is producing IMU or the topic is wrong.
+        if (!imu_first_logged_.exchange(true)) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] First IMU sample received (frame_id='%s')",
+                imu_msg->header.frame_id.c_str());
         }
 
         if (imu_int_buff.size() >= 2000) {
@@ -1383,6 +1568,8 @@ private:
         // std::terminate → SIGABRT. PCL/TF calls can also throw. Convert to a
         // throttled warning so a single bad message can't take the node down.
         try {
+        noteFirstLidar("Ouster", ouster_msg_in->header.frame_id,
+                       ouster_msg_in->width * ouster_msg_in->height);
         // Find the Ouster lidar config
         std::string name = "Ouster";
         if (lidars.find(name) == lidars.end()) {
@@ -1446,6 +1633,7 @@ private:
     void livoxLidarCallback(const livox_ros_driver::msg::CustomMsg::SharedPtr livox_msg_in)
     {
         try {
+        noteFirstLidar("Mid70Avia", livox_msg_in->header.frame_id, livox_msg_in->point_num);
         std::string name = "Mid70Avia";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1512,6 +1700,7 @@ private:
     void livoxLidar2Callback(const livox_ros_driver2::msg::CustomMsg::SharedPtr livox_msg_in)
     {
         try {
+        noteFirstLidar("HAP360", livox_msg_in->header.frame_id, livox_msg_in->point_num);
         std::string name = "HAP360";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1577,6 +1766,7 @@ private:
      void livoxAVIACallback(const livox_interfaces::msg::CustomMsg::SharedPtr livox_msg_in)
      {
         try {
+        noteFirstLidar("AviaResple", livox_msg_in->header.frame_id, livox_msg_in->point_num);
         std::string name = "AviaResple";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1643,6 +1833,8 @@ private:
     void hesaiLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr hesai_msg_in)
 	{
         try {
+        noteFirstLidar("Hesai", hesai_msg_in->header.frame_id,
+                       hesai_msg_in->width * hesai_msg_in->height);
         std::string name = "Hesai";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1699,6 +1891,8 @@ private:
     void livoxMid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
 	{
         try {
+        noteFirstLidar("Mid360Boxi", livox_msg_in->header.frame_id,
+                       livox_msg_in->width * livox_msg_in->height);
         std::string name = "Mid360Boxi";
         const LidarConfig& lidar = lidars.at(name);
 
@@ -1750,7 +1944,102 @@ private:
         }
 	}
 
-    void publishFrameWorld(pcl::PointCloud<pcl::PointXYZINormal>& pc)
+    // Pose / odom / TF only — no point cloud, no map access. Safe to call
+    // every IEKF iteration on the worker thread; intentionally separated
+    // from publishCurrentScan so the odom frame keeps flowing even when
+    // the background map mutation lambda is wedged inside ikd-Tree.
+    int64_t last_pose_pub_time_ns_ = std::numeric_limits<int64_t>::min();
+
+    void publishPoseAndTf()
+    {
+        int64_t pose_time_ns = spline->maxTimeNs();
+        // Skip duplicates: the inner collectMeasurements loop can fire many
+        // times before the spline advances, and tf2 / nav listeners reject
+        // identical-stamp transforms anyway.
+        if (pose_time_ns <= last_pose_pub_time_ns_) return;
+        last_pose_pub_time_ns_ = pose_time_ns;
+
+        Eigen::Vector3d t_pose = spline->itpPosition(pose_time_ns);
+        Eigen::Quaterniond q_pose;
+        spline->itpQuaternion(pose_time_ns, &q_pose);
+
+        geometry_msgs::msg::PoseStamped pose_msg =
+            CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose);
+        pub_pose->publish(pose_msg);
+
+        // Pull the IEKF posterior covariance from the active estimator and
+        // project it through the spline Jacobian so downstream consumers
+        // (robot_localization, sierra) actually see per-step uncertainty
+        // rather than the static cov_pose YAML diagonal.
+        const Eigen::Matrix<double, 6, 6> P_pose =
+            if_lidar_only ? estimator_lo.getLastPoseCovariance()
+                          : estimator_lio.getLastPoseCovariance();
+        const Eigen::Matrix<double, 6, 6> P_twist =
+            if_lidar_only ? estimator_lo.getLastTwistCovariance()
+                          : estimator_lio.getLastTwistCovariance();
+
+        geometry_msgs::msg::PoseWithCovarianceStamped pose_cov_msg;
+        pose_cov_msg.header.frame_id = odom_id;
+        pose_cov_msg.header.stamp = rclcpp::Time(pose_time_ns);
+        pose_cov_msg.pose.pose = pose_msg.pose;
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c)
+                pose_cov_msg.pose.covariance[r * 6 + c] = P_pose(r, c);
+        pub_pose_cov->publish(pose_cov_msg);
+
+        // Odometry (pose + twist) for EKF fusion — twist from spline derivative
+        // gives the odom EKF a smooth velocity between pose updates.
+        nav_msgs::msg::Odometry odom_msg;
+        odom_msg.header.frame_id = odom_id;
+        odom_msg.header.stamp = rclcpp::Time(pose_time_ns);
+        odom_msg.child_frame_id = frame_id;
+        odom_msg.pose.pose = pose_cov_msg.pose.pose;
+        for (int i = 0; i < 36; ++i)
+            odom_msg.pose.covariance[i] = pose_cov_msg.pose.covariance[i];
+
+        Eigen::Vector3d v_world = spline->itpPosition<1>(pose_time_ns);
+        Eigen::Vector3d v_body = q_pose.inverse() * v_world;
+        odom_msg.twist.twist.linear.x = v_body.x();
+        odom_msg.twist.twist.linear.y = v_body.y();
+        odom_msg.twist.twist.linear.z = v_body.z();
+
+        Eigen::Vector3d w_body;
+        spline->itpQuaternion(pose_time_ns, nullptr, &w_body);
+        odom_msg.twist.twist.angular.x = w_body.x();
+        odom_msg.twist.twist.angular.y = w_body.y();
+        odom_msg.twist.twist.angular.z = w_body.z();
+
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c)
+                odom_msg.twist.covariance[r * 6 + c] = P_twist(r, c);
+
+        pub_odom->publish(odom_msg);
+
+        if (publish_tf) {
+            geometry_msgs::msg::TransformStamped transformStamped;
+            transformStamped.transform.translation.x = pose_msg.pose.position.x;
+            transformStamped.transform.translation.y = pose_msg.pose.position.y;
+            transformStamped.transform.translation.z = pose_msg.pose.position.z;
+            transformStamped.transform.rotation = pose_msg.pose.orientation;
+
+            tf2::Transform transform_tf;
+            tf2::fromMsg(transformStamped.transform, transform_tf);
+            if (invert_tf) transform_tf = transform_tf.inverse();
+            tf2::toMsg(transform_tf, transformStamped.transform);
+
+            transformStamped.header.stamp = pose_msg.header.stamp;
+            if (invert_tf) {
+                transformStamped.header.frame_id = frame_id;
+                transformStamped.child_frame_id  = odom_id;
+            } else {
+                transformStamped.header.frame_id = odom_id;
+                transformStamped.child_frame_id  = frame_id;
+            }
+            br->sendTransform(transformStamped);
+        }
+    }
+
+    void publishCurrentScan(pcl::PointCloud<pcl::PointXYZINormal>& pc)
     {
         int size = pc.points.size();
         laser_cloud_world_reusable_->clear();
@@ -1761,93 +2050,11 @@ private:
             laser_cloud_world_reusable_->points[i].z = pc.points[i].z;
             laser_cloud_world_reusable_->points[i].intensity = pc.points[i].curvature;
         }
-        
-        // Standard publishing (compatible with all RMW implementations)
-        int64_t pose_time_ns = spline->maxTimeNs();
         sensor_msgs::msg::PointCloud2 cloud_msg;
         pcl::toROSMsg(*laser_cloud_world_reusable_, cloud_msg);
-        cloud_msg.header.stamp = rclcpp::Time(pose_time_ns);
+        cloud_msg.header.stamp = rclcpp::Time(spline->maxTimeNs());
         cloud_msg.header.frame_id = odom_id;
         pub_cur_scan->publish(cloud_msg);
-
-        // Publish current pose
-        Eigen::Vector3d t_pose = spline->itpPosition(pose_time_ns);
-        Eigen::Quaterniond q_pose;
-        spline->itpQuaternion(pose_time_ns, &q_pose);
-
-        geometry_msgs::msg::PoseStamped pose_msg = 
-        CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose);
-        pub_pose->publish(pose_msg);                        
-
-        geometry_msgs::msg::PoseWithCovarianceStamped pose_cov_msg = 
-            CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose, cov_pose);
-        pub_pose_cov->publish(pose_cov_msg);
-
-        // Publish Odometry (pose + twist) for EKF fusion — twist from spline derivative
-        // gives the odom EKF velocity between pose updates, preventing jumpy corrections.
-        {
-            nav_msgs::msg::Odometry odom_msg;
-            odom_msg.header.frame_id = odom_id;
-            odom_msg.header.stamp = rclcpp::Time(pose_time_ns);
-            odom_msg.child_frame_id = frame_id;
-            odom_msg.pose.pose = pose_cov_msg.pose.pose;
-            // Copy full pose covariance from IEKF posterior
-            for (int i = 0; i < 36; ++i)
-                odom_msg.pose.covariance[i] = pose_cov_msg.pose.covariance[i];
-
-            // Velocity from spline first derivative (world frame), rotated to body frame
-            Eigen::Vector3d v_world = spline->itpPosition<1>(pose_time_ns);
-            Eigen::Vector3d v_body = q_pose.inverse() * v_world;
-            odom_msg.twist.twist.linear.x = v_body.x();
-            odom_msg.twist.twist.linear.y = v_body.y();
-            odom_msg.twist.twist.linear.z = v_body.z();
-
-            // Angular velocity from spline orientation derivative
-            Eigen::Vector3d w_body;
-            spline->itpQuaternion(pose_time_ns, nullptr, &w_body);
-            odom_msg.twist.twist.angular.x = w_body.x();
-            odom_msg.twist.twist.angular.y = w_body.y();
-            odom_msg.twist.twist.angular.z = w_body.z();
-
-            // Twist covariance — use position covariance scaled for velocity uncertainty
-            // Diagonal only: vx, vy, vz, wx, wy, wz
-            odom_msg.twist.covariance[0]  = cov_pose[0] * 4.0;  // vx
-            odom_msg.twist.covariance[7]  = cov_pose[1] * 4.0;  // vy
-            odom_msg.twist.covariance[14] = cov_pose[2] * 4.0;  // vz
-            odom_msg.twist.covariance[21] = cov_pose[3] * 4.0;  // wx
-            odom_msg.twist.covariance[28] = cov_pose[4] * 4.0;  // wy
-            odom_msg.twist.covariance[35] = cov_pose[5] * 4.0;  // wz
-
-            pub_odom->publish(odom_msg);
-        }
-
-        // Publish odom transforms
-        if(publish_tf)
-        {        
-            geometry_msgs::msg::TransformStamped transformStamped;
-            transformStamped.transform.translation.x = pose_msg.pose.position.x;
-            transformStamped.transform.translation.y = pose_msg.pose.position.y;
-            transformStamped.transform.translation.z = pose_msg.pose.position.z;
-            transformStamped.transform.rotation = pose_msg.pose.orientation;
-
-            tf2::Transform transform_tf;
-            tf2::fromMsg(transformStamped.transform, transform_tf);
-            if(invert_tf){
-                transform_tf = transform_tf.inverse(); 
-              }
-            tf2::toMsg(transform_tf, transformStamped.transform);
-
-            transformStamped.header.stamp = pose_msg.header.stamp;
-            if(invert_tf){            
-                transformStamped.header.frame_id = frame_id;
-                transformStamped.child_frame_id  = odom_id;
-            } else {
-                transformStamped.header.frame_id = odom_id;
-                transformStamped.child_frame_id  = frame_id;
-            }
-
-            br->sendTransform(transformStamped);
-        }
     }
 
     bool initialization()
@@ -1858,6 +2065,59 @@ private:
         for (const auto& [lidar_name, lidar_data] : lidars_data) {
             if (lidar_data.pt_buff.empty()) {
                 return false;
+            }
+        }
+        // Discard pre-init backlog: when the bag started before this node
+        // was ready (the common case), pc_buff + pt_buff have accumulated
+        // several seconds of stale scans by the time gravity alignment
+        // finishes. Anchoring the spline at pt_buff.front() then locks
+        // in a permanent real-time lag — the estimator processes at
+        // exactly the bag rate and never catches up, so visualization
+        // drifts further behind the actual robot pose every second.
+        //
+        // The latest LiDAR/IMU arrivals define "now" — both topics are
+        // confirmed active by this point (we wouldn't be here without
+        // first IMU + first LiDAR). Drop everything in pc_buff/t_buff/
+        // pt_buff older than a short window before the most recent
+        // point. 200ms = ~2 Avia scans, enough geometric overlap for
+        // the first IEKF iteration without dragging in stale history.
+        if (!if_init_filter) {
+            constexpr int64_t init_lag_window_ns = 200'000'000;  // 200ms
+            int64_t latest_t_ns = std::numeric_limits<int64_t>::min();
+            for (auto& [lidar_name, lidar_data] : lidars_data) {
+                if (!lidar_data.pt_buff.empty()) {
+                    latest_t_ns = std::max(latest_t_ns, lidar_data.pt_buff.back().time_ns);
+                }
+                // pc_buff/t_buff are pushed in the LiDAR callback; t_buff
+                // entries are scan-start timestamps (header.stamp).
+                std::lock_guard<std::mutex> lock(lidar_data.mtx_pc);
+                if (!lidar_data.t_buff.empty()) {
+                    latest_t_ns = std::max(latest_t_ns, lidar_data.t_buff.back());
+                }
+            }
+            int64_t cutoff = latest_t_ns - init_lag_window_ns;
+            size_t total_pt_dropped = 0;
+            size_t total_pc_dropped = 0;
+            for (auto& [lidar_name, lidar_data] : lidars_data) {
+                while (!lidar_data.pt_buff.empty() &&
+                       lidar_data.pt_buff.front().time_ns < cutoff) {
+                    lidar_data.pt_buff.pop_front();
+                    ++total_pt_dropped;
+                }
+                std::lock_guard<std::mutex> lock(lidar_data.mtx_pc);
+                while (!lidar_data.t_buff.empty() &&
+                       lidar_data.t_buff.front() < cutoff) {
+                    lidar_data.pc_buff.pop_front();
+                    lidar_data.t_buff.pop_front();
+                    ++total_pc_dropped;
+                }
+            }
+            if (total_pt_dropped > 0 || total_pc_dropped > 0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] dropped %zu pt_buff + %zu pc_buff stale entries "
+                    "(kept last %ld ms ending at %ld) to start near real time",
+                    total_pt_dropped, total_pc_dropped,
+                    init_lag_window_ns / 1'000'000, latest_t_ns);
             }
         }
         int64_t start_t_ns = std::numeric_limits<int64_t>::max();
@@ -1887,32 +2147,67 @@ private:
                         return false;
                     }
 
-                    // Compute mean and variance of accelerometer readings.
-                    // Use the NEWEST n_imu samples (tail of the buffer) so that spawning
-                    // transients at the front do not permanently block initialization.
-                    Eigen::Vector3d gravity_sum(0, 0, 0);
-                    n_imu = std::min(imu_init_num_samples_, buff_size);
-                    int start_idx = buff_size - n_imu;  // guaranteed >= 0 by the check above
-                    for (int i = 0; i < n_imu; i++) {
-                        gravity_sum += imu_buff.at(start_idx + i).accel;
+                    // One-shot: positive confirmation that we hit the sample
+                    // count, even if the variance check below later fails. Pairs
+                    // with the "Waiting for N IMU samples" warn — without this
+                    // log, a stuck variance check looks identical to "no IMU".
+                    if (!imu_count_logged_.exchange(true)) {
+                        RCLCPP_INFO(this->get_logger(),
+                            "[RESPLE] Collected %d IMU samples for gravity alignment "
+                            "(buffer size: %d)",
+                            imu_init_num_samples_, buff_size);
                     }
-                    gravity_mean = gravity_sum / n_imu;
 
-                    // Check variance to ensure IMU is stationary
-                    for (int i = 0; i < n_imu; i++) {
-                        Eigen::Vector3d diff = imu_buff.at(start_idx + i).accel - gravity_mean;
-                        accel_variance += diff.squaredNorm();
+                    // Scan ALL n_imu-wide windows in the buffer and pick
+                    // the one with the lowest accelerometer variance.
+                    // Previously we always took the tail; if the bag
+                    // started with the robot moving (or — common with our
+                    // delayed-launch workflow — the latest samples happen
+                    // to land mid-motion), the tail would fail the
+                    // variance check and the spline orientation ended up
+                    // anchored to a noisy gravity estimate, tilting the
+                    // map. Picking the quietest window in the buffer
+                    // recovers a clean gravity even when init lands
+                    // mid-bag.
+                    n_imu = std::min(imu_init_num_samples_, buff_size);
+                    const int n_windows = buff_size - n_imu + 1;
+                    Eigen::Vector3d best_mean = Eigen::Vector3d::Zero();
+                    double best_var = std::numeric_limits<double>::infinity();
+                    int best_start = 0;
+                    for (int w = 0; w < n_windows; ++w) {
+                        Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+                        for (int i = 0; i < n_imu; ++i) {
+                            sum += imu_buff.at(w + i).accel;
+                        }
+                        Eigen::Vector3d mean = sum / n_imu;
+                        double var = 0.0;
+                        for (int i = 0; i < n_imu; ++i) {
+                            var += (imu_buff.at(w + i).accel - mean).squaredNorm();
+                        }
+                        var /= n_imu;
+                        if (var < best_var) {
+                            best_var = var;
+                            best_mean = mean;
+                            best_start = w;
+                        }
                     }
-                    accel_variance /= n_imu;
+                    gravity_mean = best_mean;
+                    accel_variance = best_var;
 
                     if (accel_variance > imu_init_max_variance_) {
                         imu_lock.unlock();
                         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                            "IMU readings too noisy for initialization (variance: %.4f > %.4f). "
-                            "Ensure robot is stationary or increase imu_init_max_variance parameter.",
-                            accel_variance, imu_init_max_variance_);
+                            "IMU readings too noisy for initialization (best window variance: %.4f > %.4f, "
+                            "scanned %d windows). Ensure robot is stationary at some point during launch "
+                            "or increase imu_init_max_variance parameter.",
+                            accel_variance, imu_init_max_variance_, n_windows);
                         return false;
                     }
+                    RCLCPP_INFO(this->get_logger(),
+                        "[RESPLE] gravity window: picked samples [%d..%d] of %d "
+                        "(variance %.4f, scanned %d windows)",
+                        best_start, best_start + n_imu - 1, buff_size,
+                        accel_variance, n_windows);
 
                     // Clean up old IMU data
                     while (!imu_buff.empty() && imu_buff.front().time_ns < start_t_ns) {
@@ -2313,20 +2608,29 @@ int respleMain(int argc, char *argv[])
     exec.spin();
 
     // Cleanup on shutdown (only if context still valid)
-    if (rclcpp::ok()) {
+    bool sigint_path = !rclcpp::ok();
+    if (!sigint_path) {
         RCLCPP_INFO(node->get_logger(), "Gracefully shutting down RESPLE...");
         node->deactivate();
         node->cleanup();
         node->shutdown();
-    } else {
-        // Context already shut down (Ctrl+C); call on_shutdown directly to stop
-        // the processing thread since the executor is no longer spinning and
-        // lifecycle transitions cannot be driven through the state machine.
-        node->on_shutdown(node->get_current_state());
+        exec.remove_node(node->get_node_base_interface());
+        rclcpp::shutdown();
+        return 0;
     }
-    exec.remove_node(node->get_node_base_interface());
-    rclcpp::shutdown();
-    return 0;
+
+    // SIGINT path: the executor is no longer spinning and lifecycle
+    // transitions cannot be driven through the state machine. Run
+    // on_shutdown directly to stop the processing thread, then bail
+    // out hard — exec.remove_node / rclcpp::shutdown / static
+    // destructors all have observed wedge modes (CUDA teardown,
+    // ikd-Tree rebuild thread join, FastDDS atexit) that cause the
+    // launcher to escalate SIGINT → SIGTERM → SIGKILL. on_shutdown
+    // already released the ROS-visible state we care about.
+    node->on_shutdown(node->get_current_state());
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);
 }
 
 RCLCPP_COMPONENTS_REGISTER_NODE(RESPLE)
