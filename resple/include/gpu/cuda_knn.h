@@ -60,6 +60,12 @@ public:
     std::size_t n_points() const;
     bool empty() const;
 
+    // Drop the GPU-resident map (n_points → 0, so empty()==true) without
+    // freeing device buffers. Call on lifecycle deactivate so a re-activated
+    // node never queries the previous run's stale map before the next update().
+    // If a CUDA op has failed (sticky), empty() stays true regardless.
+    void clear();
+
 private:
     struct Impl;
     Impl* impl_ = nullptr;

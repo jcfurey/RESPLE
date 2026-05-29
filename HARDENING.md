@@ -322,18 +322,34 @@ inconsistency is the bug.
 
 ### Fix landed
 
-`resple/CMakeLists.txt`: `target_compile_definitions(${PROJECT_NAME} PUBLIC
-EIGEN_HAS_POSIX_MEMALIGN=1 EIGEN_HAS_MM_MALLOC=0)`. Forces every TU that
-pulls in our headers (resple library + RESPLE/Mapping executables) to see
-the same Eigen allocator dispatch — `posix_memalign` for allocation,
-`std::free` for deallocation. No mismatch possible.
+In `resple/CMakeLists.txt` (see the annotated comment block above the
+`target_compile_definitions` call — that block is the source of truth):
 
-**Status of the fix at commit time: built and installed; not yet
-verified to eliminate the crash in a sim run** (user moved on to commit
-the work in progress). If re-run shows the SIGSEGV gone, this is the fix.
-If it still fires, fall back to the more aggressive
-`EIGEN_MALLOC_ALREADY_ALIGNED=1` which forces plain `std::malloc` /
-`std::free` everywhere.
+- **First attempt (superseded, do not reintroduce):**
+  `EIGEN_HAS_POSIX_MEMALIGN=1 EIGEN_HAS_MM_MALLOC=0`. This *did not work* —
+  Eigen's `Memory.h` `#define`s those macros unconditionally from its own
+  `_GNU_SOURCE` / `_POSIX_ADVISORY_INFO` feature test, so a `-D` from the
+  command line gets overwritten when the header is preprocessed, and dispatch
+  still reached `handmade_aligned_free`.
+- **Current fix (in tree):**
+  ```cmake
+  target_compile_definitions(${PROJECT_NAME} PUBLIC
+      _GNU_SOURCE
+      EIGEN_MALLOC_ALREADY_ALIGNED=1
+      EIGEN_DEFAULT_ALIGN_BYTES=16)
+  ```
+  `_GNU_SOURCE` satisfies Eigen's own `posix_memalign` feature test;
+  `EIGEN_MALLOC_ALREADY_ALIGNED=1` short-circuits `aligned_free` to plain
+  `std::free` regardless of the other macros (the actual safety net); and
+  `EIGEN_DEFAULT_ALIGN_BYTES=16` pins alignment to match PCL and what
+  `std::malloc` delivers on x86_64 glibc, preventing over-alignment to 32
+  (AVX) from re-triggering the aligned-malloc dispatch.
+
+**Status at commit time: built and installed; not yet verified to eliminate
+the crash in a sim run** (work committed in progress). If it still fires, the
+next escalation is `EIGEN_MAX_ALIGN_BYTES=0` (disable Eigen alignment
+entirely), but that costs vectorization — try only if the current defines
+don't hold.
 
 ### Other defensive fixes landed alongside (also in this commit)
 

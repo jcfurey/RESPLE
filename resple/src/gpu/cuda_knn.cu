@@ -42,13 +42,21 @@ constexpr int kNumBucketsLog2 = 18;  // 256K buckets
 constexpr int kNumBuckets = 1 << kNumBucketsLog2;
 constexpr uint32_t kBucketMask = kNumBuckets - 1;
 
+// On a CUDA error, throw rather than std::abort(). update()/batch_search()
+// catch the throw, latch Impl::failed, and report the map empty so RESPLE
+// falls back to the ikd-tree CPU path instead of taking the whole node down.
+// (CUDA errors are usually sticky — the context is unusable — so latching and
+// never touching the GPU again is exactly the right degradation.) This macro
+// is only used in host code; never inside a __global__ kernel.
 #define CUDA_CHECK(call)                                                    \
     do {                                                                    \
         cudaError_t err__ = (call);                                         \
         if (err__ != cudaSuccess) {                                         \
-            fprintf(stderr, "[CudaMap] CUDA error %s at %s:%d: %s\n",       \
-                    #call, __FILE__, __LINE__, cudaGetErrorString(err__));  \
-            std::abort();                                                   \
+            char msg__[512];                                                \
+            snprintf(msg__, sizeof(msg__),                                  \
+                     "[CudaMap] CUDA error %s at %s:%d: %s",                \
+                     #call, __FILE__, __LINE__, cudaGetErrorString(err__)); \
+            throw std::runtime_error(msg__);                                \
         }                                                                   \
     } while (0)
 
@@ -297,6 +305,11 @@ struct CudaMap::Impl {
     // cudaSetDevice.
     bool integrated = false;
     bool integrated_detected = false;
+    // Sticky GPU-failure latch. Set by update()/batch_search() if any CUDA op
+    // throws. Once set, n_points() reports 0 so CudaMap::empty() is true and
+    // RESPLE falls back to the ikd-tree CPU path. Not cleared by clear() — a
+    // real CUDA fault leaves the context unusable for the rest of the process.
+    bool failed = false;
     cudaStream_t stream = 0;
 
     // GPU-resident sorted map (after hash-grid build).
@@ -421,12 +434,15 @@ CudaMap::~CudaMap() { delete impl_; }
 
 void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
     RESPLE_NVTX("CudaMap::update");
+    // Already in CPU-fallback mode after a prior CUDA failure: stay there.
+    if (impl_->failed) { impl_->n_points = 0; return; }
     const int n = static_cast<int>(n_in);
     impl_->n_points = n;
     if (n == 0) {
         return;
     }
 
+    try {
     impl_->maybe_detect_integrated();
     impl_->ensure_build_capacity(n);
     impl_->ensure_bucket_storage();
@@ -555,6 +571,12 @@ void CudaMap::update(const pcl::PointXYZINormal* points, std::size_t n_in) {
     impl_->cub_query_n = n;
     // No DtoH copy / host mirror — search kernel returns neighbor coords
     // directly, so the host doesn't need a copy of the sorted map.
+    } catch (const std::exception& e) {
+        fprintf(stderr, "%s\n[CudaMap] update() failed — disabling GPU map, "
+                "falling back to CPU kd-tree path.\n", e.what());
+        impl_->failed = true;
+        impl_->n_points = 0;
+    }
 }
 
 void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_queries_in,
@@ -570,7 +592,11 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
         dist_sq.assign(n_queries * k, INFINITY);
     }
 
-    if (n_queries == 0 || impl_->n_points == 0) {
+    // Sticky failure or empty map: the outputs are already all-miss (INFINITY,
+    // assigned above), so findCorresp phase 3 marks every correspondence
+    // invalid and the IEKF gets zero GPU correspondences this frame. Combined
+    // with empty()==true (failed latch), RESPLE then uses the CPU path.
+    if (impl_->failed || n_queries == 0 || impl_->n_points == 0) {
         prof::frame_done();
         return;
     }
@@ -579,6 +605,7 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
             "CudaMap::batch_search: k out of range [1, kMaxK]");
     }
 
+    try {
     impl_->maybe_detect_integrated();
     impl_->ensure_queries_capacity(n_queries);
     impl_->ensure_out_capacity(n_queries * k);
@@ -647,6 +674,13 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
             dist_sq[i] = h_out_dst[i];
         }
     }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "%s\n[CudaMap] batch_search() failed — disabling GPU "
+                "map, falling back to CPU kd-tree path.\n", e.what());
+        impl_->failed = true;
+        impl_->n_points = 0;
+        // Outputs stay all-INFINITY (assigned at entry) → zero correspondences.
+    }
 
     // batch_search is the natural per-frame cadence (one call per IEKF
     // iteration; iterations are bounded by max_iter — the periodic dump
@@ -655,9 +689,19 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
 }
 
 std::size_t CudaMap::n_points() const {
-    return impl_ ? static_cast<std::size_t>(impl_->n_points) : 0;
+    if (!impl_ || impl_->failed) return 0;
+    return static_cast<std::size_t>(impl_->n_points);
 }
 
 bool CudaMap::empty() const { return n_points() == 0; }
+
+void CudaMap::clear() {
+    // Drop the GPU-resident map so empty()==true until the next update(),
+    // without freeing the device buffers (the next update() reuses them).
+    // Called on lifecycle deactivate so a re-activated node never queries the
+    // previous run's stale points before the first mapIncremental re-syncs the
+    // GPU. Does NOT clear the sticky `failed` latch (see Impl::failed).
+    if (impl_) impl_->n_points = 0;
+}
 
 }  // namespace resple_gpu

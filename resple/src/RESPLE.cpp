@@ -290,6 +290,16 @@ public:
         joinProcessingThreadBounded(std::chrono::seconds(2));
         waitForMapUpdateBounded(std::chrono::seconds(2));
 
+#ifdef RESPLE_USE_CUDA
+        // Worker + async map update are now quiesced, so no thread touches
+        // g_cuda_map. Drop the GPU-resident map so a re-activation (configure→
+        // activate) doesn't run IEKF k-NN against the previous run's stale
+        // points before the first mapIncremental re-syncs the GPU. The kd-tree
+        // (ikdtree global) is likewise rebuilt on the next init, so both map
+        // backends start the new session empty.
+        g_cuda_map.clear();
+#endif
+
         // Wait for any in-flight SaveMap action
         {
             std::lock_guard<std::mutex> lock(save_map_mutex_);
