@@ -209,6 +209,12 @@ public:
         return static_cast<int64_t>(static_cast<double>(t_ms) * 1e6);
     }    
 
+    // Per-scan time-order comparator for deskew. The `.intensity` field is
+    // overloaded to carry the per-point time offset (ms) — every sensor
+    // callback writes time-since-scan-start into `.intensity` and moves the
+    // real reflectivity into `.curvature` (see the Ouster/Livox/Hesai loaders).
+    // So this sorts by time, not reflectivity. If a future sensor path leaves
+    // genuine intensity in this field, deskew ordering breaks silently.
     static bool time_list(pcl::PointXYZINormal &x, pcl::PointXYZINormal &y) {return (x.intensity < y.intensity);};
 
     // Create Pose

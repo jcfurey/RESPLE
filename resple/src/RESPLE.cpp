@@ -73,7 +73,13 @@
 #include "gpu/cuda_knn.h"
 #endif
 
-KD_TREE<pcl::PointXYZINormal> ikdtree;
+// Internal linkage: RESPLE.cpp is compiled into both libresple.so and the
+// standalone RESPLE executable (the executable re-compiles the source and links
+// the lib). With external linkage there were two definitions of `ikdtree`, and
+// which one each function bound to depended on ELF symbol interposition. `static`
+// gives each translation unit its own instance (matching g_cuda_map below); the
+// global is only ever referenced from within this file.
+static KD_TREE<pcl::PointXYZINormal> ikdtree;
 #ifdef RESPLE_USE_CUDA
 static resple_gpu::CudaMap g_cuda_map;
 #endif
@@ -136,10 +142,10 @@ public:
         diagnostics_.add("System Health", this, &RESPLE::updateDiagnostics);
         
         // Initialize diagnostic metrics
-        last_process_time_ = this->now();
-        frame_count_ = 0;
-        total_computation_time_ms_ = 0.0;
-        total_iekf_iterations_ = 0;
+        last_process_ns_.store(this->now().nanoseconds(), std::memory_order_relaxed);
+        frame_count_.store(0, std::memory_order_relaxed);
+        total_computation_time_us_.store(0, std::memory_order_relaxed);
+        total_iekf_iterations_.store(0, std::memory_order_relaxed);
         
         readParameters();
         
@@ -515,7 +521,7 @@ public:
                         {
                             estimator_lo.updateIEKFLiDAR(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
                         }
-                        total_iekf_iterations_ += estimator_lo.n_iter;
+                        total_iekf_iterations_.fetch_add(estimator_lo.n_iter, std::memory_order_relaxed);
                     } else {
                         if (!imu_meas.empty()) {
                             max_time_ns = std::max(imu_meas.back().time_ns, max_time_ns);
@@ -532,7 +538,7 @@ public:
                         {
                             estimator_lio.updateIEKFLiDARInertial(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
                         }
-                        total_iekf_iterations_ += estimator_lio.n_iter;
+                        total_iekf_iterations_.fetch_add(estimator_lio.n_iter, std::memory_order_relaxed);
                     }
                 }
                 {
@@ -567,7 +573,7 @@ public:
                     est_msg.runtime.data = 0;
                     pub_est->publish(est_msg);
                 }
-                if (max_time_ns >= t_last_map_upd + 1e8) {
+                if (max_time_ns >= t_last_map_upd + 100000000LL) {
                     // Wait for any prior async map update before swapping buffers.
                     // Gated on map_update_pending_ so the worker never reads the
                     // future until a prior launch was observed here.
@@ -692,13 +698,14 @@ public:
                 // Update diagnostic metrics
                 auto frame_end = std::chrono::high_resolution_clock::now();
                 auto frame_duration = std::chrono::duration_cast<std::chrono::microseconds>(frame_end - frame_start);
-                total_computation_time_ms_ += frame_duration.count() / 1000.0;
-                frame_count_++;
-                
+                total_computation_time_us_.fetch_add(
+                    static_cast<uint64_t>(frame_duration.count()), std::memory_order_relaxed);
+                frame_count_.fetch_add(1, std::memory_order_relaxed);
+
                 // Update diagnostics at 1 Hz
-                if ((this->now() - last_process_time_).seconds() >= 1.0) {
+                if ((this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) >= 1000000000LL) {
                     diagnostics_.force_update();
-                    last_process_time_ = this->now();
+                    last_process_ns_.store(this->now().nanoseconds(), std::memory_order_relaxed);
                 }
             }
             } catch (const std::exception& e) {
@@ -729,10 +736,17 @@ private:
     
     // Diagnostics
     diagnostic_updater::Updater diagnostics_;
-    rclcpp::Time last_process_time_;
-    size_t frame_count_;
-    double total_computation_time_ms_;
-    size_t total_iekf_iterations_;
+    // These counters are written by the worker thread (processData) and
+    // read/reset by updateDiagnostics, which can run on the ROS executor thread
+    // via the Updater's internal 1 Hz timer (not only from the worker's
+    // force_update). Plain members were a data race; atomics make every access
+    // well-defined. Computation time is accumulated in integer microseconds
+    // because C++17 has no atomic<double> fetch_add. last_process_ns_ replaces
+    // an rclcpp::Time member for the same reason.
+    std::atomic<int64_t> last_process_ns_{0};
+    std::atomic<size_t> frame_count_{0};
+    std::atomic<uint64_t> total_computation_time_us_{0};
+    std::atomic<size_t> total_iekf_iterations_{0};
     // Phase-0 hardening instrumentation: cached under spline_mutex_ by the
     // worker at the end of each IEKF cycle, read lock-free by updateDiagnostics
     // (which may run on the ROS executor thread via the Updater's internal
@@ -1260,11 +1274,17 @@ private:
     // Diagnostic updater callback
     void updateDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& stat)
     {
+        // Snapshot the worker-written atomics once so the metrics below are
+        // computed from a consistent set of values.
+        const size_t frame_count = frame_count_.load(std::memory_order_relaxed);
+        const uint64_t comp_time_us = total_computation_time_us_.load(std::memory_order_relaxed);
+        const size_t iekf_iters = total_iekf_iterations_.load(std::memory_order_relaxed);
+
         // Calculate processing rate
-        double time_elapsed = (this->now() - last_process_time_).seconds();
-        double processing_rate = (time_elapsed > 0) ? frame_count_ / time_elapsed : 0.0;
-        double avg_computation_time = (frame_count_ > 0) ? total_computation_time_ms_ / frame_count_ : 0.0;
-        double avg_iekf_iters = (frame_count_ > 0) ? static_cast<double>(total_iekf_iterations_) / frame_count_ : 0.0;
+        double time_elapsed = (this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) / 1e9;
+        double processing_rate = (time_elapsed > 0) ? frame_count / time_elapsed : 0.0;
+        double avg_computation_time = (frame_count > 0) ? (comp_time_us / 1000.0) / frame_count : 0.0;
+        double avg_iekf_iters = (frame_count > 0) ? static_cast<double>(iekf_iters) / frame_count : 0.0;
 
         // Determine rate-based health level
         const double expected_rate = 20.0;  // Target: 20 Hz
@@ -1273,7 +1293,7 @@ private:
 
         uint8_t level = diagnostic_msgs::msg::DiagnosticStatus::OK;
         std::string msg = "System healthy";
-        if (frame_count_ == 0) {
+        if (frame_count == 0) {
             level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
             msg = "No frames processed yet";
         } else if (processing_rate < error_threshold) {
@@ -1287,7 +1307,7 @@ private:
         // Add detailed metrics
         stat.add("Processing Rate (Hz)", processing_rate);
         stat.add("Target Rate (Hz)", expected_rate);
-        stat.add("Frames Processed", static_cast<int>(frame_count_));
+        stat.add("Frames Processed", static_cast<int>(frame_count));
         stat.add("Avg Computation Time (ms)", avg_computation_time);
         stat.add("Avg IEKF Iterations", avg_iekf_iters);
         stat.add("Num Threads", num_threads_);
@@ -1347,9 +1367,9 @@ private:
         stat.summary(level, msg);
 
         // Reset counters for next period
-        frame_count_ = 0;
-        total_computation_time_ms_ = 0.0;
-        total_iekf_iterations_ = 0;
+        frame_count_.store(0, std::memory_order_relaxed);
+        total_computation_time_us_.store(0, std::memory_order_relaxed);
+        total_iekf_iterations_.store(0, std::memory_order_relaxed);
     }
 
     template<typename T>
@@ -1955,7 +1975,7 @@ private:
             int feats_down_size = 0;
             for (const auto& [lidar_name, lidar_data] : lidars_data) {
                 for (size_t i = 0; i < lidar_data.pt_buff.size(); i++) {
-                    if (lidar_data.pt_buff[i].time_ns < start_t_ns + 1e8) {
+                    if (lidar_data.pt_buff[i].time_ns < start_t_ns + 100000000LL) {
                         feats_down_size++;
                     } else {
                         break;
@@ -1970,7 +1990,7 @@ private:
             int world_i = 0;
             for (const auto& [lidar_name, lidar_data] : lidars_data) {
                 for (size_t i = 0; i < lidar_data.pt_buff.size(); i++) {
-                    if (lidar_data.pt_buff[i].time_ns < start_t_ns + 1e8) {
+                    if (lidar_data.pt_buff[i].time_ns < start_t_ns + 100000000LL) {
                         Association::pointBodyToWorld(start_t_ns, spline, lidar_data.pt_buff[i].pt,
                             pc_world.points[world_i], lidar_data.pt_buff[i].t_bl, lidar_data.pt_buff[i].q_bl);
                         world_i++;
@@ -1980,7 +2000,7 @@ private:
                 }
             }
             for (auto& [lidar_name, lidar_data] : lidars_data) {
-                while (!lidar_data.pt_buff.empty() && lidar_data.pt_buff.front().time_ns < start_t_ns + 1e8) {
+                while (!lidar_data.pt_buff.empty() && lidar_data.pt_buff.front().time_ns < start_t_ns + 100000000LL) {
                     lidar_data.pt_buff.pop_front();
                 }
             }

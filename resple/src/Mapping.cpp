@@ -91,6 +91,7 @@ class MappingBase
         have_imu_transform_ = false;
         lidar_to_baselink_ = Eigen::Affine3d::Identity();
         imu_to_baselink_ = Eigen::Affine3d::Identity();
+        baselink_to_imu_ = Eigen::Affine3d::Identity();
 
         pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("global_map",
             rclcpp::QoS(2).reliable());
@@ -178,7 +179,8 @@ class MappingBase
                         Eigen::Translation3d translation(lidar.t_lb);
                         Eigen::Affine3d imu_to_lidar = translation * lidar.q_lb;
                         imu_to_baselink_ = lidar_to_baselink_ * imu_to_lidar;
-                        have_imu_transform_ = true;                        
+                        baselink_to_imu_ = imu_to_baselink_.inverse();
+                        have_imu_transform_ = true;
                         RCLCPP_INFO(node_handle_->get_logger(), "[Mapping] Got LiDAR transform: %s -> %s", 
                                 source_frame_id.c_str(), this->frame_id.c_str());
                     } else {
@@ -206,8 +208,14 @@ class MappingBase
         Eigen::Vector3d t_itp;
         spl->itpQuaternion(time_ns, &q_itp);
         t_itp = spl->itpPosition(time_ns);
+        // pt_in is already in base_link (the sensor callbacks pre-transform
+        // the cloud via lidar_to_baselink_). The spline pose (q_itp, t_itp) is
+        // the IMU/body trajectory in world (same convention as RESPLE's
+        // Association::pointBodyToWorld). So go base_link -> IMU -> world.
+        // Applying lidar->IMU (lidar.q_bl/t_bl) here would double-count the
+        // extrinsic, since the point is no longer in the lidar frame.
         Eigen::Vector3d p_body(pt_in.x, pt_in.y, pt_in.z);
-        Eigen::Vector3d p_imu(lidar.q_bl * p_body + lidar.t_bl);
+        Eigen::Vector3d p_imu(baselink_to_imu_ * p_body);
         Eigen::Vector3d p_global(q_itp * p_imu + t_itp);
         PointType point_world;
         point_world.x = p_global(0);
@@ -222,7 +230,7 @@ class MappingBase
                        typename pcl::PointCloud<PointType>::Ptr pc_out) const
     {
         int64_t time_begin = rclcpp::Time(pc_in.header.stamp).nanoseconds();
-        pc->clear();
+        pc_out->clear();
         const size_t n = pc_in.size();
         pc_out->points.resize(n);
         std::vector<uint8_t> valid(n, 0);
@@ -264,6 +272,7 @@ class MappingBase
     bool have_imu_transform_;
     Eigen::Affine3d lidar_to_baselink_;
     Eigen::Affine3d imu_to_baselink_;
+    Eigen::Affine3d baselink_to_imu_;
 
     typename pcl::PointCloud<PointType>::Ptr pc;
 };
@@ -820,6 +829,15 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                     spline_pending_ready_.store(false);
                 }
             }
+            // Consume a (re)start signal: reset worker-local trackers so a
+            // RESPLE respawn doesn't leave us gating on a stale knot count /
+            // path timestamp from the previous run. Done on the worker thread
+            // so opt_old_path/path_t_ns_/num_knot are only ever touched here.
+            if (path_reset_.exchange(false, std::memory_order_acquire)) {
+                num_knot = 0;
+                path_t_ns_ = 0;
+                opt_old_path.poses.clear();
+            }
             // Acquire-load on if_init_succeed so the startCallBack init()
             // writes (release-store on the flag) are visible before we read
             // spline_active_'s state. After this gate, all subsequent reads
@@ -883,6 +901,13 @@ private:
     // initialized spline_active_ when it sees the flag true.
     std::atomic<bool> if_init_succeed{false};
     int64_t path_t_ns_ = 0;
+    // Set by startCallBack (executor thread) on every (re)start, consumed once
+    // by process() (worker thread). On a RESPLE respawn the spline window is
+    // re-init'd from a fresh start time; without this the worker's local
+    // num_knot and the member path_t_ns_/opt_old_path hold stale values from
+    // the previous run, so the publish gate (numKnots() > num_knot) and
+    // publishPath's while-loop never advance and path/odom silently freeze.
+    std::atomic<bool> path_reset_{false};
     std::mutex m_spline;
 
     void displayControlPoints()
@@ -1084,6 +1109,9 @@ private:
             std::lock_guard<std::mutex> lock(m_spline);
             spline_active_.init(1, 0, bag_start_time, 0);  // dt=1 placeholder; overridden by getEstCallback
         }
+        // Tell the worker to drop the previous run's path/knot trackers before
+        // it publishes against the freshly re-init'd spline window.
+        path_reset_.store(true, std::memory_order_release);
         if_init_succeed.store(true, std::memory_order_release);
     }
 
@@ -1103,7 +1131,7 @@ private:
             Eigen::Vector3d t_interp = spline_active_.itpPosition(path_t_ns_);
             spline_active_.itpQuaternion(path_t_ns_, &orient_interp);
             opt_old_path.poses.push_back(CommonUtils::pose2msg(map_id, path_t_ns_, t_interp, orient_interp));
-            path_t_ns_ += 1e8;
+            path_t_ns_ += 100000000LL;  // 100 ms; integer to avoid double rounding of absolute-ns stamps
         }
         // Cap path length to prevent OOM on long runs
         if (opt_old_path.poses.size() > 10000) {
