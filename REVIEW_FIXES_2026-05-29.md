@@ -113,20 +113,25 @@ ordering. (No behavior change.)
 
 ---
 
+## Follow-up (done in a second commit)
+
+- **Eliminated the double-compilation of `RESPLE.cpp` / `Mapping.cpp`.** The
+  executables previously re-compiled the full ~90 KB node sources that already
+  live in `libresple.so` (gated with `#ifndef RESPLE_LIB_BUILD`), a build-time
+  cost and a duplicate-symbol layout. `main()` in each file was renamed to an
+  exported entry function (`respleMain` / `mappingMain`) compiled once into the
+  library; the executables are now thin wrappers (`src/RESPLE_main.cpp`,
+  `src/Mapping_main.cpp`) that forward to it. `RESPLE_LIB_BUILD` and the
+  redundant per-executable PCL/YAML/OpenMP links are gone (propagated
+  transitively from the lib). The `static ikdtree` from fix #6 is now strictly
+  internal to the single compilation, not just papering over interposition.
+
+- **Diagnostic window accounting no longer drops counts.** `updateDiagnostics`
+  now subtracts exactly the snapshot it reported (`fetch_sub`) instead of
+  `store(0)`, so worker increments that land between the snapshot and the reset
+  carry into the next window rather than being lost.
+
 ## Worth noting (not changed)
-
-- **Double-compilation of `RESPLE.cpp` / `Mapping.cpp` remains.** Fix #6 removes
-  the *correctness* fragility, but the executables still re-compile the full
-  ~90 KB sources that already live in `libresple.so` — a build-time cost and a
-  duplicate-symbol layout that works only because one copy sits in a `.so`. The
-  clean design is to keep `main()` in its own small TU and link the library,
-  rather than re-compiling the whole file with `#ifndef RESPLE_LIB_BUILD`.
-  Deferred — it's a CMake restructure, not a bug.
-
-- **Diagnostic window accounting is best-effort.** Counters are read then reset
-  in `updateDiagnostics`; a worker increment landing between the two is dropped
-  from that window. This matches the pre-existing design and is acceptable for
-  diagnostics — the atomics just make it well-defined rather than UB.
 
 - **Pre-existing build warnings are untouched:** `transform_broadcaster.h`
   deprecation, unused `respleCrashHandler` / `mappingCrashHandler` (installed by

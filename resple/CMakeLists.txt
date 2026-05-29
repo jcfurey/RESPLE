@@ -85,11 +85,6 @@ endif()
 
 ament_auto_add_library(${PROJECT_NAME} SHARED ${RESPLE_LIB_SOURCES})
 
-# Suppress main() in RESPLE.cpp / Mapping.cpp when compiled into the shared lib;
-# the standalone executables below compile the same .cpp files without this
-# define, so their main() is retained for the binary entry point.
-target_compile_definitions(${PROJECT_NAME} PRIVATE RESPLE_LIB_BUILD)
-
 if(ENABLE_CUDA)
 	target_compile_definitions(${PROJECT_NAME} PUBLIC RESPLE_USE_CUDA)
 	set_target_properties(${PROJECT_NAME} PROPERTIES
@@ -226,12 +221,11 @@ if(RESPLE_SAN_FLAGS)
 	target_link_options(${PROJECT_NAME} PUBLIC ${RESPLE_SAN_FLAGS})
 endif()
 
-# Executables just wrap the library - no source duplication
-add_executable(Mapping)
-target_sources(Mapping PRIVATE src/Mapping.cpp)
-
-add_executable(RESPLE)
-target_sources(RESPLE PRIVATE src/RESPLE.cpp)
+# Executables are thin main() wrappers that forward to the library's exported
+# entry functions (respleMain / mappingMain). The heavy node sources live only
+# in ${PROJECT_NAME}, so they're compiled once instead of twice.
+add_executable(Mapping src/Mapping_main.cpp)
+add_executable(RESPLE src/RESPLE_main.cpp)
 
 # -rdynamic exports symbols in the dynamic symbol table so the crash-handler's
 # backtrace_symbols_fd() in RESPLE.cpp prints function names instead of just
@@ -240,27 +234,18 @@ target_link_options(RESPLE  PRIVATE -rdynamic)
 target_link_options(Mapping PRIVATE -rdynamic)
 
 # ROS deps are linked into ${PROJECT_NAME} by ament_auto_add_library via package.xml.
-# Use plain signature consistently (ament_target_dependencies uses plain internally)
+# Use plain signature consistently (ament_target_dependencies uses plain internally).
+# The thin executables only need the library; PCL/YAML/OpenMP propagate
+# transitively from it (plain-signature links are usage requirements).
 target_link_libraries(${PROJECT_NAME}
 	${PCL_LIBRARIES}
 	${YAML_CPP_LIBRARIES}
 )
 
-target_link_libraries(RESPLE
-	${PROJECT_NAME}
-	${PCL_LIBRARIES}
-	${YAML_CPP_LIBRARIES}
-)
-
-target_link_libraries(Mapping
-	${PROJECT_NAME}
-	${PCL_LIBRARIES}
-	${YAML_CPP_LIBRARIES}
-)
+target_link_libraries(RESPLE  ${PROJECT_NAME})
+target_link_libraries(Mapping ${PROJECT_NAME})
 
 if(ENABLE_OPENMP)
-  target_link_libraries(RESPLE OpenMP::OpenMP_CXX)
-  target_link_libraries(Mapping OpenMP::OpenMP_CXX)
   target_link_libraries(${PROJECT_NAME} OpenMP::OpenMP_CXX)
 endif()
 

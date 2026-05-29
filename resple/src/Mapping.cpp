@@ -1167,8 +1167,9 @@ static void mappingCrashHandler(int sig)
     raise(sig);
 }
 
-#ifndef RESPLE_LIB_BUILD
-int main(int argc, char** argv) {
+// Real entry point, compiled once into libresple. The thin Mapping_main.cpp
+// wrapper (the executable's only TU) just forwards to this.
+int mappingMain(int argc, char** argv) {
     signal(SIGSEGV, mappingCrashHandler);
     signal(SIGABRT, mappingCrashHandler);
     signal(SIGBUS,  mappingCrashHandler);
@@ -1320,5 +1321,5 @@ int main(int argc, char** argv) {
     }
 
     rclcpp::shutdown();
+    return 0;
 }
-#endif // RESPLE_LIB_BUILD

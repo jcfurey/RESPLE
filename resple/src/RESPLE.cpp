@@ -1366,10 +1366,13 @@ private:
 
         stat.summary(level, msg);
 
-        // Reset counters for next period
-        frame_count_.store(0, std::memory_order_relaxed);
-        total_computation_time_us_.store(0, std::memory_order_relaxed);
-        total_iekf_iterations_.store(0, std::memory_order_relaxed);
+        // Reset counters for next period. Subtract exactly what was reported
+        // (rather than store(0)) so increments the worker makes between the
+        // snapshot above and here are not dropped — they carry into the next
+        // window instead of being lost.
+        frame_count_.fetch_sub(frame_count, std::memory_order_relaxed);
+        total_computation_time_us_.fetch_sub(comp_time_us, std::memory_order_relaxed);
+        total_iekf_iterations_.fetch_sub(iekf_iters, std::memory_order_relaxed);
     }
 
     template<typename T>
@@ -2248,8 +2251,10 @@ static void respleCrashHandler(int sig)
     raise(sig);
 }
 
-#ifndef RESPLE_LIB_BUILD
-int main(int argc, char *argv[])
+// Real entry point, compiled once into libresple. The thin RESPLE_main.cpp
+// wrapper (the executable's only TU) just forwards to this, so the heavy node
+// source is no longer compiled twice (lib + executable).
+int respleMain(int argc, char *argv[])
 {
     // Install before rclcpp::init so crashes during subscriber/publisher
     // construction also produce a trace.
@@ -2323,6 +2328,5 @@ int main(int argc, char *argv[])
     rclcpp::shutdown();
     return 0;
 }
-#endif // RESPLE_LIB_BUILD
 
 RCLCPP_COMPONENTS_REGISTER_NODE(RESPLE)
