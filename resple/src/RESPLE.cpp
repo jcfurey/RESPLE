@@ -472,6 +472,20 @@ public:
             // rather than silently.
             try {
                 ++hb_loop_count;
+                // Refresh diagnostic buffer-depth caches (read by
+                // updateDiagnostics, which can run on the executor thread).
+                // pc_buff is callback-written → read under mtx_pc; imu_buff and
+                // pt_meas are worker-owned → safe to read here on the worker.
+                {
+                    int64_t lidar_total = 0;
+                    for (auto& [diag_name, diag_data] : lidars_data) {
+                        std::lock_guard<std::mutex> lk(diag_data.mtx_pc);
+                        lidar_total += static_cast<int64_t>(diag_data.pc_buff.size());
+                    }
+                    cached_lidar_buf_.store(lidar_total, std::memory_order_relaxed);
+                    cached_imu_buf_.store(static_cast<int64_t>(imu_buff.size()), std::memory_order_relaxed);
+                    cached_pt_meas_.store(static_cast<int64_t>(pt_meas.size()), std::memory_order_relaxed);
+                }
                 // Heartbeat dump: read current buffer / spline state every ~2s.
                 // Diagnostic only — read-only, no lock-order interactions.
                 {
@@ -892,6 +906,16 @@ private:
     // timer, not just from the worker's force_update). Atomic so the read is
     // not a data race; stale-by-one-cycle is acceptable.
     std::atomic<int64_t> cached_spline_knots_{0};
+    // Diagnostic buffer depths. Refreshed by the worker each loop iteration and
+    // read by updateDiagnostics, which can run on the executor thread via the
+    // Updater's internal 1 Hz timer. Atomic so the cross-thread read is not a
+    // data race on the worker-owned (imu_buff, pt_meas) / callback-written
+    // (pc_buff) containers — the same race class REVIEW_FIXES #3 fixed for the
+    // perf counters, here extended to the buffer-depth metrics. Stale-by-one-
+    // cycle is acceptable for diagnostics.
+    std::atomic<int64_t> cached_lidar_buf_{0};
+    std::atomic<int64_t> cached_imu_buf_{0};
+    std::atomic<int64_t> cached_pt_meas_{0};
     // Per-window baseline for IEKF numerical-failure deltas (published as a
     // per-second rate, not a cumulative count).
     uint64_t last_numerical_failures_lo_ = 0;
@@ -1498,14 +1522,12 @@ private:
         stat.add("Num Threads", num_threads_);
         stat.add("Num Match Points", num_match_points_);
 
-        // Buffer sizes
-        size_t total_lidar_buffer = 0;
-        for (const auto& [name, data] : lidars_data) {
-            total_lidar_buffer += data.pc_buff.size();
-        }
-        stat.add("LiDAR Buffer Size", static_cast<int>(total_lidar_buffer));
-        stat.add("IMU Buffer Size", static_cast<int>(imu_buff.size()));
-        stat.add("Point Meas Buffer Size", static_cast<int>(pt_meas.size()));
+        // Buffer sizes: read the worker-maintained atomic caches instead of the
+        // live containers (mutated by the worker / lidar callbacks) to avoid a
+        // data race when this callback runs on the executor thread.
+        stat.add("LiDAR Buffer Size", static_cast<int>(cached_lidar_buf_.load(std::memory_order_relaxed)));
+        stat.add("IMU Buffer Size", static_cast<int>(cached_imu_buf_.load(std::memory_order_relaxed)));
+        stat.add("Point Meas Buffer Size", static_cast<int>(cached_pt_meas_.load(std::memory_order_relaxed)));
 
         // Phase-0 instrumentation: spline growth + IMU staging buffer + IEKF
         // numerical-failure rate. These are the primary signals for deciding

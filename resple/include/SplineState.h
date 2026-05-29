@@ -419,7 +419,12 @@ class SplineState
         baseCoeffsWithTime<0>(p, u);
         const int size_J = std::min(idx_r + 1, 4);
         const int idx_window = std::max(0, 2 - idx_l);
-        const int n_active = std::min(idx_l + 2, 4);
+        // Cap n_active against the deque size (mirrors prepareInterpolation's
+        // n_active_safe). The entry clamp already bounds t_ns, but this defends
+        // the t_knots / ort_delta reads below if a future knot-prune shrinks the
+        // deque under a stale idx0. All three knot deques have size == num_knot.
+        const int n_active = std::min<int>(std::min(idx_l + 2, 4),
+            std::max<int>(0, static_cast<int>(t_knots.size()) - static_cast<int>(idx0)));
 
         // Position interpolation
         if (p_out || J_p) {
@@ -447,7 +452,19 @@ class SplineState
             Eigen::Vector4d coeff = cumulative_blending_matrix * p;
 
             Eigen::Quaterniond cp0;
-            if (idx_r > 3)      cp0 = q_knots[idx0-1];
+            if (idx_r > 3) {
+                // Guard the q_knots[idx0-1] read (same deque-shrink rationale as
+                // the n_active cap above): fall back to identity if out of range.
+                const int64_t cp0_idx = idx0 - 1;
+                if (cp0_idx < 0 || cp0_idx >= static_cast<int64_t>(q_knots.size())) {
+                    RESPLE_LOG_INVARIANT_ONCE("itpPose q_knots[idx0-1] idx=" << cp0_idx
+                        << " out of range; returning identity quaternion");
+                    if (q_out) *q_out = Eigen::Quaterniond::Identity();
+                    if (J_q) { J_q->d_val_d_knot.clear(); J_q->start_idx = 0; }
+                    return;
+                }
+                cp0 = q_knots[cp0_idx];
+            }
             else if (idx_r == 3) cp0 = q_idle[2];
             else if (idx_r == 2) cp0 = q_idle[1];
             else if (idx_r == 1) cp0 = q_idle[0];
