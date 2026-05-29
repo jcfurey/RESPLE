@@ -18,34 +18,31 @@ with the Ouster IMU fused into the IEKF continuously (not just gravity init).
 `env.d/20-features.env` has `run_resple=False`. The active LiDAR-inertial
 odometry source is DLIO, feeding the `robot_localization` odom EKF. RESPLE
 remains fully wired for one-line revert (`run_resple=True` in
-`20-features.env`) and was the production source through the Sierra-stack
-era. See `rovermax_ws/CLAUDE.md` "Localization Architecture" for the active
-stack diagram.
+`20-features.env`). See `rovermax_ws/CLAUDE.md` "Localization Architecture"
+for the active stack diagram.
 
-Integration point **when enabled** (Sierra-stack era; one-line revert):
+Integration point **when enabled** (one-line revert):
 
 ```text
 Ouster OS1-16 points (10 Hz) ─┐
 Ouster IMU (100 Hz) ──────────┴─→ RESPLE (B-spline LIO) ─→ /localization/resple/odometry (10 Hz)
                                                                        │
                                                                        ▼
-                                                                  Sierra OdometryPlugin
+                                                                   odom EKF (odom1)
                                                                        │
                                                                        ▼
                                                        TF: odom → base_footprint
 ```
 
-Sierra owns the TF in this configuration. RESPLE publishes `odom` as a sensor
-source with `odom/publish_tf: false`. See
-`src/settings/params/localization/sierra.yaml` for the consumer side
-(`resple_odom` plugin, trust 0.85, heading reference).
+The odom EKF owns the `odom→base_footprint` TF. RESPLE publishes its pose as a
+sensor source with `odom/publish_tf: false`; see
+`src/settings/params/localization/odom_localization.yaml` for the consumer
+side (`odom1` input).
 
 Bug-chasing this package today therefore means either: (a) replaying recorded
-production bags from the Sierra era under sanitizer builds, or (b) flipping
-`run_resple=True` (and likely `run_sierra=True` + `run_dlio=False` /
-`run_odom_localization=False` to avoid the TF-owner conflict the master
-launch hard-fails on) to reproduce live. Pick (a) first — it's
-deterministic.
+production bags under sanitizer builds, or (b) flipping `run_resple=True`
+(and `run_dlio=False` to avoid the TF-owner conflict the master launch
+hard-fails on) to reproduce live. Pick (a) first — it's deterministic.
 
 ## Directory layout
 

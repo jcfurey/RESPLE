@@ -496,7 +496,7 @@ benchmark against a known-good bag.
 
 After each IEKF pass, the filter's health is invisible externally. Bad
 posterior covariance (collapse or NaN) propagates into published odometry
-and downstream (Sierra) without any warning.
+and downstream consumers without any warning.
 
 **Work:**
 - Compute posterior covariance trace and `λ_min` (via `SelfAdjointEigenSolver`).
@@ -531,8 +531,7 @@ decay (dynamic obstacles never drop out).
 **Status: can start after Phase 3 begins.**
 
 Today, diagnostics scatter across `diagnostic_updater` fields and ROS logger
-output. Consolidate into a single topic for easier monitoring and for Sierra
-to consume as a trust signal.
+output. Consolidate into a single topic for easier monitoring.
 
 ### Proposal
 New topic `/localization/resple/diagnostics` (custom msg or
@@ -553,8 +552,6 @@ New topic `/localization/resple/diagnostics` (custom msg or
 
 ### Consumers
 - Operator dashboards (Foxglove, PlotJuggler).
-- Sierra: may use covariance trace to adjust `resple_odom` plugin's trust
-  weight dynamically.
 
 ---
 
