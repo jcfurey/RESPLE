@@ -576,7 +576,7 @@ class SplineState
     int64_t dt_ns;
     double inv_dt;
     std::array<double, 4> pow_inv_dt;
-    int64_t num_knot;
+    int64_t num_knot = 0;  // 0 until init(); a default-constructed spline reports no knots
     int64_t start_i;
     int64_t start_t_ns;
     int last_start_idx_ = 0;

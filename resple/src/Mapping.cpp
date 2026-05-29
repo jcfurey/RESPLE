@@ -801,8 +801,11 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         sub_est.reset();
 
         // Clear init flag so a re-activation starts in the unitialized state.
-        // Worker is joined; safe to write without ordering concerns.
+        // Worker is joined; safe to write without ordering concerns. Also drop
+        // any restart staged but not yet consumed by the (now-joined) worker, so
+        // it can't fire with a stale bag time after the next activation.
         if_init_succeed.store(false, std::memory_order_relaxed);
+        start_pending_.store(false, std::memory_order_relaxed);
 
         // Drain in-flight callbacks before on_cleanup tears down related state.
         // Mirror of the RESPLE on_deactivate barrier; same rationale (rclcpp
@@ -897,6 +900,25 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         constexpr auto kRatePeriod = std::chrono::milliseconds(100);  // 10 Hz
         int64_t num_knot = 0;
         while (processing_active_ && rclcpp::ok()) {
+            // Option B: consume a (re)start staged by startCallBack and perform
+            // the spline_active_.init() here, on the worker thread, under
+            // m_spline. Doing it before the swap below means a re-init clears the
+            // window first; we also drop any knots the previous run had staged so
+            // they aren't swapped onto the fresh spline. Because this is the only
+            // place (besides the swap) that mutates spline_active_, the publish
+            // reads further down are genuinely single-threaded w.r.t. it.
+            if (start_pending_.exchange(false, std::memory_order_acquire)) {
+                {
+                    std::lock_guard<std::mutex> lock(m_spline);
+                    // dt=1 placeholder; overridden by getEstCallback's first window.
+                    spline_active_.init(1, 0, start_bag_time_pending_.load(std::memory_order_relaxed), 0);
+                    spline_pending_ready_.store(false, std::memory_order_relaxed);
+                }
+                // Only now is spline_active_ init'd: publish that to consumers.
+                // startCallBack set if_init_succeed=false, so until this store no
+                // reader can act on a default-constructed / stale spline.
+                if_init_succeed.store(true, std::memory_order_release);
+            }
             // Swap pending spline to active (lock-free check then mutex swap)
             if (spline_pending_ready_.load()) {
                 std::lock_guard<std::mutex> lock(m_spline);
@@ -917,12 +939,12 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 path_t_ns_ = 0;
                 opt_old_path.poses.clear();
             }
-            // Acquire-load on if_init_succeed so the startCallBack init()
-            // writes (release-store on the flag) are visible before we read
-            // spline_active_'s state. After this gate, all subsequent reads
-            // happen on the same worker thread as the swap above, so they
-            // are single-threaded with respect to spline_active_ mutation —
-            // no further m_spline coverage needed for steady state.
+            // Acquire-load on if_init_succeed pairs with startCallBack's
+            // release-store so the staged start_pending_ / start_bag_time_pending_
+            // are visible. Under Option B all spline_active_ mutation (init above
+            // + swap above) is on this worker thread, so these reads are now
+            // genuinely single-threaded with respect to spline_active_ — no
+            // m_spline coverage needed here.
             if (if_init_succeed.load(std::memory_order_acquire) && spline_active_.numKnots() > num_knot) {
                 ScopedMappingsLock maps_lock(vis_maps);
                 publishPath();
@@ -978,11 +1000,11 @@ private:
     // window before pubOdom()'s first odom→base_link lookup succeeds.
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_br_;
     std::atomic<bool> static_map_odom_sent_{false};
-    // Atomic so process() (worker thread) reads the flag without racing with
-    // startCallBack (executor thread) writing it. The store in startCallBack
-    // happens AFTER spline_active_.init(); using release ordering on the
-    // store + acquire on the loads ensures the worker observes the fully
-    // initialized spline_active_ when it sees the flag true.
+    // Set true ONLY by the worker (process()), immediately after it runs
+    // spline_active_.init() on consuming start_pending_. startCallBack sets it
+    // FALSE to pause consumers across a (re)start. So any thread observing
+    // if_init_succeed==true is guaranteed an init'd spline_active_ — this is
+    // what makes Option B's deferred init() safe (no default-constructed read).
     std::atomic<bool> if_init_succeed{false};
     int64_t path_t_ns_ = 0;
     // Set by startCallBack (executor thread) on every (re)start, consumed once
@@ -992,6 +1014,14 @@ private:
     // the previous run, so the publish gate (numKnots() > num_knot) and
     // publishPath's while-loop never advance and path/odom silently freeze.
     std::atomic<bool> path_reset_{false};
+    // Option B (Mapping respawn race fix): startCallBack stages the (re)start
+    // here instead of calling spline_active_.init() itself. The worker performs
+    // init() under m_spline when it consumes start_pending_, so spline_active_
+    // is NEVER mutated from the executor thread. This removes the data race
+    // between startCallBack's init() and process()'s publish reads, which hold
+    // ScopedMappingsLock (the per-map mutexes) rather than m_spline.
+    std::atomic<bool> start_pending_{false};
+    std::atomic<int64_t> start_bag_time_pending_{0};
     std::mutex m_spline;
 
     void displayControlPoints()
@@ -1198,22 +1228,28 @@ private:
 
     void startCallBack(const std_msgs::msg::Int64::SharedPtr start_time_msg)
     {
-        // Init under m_spline so a concurrent process() iteration that's
-        // mid-swap (lock_guard<mutex>(m_spline)) can't observe a partially
-        // constructed spline_active_. The release-store on if_init_succeed
-        // pairs with process()'s acquire-load to guarantee the init writes
-        // are visible.
+        // Option B: stage the (re)start for the worker thread rather than
+        // calling spline_active_.init() here. This keeps ALL spline_active_
+        // mutation on the worker, eliminating the data race with process()'s
+        // publish reads (which hold ScopedMappingsLock, not m_spline). The
+        // worker performs init() under m_spline when it consumes start_pending_.
+        // The release-stores below pair with the worker's acquire-loads so the
+        // staged bag time is visible before the worker acts on the flags.
         int64_t bag_start_time = start_time_msg->data;
-        {
-            std::lock_guard<std::mutex> lock(m_spline);
-            spline_active_.init(1, 0, bag_start_time, 0);  // dt=1 placeholder; overridden by getEstCallback
-        }
+        start_bag_time_pending_.store(bag_start_time, std::memory_order_relaxed);
+        // Pause consumers until the worker has actually re-init'd spline_active_;
+        // the worker flips if_init_succeed back to true right after init(). This
+        // closes the cold-start window where a reader could observe
+        // if_init_succeed==true before the deferred init() ran.
+        if_init_succeed.store(false, std::memory_order_release);
         // Tell the worker to drop the previous run's path/knot trackers before
         // it publishes against the freshly re-init'd spline window.
         path_reset_.store(true, std::memory_order_release);
-        if_init_succeed.store(true, std::memory_order_release);
+        // Stage the (re)start LAST: the worker's acquire-exchange on
+        // start_pending_ then sees the bag time + both flags above.
+        start_pending_.store(true, std::memory_order_release);
         RCLCPP_INFO(this->get_logger(),
-            "[Mapping] startCallBack: if_init_succeed=true (bag_start_time=%ld)",
+            "[Mapping] startCallBack: staged restart (bag_start_time=%ld)",
             bag_start_time);
 
         // Latch an identity map→odom so the REP-105 chain is never broken
