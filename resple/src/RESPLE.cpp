@@ -46,7 +46,6 @@ public:
         pub_cur_scan = nh->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", 2);
         br = std::make_shared<tf2_ros::TransformBroadcaster>(nh);        
         auto lidar_names = nh->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
-        assert(nh->get_parameter({"lidars"}, lidar_names));
         if (lidar_names.empty()) {
             LidarConfig lidar(nh, "");
             lidars.emplace(lidar.type, lidar);
@@ -701,7 +700,9 @@ private:
 
     bool collectMeasurements()
     {
-        rclcpp::Rate rate(20);
+        // static so the 20 Hz pacing is preserved across calls instead of
+        // re-arming a fresh timer (and always sleeping a full period) each call.
+        static rclcpp::Rate rate(20);
         int64_t pt_min_time = std::numeric_limits<int64_t>::max();
         int64_t pt_max_time = std::numeric_limits<int64_t>::max();            
         for (const auto& [lidar_name, lidar_data] : lidars_data) {

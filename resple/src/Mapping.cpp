@@ -601,7 +601,6 @@ int main(int argc, char** argv) {
     auto nh = rclcpp::Node::make_shared("Mapping");
     std::vector<LidarConfig> lidars;
     auto lidar_names = nh->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
-    assert(nh->get_parameter({"lidars"}, lidar_names));
     if (lidar_names.empty()) {
         lidars.emplace_back(nh, "");
     } else {

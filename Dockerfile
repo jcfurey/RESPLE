@@ -13,23 +13,19 @@ RUN apt update
 # Install git and SSH client
 RUN apt install -y git openssh-client
 
-# Add public github and bitbucket keys
+# Add public github key (used when cloning dependencies over SSH)
 RUN mkdir -p -m 0600 $HOME/.ssh
 RUN ssh-keyscan github.com >> $HOME/.ssh/known_hosts
-RUN ssh-keyscan bitbucket.org >> $HOME/.ssh/known_hosts
 
-# Install system dependencies
+# Install system dependencies, mcap support, and gdb in a single layer
 RUN apt update && apt install -y \
     libeigen3-dev \
     libomp-dev \
     libpcl-dev \
-    ros-humble-pcl*
-
-# Install mcap support
-RUN apt install -y ros-humble-rosbag2-storage-mcap
-
-# Install gdb support
-RUN apt install -y gdb gdbserver
+    ros-humble-pcl* \
+    ros-humble-rosbag2-storage-mcap \
+    gdb gdbserver \
+    && rm -rf /var/lib/apt/lists/*
 
 # Add colcon bash completion
 RUN echo "source /usr/share/colcon_argcomplete/hook/colcon-argcomplete.bash" >> $HOME/.bashrc
