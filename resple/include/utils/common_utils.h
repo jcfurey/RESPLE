@@ -303,6 +303,12 @@ struct LidarConfig {
     Eigen::Quaterniond q_bl;
     Eigen::Vector3d t_bl;
     double w_pt;
+    // Generic "PointCloud2" ingestion options (utils/point_cloud_adapter.h).
+    // All optional: empty/auto means "use the built-in candidate names and
+    // unit conventions" (Ouster 't', Velodyne 'time', Hesai 'timestamp', ...).
+    std::string time_field;       // override per-point time field name
+    std::string time_unit = "auto"; // auto | s | ms | us | ns
+    std::string intensity_field;  // override reflectivity field name
     // Sensor origin in body (base_link) frame — populated from TF at runtime,
     // NOT from YAML.  Used to compute true sensor-frame range for outlier gating.
     Eigen::Vector3d sensor_origin_body = Eigen::Vector3d::Zero();
@@ -320,6 +326,9 @@ struct LidarConfig {
         q_bl = q_lb.inverse();
         t_bl = q_lb.inverse() * (- t_lb);
         w_pt = CommonUtils::readParam<double>(node_params, prefix + "w_pt", 0.0);
+        time_field = CommonUtils::readParam<std::string>(node_params, prefix + "time_field", "");
+        time_unit = CommonUtils::readParam<std::string>(node_params, prefix + "time_unit", "auto");
+        intensity_field = CommonUtils::readParam<std::string>(node_params, prefix + "intensity_field", "");
     }
 };
 

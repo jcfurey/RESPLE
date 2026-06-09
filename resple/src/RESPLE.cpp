@@ -70,6 +70,7 @@
 #include "estimate_msgs/msg/estimate.hpp"
 #include "estimate_msgs/action/save_map.hpp"
 #include "Estimator.h"
+#include "utils/point_cloud_ingest.h"
 #ifdef RESPLE_USE_CUDA
 #include "gpu/cuda_knn.h"
 #endif
@@ -264,6 +265,19 @@ public:
             } else if (!lidar.type.compare("Mid360Boxi")) {
                 sub_livox_mid360_boxi = this->create_subscription<sensor_msgs::msg::PointCloud2>(
                         lidar.topic, lidar_qos, std::bind(&RESPLE::livoxMid360BoxiCallback, this, std::placeholders::_1), sensor_sub_opt);
+            } else if (!lidar.type.compare("PointCloud2")) {
+                // Generic path: runtime PointField introspection, no per-sensor
+                // point struct required. Field/unit overrides come from the
+                // per-lidar YAML (time_field / time_unit / intensity_field).
+                generic_adapter_cfg_ = resple::makeAdapterConfig(
+                    lidar.time_field, lidar.time_unit, lidar.intensity_field);
+                sub_generic = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                        lidar.topic, lidar_qos, std::bind(&RESPLE::genericLidarCallback, this, std::placeholders::_1), sensor_sub_opt);
+            } else {
+                RCLCPP_WARN(this->get_logger(),
+                    "[RESPLE] unknown lidar type '%s' — no subscription created. "
+                    "Supported: Ouster, Mid70Avia, HAP360, AviaResple, Hesai, "
+                    "Mid360Boxi, PointCloud2 (generic).", lidar.type.c_str());
             }
         }
         
@@ -324,6 +338,7 @@ public:
         sub_livox_avia.reset();
         sub_hesai.reset();
         sub_livox_mid360_boxi.reset();
+        sub_generic.reset();
 
         // Drain any in-flight callbacks before on_cleanup tears down lidars_data
         // / m_buff state. Subscription::reset() drops the application's strong
@@ -953,6 +968,13 @@ private:
     rclcpp::Subscription<livox_interfaces::msg::CustomMsg>::SharedPtr sub_livox_avia;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_hesai;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_livox_mid360_boxi;
+    // Generic "PointCloud2" lidar type: field-introspection ingestion that
+    // accepts any PointCloud2 layout (see utils/point_cloud_adapter.h).
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_generic;
+    // Built once at subscription time from the LidarConfig overrides; the
+    // layout itself is still resolved per message (cheap string compares)
+    // because a relaunched driver may legitimately change the field set.
+    resple::pc2::AdapterConfig generic_adapter_cfg_;
     rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan;
     rclcpp_lifecycle::LifecyclePublisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
@@ -1659,6 +1681,84 @@ private:
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                 "[RESPLE] ousterLidarCallback exception: %s", e.what());
+        }
+    }
+
+    // Generic PointCloud2 ingestion: resolves x/y/z + time/intensity fields by
+    // name at runtime (utils/point_cloud_adapter.h), so any sensor that
+    // publishes sensor_msgs/PointCloud2 works without a hand-written point
+    // struct. Per-point time is normalized to a ms offset from scan start
+    // (relative or absolute-epoch source fields both supported); clouds with
+    // no time field still work, just without intra-scan deskew.
+    void genericLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg_in)
+    {
+        try {
+        noteFirstLidar("PointCloud2", msg_in->header.frame_id,
+                       msg_in->width * msg_in->height);
+        std::string name = "PointCloud2";
+        if (lidars.find(name) == lidars.end()) {
+            for (const auto& [lidar_name, lidar_cfg] : lidars) {
+                if (lidar_cfg.type == "PointCloud2") {
+                    name = lidar_name;
+                    break;
+                }
+            }
+        }
+        const LidarConfig& lidar = lidars.at(name);
+
+        if(!updateLidarTransform(msg_in->header.frame_id)) return;
+
+        int64_t stamp_ns = rclcpp::Time(msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;  // skip early sim-time messages
+        int64_t time_begin = stamp_ns - time_offset;
+
+        // Field-introspecting conversion: applies blind-radius + decimation and
+        // writes the deskew ms-offset into .intensity / reflectivity into
+        // .curvature (the RESPLE conventions).
+        pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
+        if (!resple::ingestPointCloud2(*msg_in, lidar.blind, point_filter_num,
+                                       generic_adapter_cfg_, *pc_last)) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] PointCloud2 on '%s' has no usable x/y/z layout — dropped",
+                lidar.topic.c_str());
+            return;
+        }
+        if (pc_last->points.empty()) return;
+
+        // Monotonic-time gate (same contract as the per-sensor loaders): drop
+        // points that precede the newest point already buffered, and track the
+        // scan's max offset to advance last_t_ns.
+        LidarData& lidar_buffs = lidars_data.at(name);
+        int64_t last_t_ns = lidar_buffs.last_t_ns.load();
+        int64_t max_ofs_ns = 0;
+        size_t write_idx = 0;
+        for (size_t i = 0; i < pc_last->points.size(); ++i) {
+            const pcl::PointXYZINormal& pt = pc_last->points[i];
+            // Non-finite xyz would poison the ikd-Tree / IEKF downstream.
+            if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
+                continue;
+            }
+            int64_t ofs = CommonUtils::ms2ns(pt.intensity);
+            if (ofs + time_begin > last_t_ns) {
+                max_ofs_ns = max_ofs_ns > ofs ? max_ofs_ns : ofs;
+                pc_last->points[write_idx++] = pt;
+            }
+        }
+        pc_last->points.resize(write_idx);
+        if (pc_last->points.empty()) return;
+
+        // Transform point cloud to body frame
+        pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_);
+
+        {
+            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
+            lidar_buffs.pc_buff.push_back(pc_last->points);
+            lidar_buffs.t_buff.push_back(time_begin);
+        }
+        lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] genericLidarCallback exception: %s", e.what());
         }
     }
 

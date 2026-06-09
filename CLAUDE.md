@@ -323,6 +323,16 @@ the source.
   variants) — our runtime uses `settings_erdc` + our YAML. Upstream files are
   kept for reference and occasional benchmarking.
 - **Do modify the workspace config** at `src/settings/params/localization/resple.yaml`.
+- **Before adding a new per-sensor callback, check whether the generic
+  `PointCloud2` lidar type already covers the sensor.** `lidar_type:
+  PointCloud2` resolves x/y/z + time/intensity fields by name at runtime
+  (`utils/point_cloud_adapter.h`, unit-tested) and handles relative or
+  absolute-epoch per-point time in any datatype/endianness. Per-lidar YAML
+  overrides: `time_field`, `time_unit` (auto|s|ms|us|ns), `intensity_field`.
+  Template config: `config/config_pointcloud2.yaml`. Both RESPLE
+  (`genericLidarCallback`) and Mapping (`GenericPC2Buff`) support it. A
+  hand-written sensor struct is only needed for non-PointCloud2 transports
+  (e.g. Livox CustomMsg).
 - When adding a new sensor type, wire the callback through `sensor_cb_group`
   (not the default group) and push to a per-sensor `LidarData` struct with its
   own `mtx_pc` — do not add heavy work inline in the callback. **Wrap the

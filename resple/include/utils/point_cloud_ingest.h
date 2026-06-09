@@ -30,6 +30,34 @@
 
 namespace resple {
 
+// Build an AdapterConfig from the per-lidar YAML options (LidarConfig's
+// time_field / time_unit / intensity_field strings). Empty overrides keep the
+// built-in candidate lists; explicit names are tried FIRST but the defaults
+// remain as fallback, so a slightly-wrong override degrades gracefully.
+inline pc2::AdapterConfig makeAdapterConfig(const std::string& time_field,
+                                            const std::string& time_unit,
+                                            const std::string& intensity_field) {
+  pc2::AdapterConfig cfg;
+  if (!time_field.empty()) {
+    cfg.names.time.insert(cfg.names.time.begin(), time_field);
+  }
+  if (!intensity_field.empty()) {
+    cfg.names.intensity.insert(cfg.names.intensity.begin(), intensity_field);
+  }
+  if (time_unit == "s") {
+    cfg.time_unit = pc2::TimeUnit::Seconds;
+  } else if (time_unit == "ms") {
+    cfg.time_unit = pc2::TimeUnit::Milliseconds;
+  } else if (time_unit == "us") {
+    cfg.time_unit = pc2::TimeUnit::Microseconds;
+  } else if (time_unit == "ns") {
+    cfg.time_unit = pc2::TimeUnit::Nanoseconds;
+  } else {
+    cfg.time_unit = pc2::TimeUnit::Auto;  // "auto" or anything unrecognized
+  }
+  return cfg;
+}
+
 // Build the adapter's field-descriptor list straight from a PointCloud2.
 inline std::vector<pc2::FieldInfo> toFieldInfo(
     const sensor_msgs::msg::PointCloud2& msg) {
