@@ -279,4 +279,26 @@ install(TARGETS RESPLE
 install(TARGETS Mapping
   DESTINATION lib/${PROJECT_NAME})
 
+if(BUILD_TESTING)
+  # Dependency-light estimator-core unit tests (Eigen + GoogleTest only — no
+  # ROS 2 / PCL). The same sources also build standalone without colcon via
+  # resple/test/CMakeLists.txt. Each entry is guarded with EXISTS so the commit
+  # series stays bisectable while tests are added incrementally.
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(Eigen3 QUIET)
+  set(RESPLE_UNIT_TESTS
+    test/test_geometry_core.cpp
+    test/test_point_cloud_adapter.cpp)
+  foreach(_test_src ${RESPLE_UNIT_TESTS})
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${_test_src})
+      get_filename_component(_test_name ${_test_src} NAME_WE)
+      ament_add_gtest(${_test_name} ${_test_src})
+      target_include_directories(${_test_name} PRIVATE include)
+      if(TARGET Eigen3::Eigen)
+        target_link_libraries(${_test_name} Eigen3::Eigen)
+      endif()
+    endif()
+  endforeach()
+endif()
+
 ament_auto_package()

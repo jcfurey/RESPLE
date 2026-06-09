@@ -11,6 +11,7 @@
 #include <omp.h>
 
 #include "utils/eigen_utils.hpp"
+#include "utils/geometry_core.h"
 
 // NOTE: NUM_OF_THREAD and NUM_MATCH_POINTS are now ROS parameters in RESPLE node
 // They were previously global variables but are now configurable per-node instance
@@ -276,37 +277,19 @@ public:
     template<typename T>
     static bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const Eigen::aligned_vector<pcl::PointXYZINormal> &point, const T &threshold)
     {
-        const int num_pts = static_cast<int>(point.size());
-        if (num_pts < 3) { return false; }
-        // Solve A x = b where A rows = [x_j, y_j, z_j], b = -1.
-        // Use fixed-size 3x3 normal-equation form (A^T A) x = A^T b with
-        // colPivHouseholderQr which is rank-revealing — handles the
-        // degenerate case (points through origin / collinear) gracefully.
-        Eigen::Matrix<T, 3, 3> ATA = Eigen::Matrix<T, 3, 3>::Zero();
-        Eigen::Matrix<T, 3, 1> ATb = Eigen::Matrix<T, 3, 1>::Zero();
-        for (int j = 0; j < num_pts; j++)
-        {
-            Eigen::Matrix<T, 3, 1> row(point[j].x, point[j].y, point[j].z);
-            ATA.noalias() += row * row.transpose();
-            ATb.noalias() -= row;
-        }
-        Eigen::Matrix<T, 3, 1> normvec = ATA.colPivHouseholderQr().solve(ATb);
-        if (!normvec.allFinite()) { return false; }
-        T n = normvec.norm();
-        if (n < static_cast<T>(1e-12)) { return false; }
-        T n_inv = static_cast<T>(1.0) / n;
-        pca_result(0) = normvec(0) * n_inv;
-        pca_result(1) = normvec(1) * n_inv;
-        pca_result(2) = normvec(2) * n_inv;
-        pca_result(3) = n_inv;
-        for (int j = 0; j < num_pts; j++)
-        {
-            if (fabs(pca_result(0) * point[j].x + pca_result(1) * point[j].y + pca_result(2) * point[j].z + pca_result(3)) > threshold)
-            {
-                return false;
-            }
-        }
-        return true;
+        // Delegate to the Eigen-only, unit-tested core (resple::geom::fitPlane,
+        // see utils/geometry_core.h + test/test_geometry_core.cpp). The
+        // accessor reads the PCL points in place — no intermediate copy — and
+        // min_cond_ratio is left at its 0 default so behaviour is bit-for-bit
+        // identical to the previous inline normal-equation fit.
+        return resple::geom::fitPlane<T>(
+            static_cast<int>(point.size()),
+            [&point](int j, T& x, T& y, T& z) {
+                x = static_cast<T>(point[j].x);
+                y = static_cast<T>(point[j].y);
+                z = static_cast<T>(point[j].z);
+            },
+            threshold, pca_result);
     }
 };
 
