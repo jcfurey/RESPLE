@@ -235,9 +235,11 @@ child nodes' flag fields. The fix:
 
 This makes multi-threaded k-NN safe by contract; the old `num_threads=1`
 mitigation is retired. Verified with `resple/test/test_ikdtree_concurrency.cpp`
-under ThreadSanitizer (reader-vs-reader `Push_Down` races 16→0). Two
-pre-existing, independent rebuild-path hazards remain (hazard 34 above), tracked
-as Phase 2.5 and listed in `resple/test/tsan_suppressions.txt`.
+under ThreadSanitizer (reader-vs-reader `Push_Down` races 16→0). The
+`search_rw_mutex_`↔`working_flag_mutex` rebuild deadlock (hazard 34) was also
+fixed (Phase 2.5 #2); one pre-existing upstream rebuild-vs-mutator data race
+remains (hazard 35, Phase 2.5 #1), deferred and listed in
+`resple/test/tsan_suppressions.txt`.
 
 ## Build configuration
 
@@ -352,7 +354,8 @@ reference (status as of latest pass):
 | 31 | `processData` worker loop body unwrapped → throw anywhere kills worker thread silently → "alive but doing nothing" | **fixed** (try/catch around iteration body, log + 50ms sleep + continue) | post-1.5 |
 | 32 | `mapIncremental` passed NaN/Inf points straight to ikd-Tree `Add_by_point`, where `calc_dist` returns NaN, `<` comparisons all false, recursion takes wrong branch, tree state corrupts silently | **fixed** (skip non-finite points; surface counter via WARN_THROTTLE) | post-1.5 |
 | 33 | `ikd-Tree::Push_Down` writes to children's flag fields holding only the parent's per-node lock → races on overlapping subtree paths (dominant caller: findCorresp's OpenMP parallel `Nearest_Search`) | **fixed** (Phase 2.4: `Push_Down` takes the parent's *and* the child's `push_down_mutex_lock`; mutator flag-SET sites take the node's lock; the racy node fields are `std::atomic`; `num_threads=1` mitigation retired). TSan-verified reader-vs-reader races 16→0 via `test_ikdtree_concurrency` | 2.4 |
-| 34 | ikd-Tree background rebuild thread reads `KD_TREE_NODE::father_ptr` while a concurrent mutator's `Update` writes it; and a `working_flag_mutex`↔`search_rw_mutex_` lock-order inversion via the inline `Rebuild` path | **documented, deferred to Phase 2.5** (pre-existing, inherited from HKU-MARS; independent of Phase 2.4 — surfaced by `test_ikdtree_concurrency` under TSan and listed in `resple/test/tsan_suppressions.txt`) | 2.4 |
+| 34 | `working_flag_mutex`↔`search_rw_mutex_` lock-order inversion (real deadlock): Phase 1.5 K1 wrapped the *mutating* fast-path calls in `Add_Points`/`Delete_Points`/etc. in `search_rw_mutex_` shared, but those take `working_flag_mutex` at a deeper rebuild boundary — opposite order to the rebuild thread (`working_flag`→`search_rw` unique). TSan-confirmed; observed to hang | **fixed** (Phase 2.5 #2: drop the shared lock from the 5 mutating fast paths — mutators self-coordinate via `working_flag_mutex`, the upstream mechanism; K1's lock kept on the *search* fns + the genuine `Search_by_range` read). Verified deadlock-free under TSan | 2.5 |
+| 35 | ikd-Tree background rebuild thread vs. concurrent mutator data race on `KD_TREE_NODE` fields (`father_ptr` at `multi_thread_rebuild` ~255 vs `Update` ~1564; ancestor Update-walk during swap) | **documented, deferred to Phase 2.5 #1** (pre-existing upstream HKU-MARS baseline — vanilla ikd-Tree races identically; benign in testing, `err=0`; only the aggressive focused stress triggers it, suppressed in `resple/test/tsan_suppressions.txt`) | 2.5 |
 
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7

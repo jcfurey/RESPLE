@@ -4,31 +4,26 @@
 # Usage:
 #   TSAN_OPTIONS="suppressions=$PWD/resple/test/tsan_suppressions.txt" <test-binary>
 #
-# These suppress TWO PRE-EXISTING, OUT-OF-SCOPE hazards that the stress test
-# surfaces but Phase 2.4 (the Push_Down child-write race) does not touch. Both
-# are present in the code with AND without the Phase 2.4 change — verified by
-# running the same test against the pre-2.4 tree — so suppressing them isolates
-# the Phase 2.4 regression signal (reader-vs-reader races on the node
-# deletion-propagation fields, which appear as size-1/size-4 races inside
-# KD_TREE::Search / Push_Down and are NOT suppressed here).
+# The production-faithful committed test is TSan-clean WITHOUT any suppressions.
+# This file exists for the more AGGRESSIVE focused stress (the before/after
+# harness with large bursty deletes hammering rebuilds), which still surfaces
+# ONE pre-existing, deferred hazard:
 #
-# Do NOT add Search/Push_Down to this file: those are exactly what the test
-# guards. If a future change reintroduces the Push_Down race it MUST fail.
-#
-# --- (1) Background rebuild thread vs. a concurrent mutator's Update, racing
-#         on KD_TREE_NODE::father_ptr (ikd_Tree.cpp multi_thread_rebuild():~255
-#         reads it; Update():~1564 writes it). Inherited HKU-MARS rebuild-vs-
-#         mutator hazard; tracked as a HARDENING follow-up (Phase 2.5).
+# --- Phase 2.5 #1: background rebuild thread vs. a concurrent mutator on
+#     KD_TREE_NODE fields (e.g. father_ptr: multi_thread_rebuild():~255 reads it
+#     while Update():~1564 writes it; plus the ancestor Update-walk during the
+#     subtree swap). Inherited from upstream HKU-MARS ikd-Tree — vanilla
+#     ikd-Tree has no search_rw_mutex_ at all and races here the same way.
+#     Functionally benign in testing (search results stay consistent, err=0),
+#     but a real data race; tracked as a HARDENING Phase 2.5 follow-up.
 race:KD_TREE<pcl::PointXYZINormal>::multi_thread_rebuild
 race:KD_TREE<pcl::PointXYZINormal>::multi_thread_ptr
 #
-# --- (2) Lock-order inversion between working_flag_mutex and search_rw_mutex_
-#         via the inline Rebuild() path (a mutator holds search_rw_mutex_ unique
-#         and takes working_flag_mutex, while the rebuild thread holds
-#         working_flag_mutex and takes search_rw_mutex_ unique). Pre-existing
-#         potential deadlock, independent of Phase 2.4's per-node push_down
-#         mutexes (which appear in no lock cycle); tracked as Phase 2.5.
-deadlock:KD_TREE<pcl::PointXYZINormal>::multi_thread_rebuild
-deadlock:KD_TREE<pcl::PointXYZINormal>::Rebuild
-deadlock:KD_TREE<pcl::PointXYZINormal>::Add_by_point
-deadlock:KD_TREE<pcl::PointXYZINormal>::Delete_by_range
+# NOTE: the Phase 2.5 #2 lock-order inversion (working_flag_mutex <->
+# search_rw_mutex_) was FIXED — see HARDENING.md Phase 2.5 and the Add_Points
+# lock-discipline comment. Its `deadlock:` suppressions were REMOVED so that any
+# regression re-introducing the inversion fails the gate.
+#
+# Do NOT add Search / Push_Down here: those are exactly what the test guards
+# (the Phase 2.4 reader-vs-reader race). If a future change reintroduces the
+# Push_Down race it MUST fail.

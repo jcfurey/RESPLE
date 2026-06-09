@@ -18,7 +18,7 @@ Companion docs:
 | 1   | Safety fixes (initial) | **Complete** | `512da1d` |
 | 1.5 | Defensive crash-hardening (3-pass) | **Complete** | `14e9be8` |
 | 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete (this commit)** — see "Phase 1.6" below | this commit |
-| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 Push_Down race IMPLEMENTED + TSan-verified (this commit); 2.3 pending data; 2.5 deferred** — see below | this commit |
+| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 Push_Down race + 2.5 #2 rebuild deadlock FIXED + TSan-verified; 2.3 pending data; 2.5 #1 rebuild-vs-mutator race deferred** — see below | this commit |
 | 3   | Spline / mapping accuracy | Pending Phase 0 data | — |
 | 4   | Diagnostics publisher | Can start after Phase 3 begins | — |
 | 5   | Regression tests | Last | — |
@@ -394,8 +394,9 @@ standalone justification.
 ## Phase 2 — Concurrency hardening
 
 **Status: 2.1 fixed (Phase 1.5 K1); 2.2 partially fixed (Phase 1.5 Fix C);
-2.3 still pending Phase 0 data; 2.4 (Push_Down race) IMPLEMENTED + TSan-verified
-(this commit); 2.5 (newly-found rebuild-path hazards) documented, deferred.**
+2.3 still pending Phase 0 data; 2.4 (Push_Down race) IMPLEMENTED + TSan-verified;
+2.5 #2 (rebuild lock-order deadlock) FIXED + TSan-verified; 2.5 #1
+(rebuild-vs-mutator data race) deferred.**
 
 Three independent items. 2.1 was preempted by Phase 1.5 (defensive shared
 lock); 2.2's immediate race was closed by Phase 1.5 Fix C, full state-enum
@@ -576,34 +577,74 @@ node visited only when `need_push_down_to_*` is set (the pre-check skips the
 lock otherwise) — deletions are bursty (FOV segment + downsample), so the
 common search path stays lock-free.
 
-### 2.5 Pre-existing rebuild-path hazards surfaced by the 2.4 stress test — **DOCUMENTED, DEFERRED**
+### 2.5 Rebuild-path hazards surfaced by the 2.4 stress test — **#1 DEFERRED, #2 FIXED**
 
-**Status: found while TSan-verifying 2.4; present in the tree with AND without
-the 2.4 change (confirmed by running `test_ikdtree_concurrency` against the
-pre-2.4 code), so they are independent of 2.4 and out of its scope. Both are
-inherited from upstream HKU-MARS. Suppressed in `resple/test/tsan_suppressions.txt`
-so the 2.4 regression signal stays isolated.**
+**Status: found while TSan-verifying 2.4; both pre-existing (present with AND
+without the 2.4 change) and inherited from upstream HKU-MARS. #1 (rebuild-vs-
+mutator data race) remains deferred and suppressed in
+`resple/test/tsan_suppressions.txt`. #2 (the lock-order inversion / deadlock)
+is FIXED this commit.**
 
-1. **Rebuild-thread vs. mutator race on `father_ptr`.** `multi_thread_rebuild`
-   reads `(*Rebuild_Ptr)->father_ptr` (`ikd_Tree.cpp` ~255) while a concurrent
-   mutator's `Update` writes `left/right_son_ptr->father_ptr` (~1564). TSan
-   flags it as a data race. Likely benign in practice (pointer-sized aligned
-   write, and the swap is gated elsewhere) but not provably safe.
-2. **`working_flag_mutex` ↔ `search_rw_mutex_` lock-order inversion (potential
-   deadlock).** The inline `Rebuild` path (taken from `Add_by_*`/`Delete_by_*`
-   when `Criterion_Check` trips for a small subtree) holds `search_rw_mutex_`
-   unique and takes `working_flag_mutex`, while the background rebuild thread
-   holds `working_flag_mutex` and takes `search_rw_mutex_` unique
-   (`multi_thread_rebuild` ~258). TSan reports the cycle; under heavy
-   concurrent mutation+search it can actually hang (observed at high stress —
-   hence the gtest `TIMEOUT`). This is the more serious of the two.
+1. **(DEFERRED) Rebuild-thread vs. mutator data race on `KD_TREE_NODE` fields.**
+   `multi_thread_rebuild` reads `(*Rebuild_Ptr)->father_ptr` (`ikd_Tree.cpp`
+   ~255) while a concurrent mutator's `Update` writes `father_ptr`/aggregate
+   fields (~1564), and the rebuild swap's ancestor `Update`-walk touches nodes
+   the mutator traverses. Vanilla ikd-Tree has no `search_rw_mutex_` and races
+   here identically, so this is the upstream baseline. Functionally benign in
+   testing (search results stay consistent, `err=0`) but a real race; the
+   production-faithful `test_ikdtree_concurrency` does not trigger it, only the
+   aggressive focused stress does. Tracked as a follow-up.
 
-**Why deferred, not fixed here:** both live in the rebuild/`Update` machinery,
-not the `Push_Down` propagation that 2.4 targets; fixing them safely needs its
-own design pass and TSan gate. Hazard #2 in particular warrants a dedicated
-look (consistent lock ordering between the inline-rebuild swap and the
-background rebuild thread, or routing all rebuilds through the one thread).
-Tracked as a follow-up phase; do not fold into 2.4.
+2. **(FIXED) `search_rw_mutex_` ↔ `working_flag_mutex` lock-order inversion
+   (real deadlock).**
+
+   **Root cause (corrected from the first diagnosis):** the Phase 1.5 K1
+   extension wrapped the *mutating* fast-path calls in `Add_Points` /
+   `Add_Point_Boxes` / `Delete_Points` / `Delete_Point_Boxes` /
+   `Delete_by_range`-downsample in `search_rw_mutex_` (shared). Those calls take
+   `working_flag_mutex` internally when the recursion reaches a *deeper*
+   `*Rebuild_Ptr` boundary. The fast-path guard only checked the *top-level*
+   `*Rebuild_Ptr != Root_Node`, so a deeper rebuild target still led to
+   `working_flag_mutex` being taken **while holding `search_rw_mutex_` shared**.
+   The background rebuild thread holds `working_flag_mutex` and takes
+   `search_rw_mutex_` **unique** (`multi_thread_rebuild` ~258/292) — the
+   opposite order → a real cycle. TSan-confirmed; observed to actually HANG the
+   committed test under load (the original reason that test carries a `TIMEOUT`).
+   Reachable in production: `mapIncremental`/`lasermapFovSegment` mutate while
+   the kd-tree's background rebuild thread runs.
+
+   **Fix:** remove the `search_rw_mutex_` shared lock from the five *mutating*
+   fast-path blocks. This reverts the mutators to the upstream ikd-Tree
+   coordination, where a mutator self-synchronises against the rebuild thread
+   via `working_flag_mutex` at the rebuild boundary (which also protects against
+   the swap + node free) — so the extra shared lock was never needed there. K1's
+   shared lock is KEPT where it is correct and load-bearing: the *search*
+   functions (`Nearest_Search`/`Box_Search`/`Radius_Search`) and the one genuine
+   lock-free *read* in `Add_Points` (`Search_by_range(Root_Node, …)`), which have
+   no `working_flag` coordination of their own. See the rewritten lock-discipline
+   comment at the top of `Add_Points`.
+
+   **Verification:** `test_ikdtree_concurrency` under TSan — before: hangs /
+   reports the inversion; after: completes, 0 lock-order-inversions, 0 data
+   races (production-faithful discipline), test passes. The aggressive focused
+   stress still shows the #1 rebuild-vs-mutator races (suppressed), but no
+   inversion. The `deadlock:` suppressions were removed so a regression fails.
+
+   **Trade-off noted honestly:** the K1 shared lock had been incidentally
+   *masking* the #1 rebuild-vs-mutator races (by excluding the mutator from the
+   rebuild thread's `search_rw`-unique sections). Removing it re-exposes #1 under
+   aggressive stress. We accept this: a deadlock (unrecoverable hang) is a
+   strictly worse failure mode than the upstream-baseline #1 race (benign in
+   testing), and #1 was already the deferred upstream behavior. Fully suppressing
+   #1 as well would need the larger redesign below.
+
+**Remaining work on #1 (deferred):** a complete fix needs consistent lock
+ordering between the mutators and the rebuild thread — e.g. a recursive
+`working_flag_mutex` so a mutator can hold it across its whole op (excluding the
+rebuild thread's critical sections) without self-deadlocking on the internal
+boundary acquisition; or routing all rebuilds through the single background
+thread; or making the few raced `KD_TREE_NODE` pointer/aggregate fields atomic.
+Each needs bag-replay validation (no bag available yet) before landing.
 
 ---
 
