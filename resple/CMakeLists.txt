@@ -279,4 +279,58 @@ install(TARGETS RESPLE
 install(TARGETS Mapping
   DESTINATION lib/${PROJECT_NAME})
 
+if(BUILD_TESTING)
+  # Dependency-light estimator-core unit tests (Eigen + GoogleTest only — no
+  # ROS 2 / PCL). The same sources also build standalone without colcon via
+  # resple/test/CMakeLists.txt. Each entry is guarded with EXISTS so the commit
+  # series stays bisectable while tests are added incrementally.
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(Eigen3 QUIET)
+  set(RESPLE_UNIT_TESTS
+    test/test_geometry_core.cpp
+    test/test_point_cloud_adapter.cpp
+    test/test_filter_health.cpp)
+  foreach(_test_src ${RESPLE_UNIT_TESTS})
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${_test_src})
+      get_filename_component(_test_name ${_test_src} NAME_WE)
+      ament_add_gtest(${_test_name} ${_test_src})
+      target_include_directories(${_test_name} PRIVATE include)
+      if(TARGET Eigen3::Eigen)
+        target_link_libraries(${_test_name} Eigen3::Eigen)
+      endif()
+    endif()
+  endforeach()
+
+  # Full PCL + ROS 2 pipeline tests. These link the heavy stack and are NOT run
+  # automatically (neither here nor in CI) — they are for a developer with a
+  # full workspace. Enable explicitly:
+  #   colcon build --packages-up-to resple \
+  #       --cmake-args -DRESPLE_BUILD_INTEGRATION_TESTS=ON
+  option(RESPLE_BUILD_INTEGRATION_TESTS
+    "Build the PCL+ROS2 integration tests (off by default; manual use)" OFF)
+  if(RESPLE_BUILD_INTEGRATION_TESTS)
+    set(RESPLE_INTEGRATION_TESTS
+      test/integration/test_pc2_ingest.cpp
+      test/integration/test_esti_plane_pcl.cpp)
+    foreach(_it_src ${RESPLE_INTEGRATION_TESTS})
+      if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${_it_src})
+        get_filename_component(_it_name ${_it_src} NAME_WE)
+        ament_add_gtest(${_it_name} ${_it_src})
+        target_include_directories(${_it_name} PRIVATE include)
+        # ament_auto exposes the package's resolved deps (sensor_msgs, PCL, ...)
+        ament_target_dependencies(${_it_name}
+          ${${PROJECT_NAME}_FOUND_BUILD_DEPENDS})
+        target_link_libraries(${_it_name} ${PCL_LIBRARIES})
+      endif()
+    endforeach()
+    # The launch_testing pipeline test is registered via add_launch_test so it
+    # is run only on explicit request (launch_test ...), never by ament's
+    # default gtest sweep.
+    find_package(launch_testing_ament_cmake QUIET)
+    if(launch_testing_ament_cmake_FOUND)
+      add_launch_test(test/integration/test_resple_lifecycle.launch_test.py)
+    endif()
+  endif()
+endif()
+
 ament_auto_package()

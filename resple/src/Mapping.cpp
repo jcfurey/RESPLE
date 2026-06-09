@@ -64,6 +64,7 @@
 #include <tf2_ros/transform_listener.hpp>
 
 #include "SplineState.h"
+#include "utils/point_cloud_ingest.h"
 
 template<typename PointType>
 class MappingBase
@@ -393,6 +394,74 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
 
   private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_ouster;
+    int64_t time_offset = 0;
+};
+
+// Generic PointCloud2 buffer: mirrors OusterBuff but uses runtime PointField
+// introspection (utils/point_cloud_adapter.h), so the map side accepts the
+// same arbitrary PointCloud2 layouts as RESPLE's genericLidarCallback.
+class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
+{
+  public:
+  GenericPC2Buff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config,
+                 rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
+      : MappingBase<pcl::PointXYZINormal>(nh, lidar_config, sensor_cb)
+    {
+        adapter_cfg_ = resple::makeAdapterConfig(
+            lidar_config.time_field, lidar_config.time_unit, lidar_config.intensity_field);
+        pc_subscription_generic = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
+            this->lidar.topic, lidar_qos, std::bind(&GenericPC2Buff::genericLidarCallback, this, std::placeholders::_1), sub_opt);
+        double lidar_time_offset = CommonUtils::readParam<double>(nh->get_node_parameters_interface(), "lidar_time_offset", 0.0);
+        time_offset = 1e9*lidar_time_offset;
+    }
+
+    void genericLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg_in)
+    {
+        // Guard against negative timestamps (sim-time messages)
+        int64_t stamp_ns = rclcpp::Time(msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;
+
+        // Lookup LiDAR transform if not yet initialized
+        if(!updateTransform(msg_in->header.frame_id)) return;
+
+        // Field-introspecting conversion. The map keeps the full cloud:
+        // no blind-radius cut and no decimation (the voxel filter below
+        // bounds the density), matching the per-sensor map buffers.
+        this->pc_last->clear();
+        if (!resple::ingestPointCloud2(*msg_in, /*blind=*/0.f,
+                                       /*point_filter_num=*/1, adapter_cfg_,
+                                       *this->pc_last)) {
+            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
+                "[Mapping] PointCloud2 on '%s' has no usable x/y/z layout — dropped",
+                this->lidar.topic.c_str());
+            return;
+        }
+        if (this->pc_last->points.empty()) return;
+        this->pc_last->header.frame_id = this->frame_id;
+        this->pc_last->header.stamp = stamp_ns - time_offset;
+        std::vector<int> indices;
+        pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
+        if (this->pc_last->points.empty()) return;
+
+        // Transform point cloud to body frame
+        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+
+        ds_filter_each_scan.setInputCloud(pc_last);
+        this->pc_last_ds->clear();
+        ds_filter_each_scan.filter(*this->pc_last_ds);
+        pc_last_ds->header.frame_id = this->frame_id;
+        pc_last_ds->header.stamp = stamp_ns - time_offset;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            // Cap cloud buffer to prevent OOM on processing stalls
+            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
+            this->pc_L_buff.push_back(*pc_last_ds);
+        }
+    }
+
+  private:
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_generic;
+    resple::pc2::AdapterConfig adapter_cfg_;
     int64_t time_offset = 0;
 };
 
@@ -1388,11 +1457,13 @@ int mappingMain(int argc, char** argv) {
                 buffs.push_back(new HesaiBuff(temp_nh, lidar, sensor_cb_group));
             } else if (!lidar.type.compare("Mid360Boxi")) {
                 buffs.push_back(new Mid360BoxiBuff(temp_nh, lidar, sensor_cb_group));
+            } else if (!lidar.type.compare("PointCloud2")) {
+                buffs.push_back(new GenericPC2Buff(temp_nh, lidar, sensor_cb_group));
             } else {
                 // exit(1) bypassed the crash handler and gave no log of why.
                 RCLCPP_FATAL(temp_nh->get_logger(),
                     "Mapping: unknown lidar type '%s'. Supported: Ouster, Mid70Avia, HAP360, "
-                    "AviaResple, Hesai, Mid360Boxi. Exiting.", lidar.type.c_str());
+                    "AviaResple, Hesai, Mid360Boxi, PointCloud2 (generic). Exiting.", lidar.type.c_str());
                 for (auto* buff : buffs) delete buff;
                 rclcpp::shutdown();
                 return 5;

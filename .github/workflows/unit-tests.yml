@@ -1,0 +1,22 @@
+name: unit-tests
+
+# Fast, ROS-free gate: the estimator math and PointCloud2 parsing cores compile
+# with just Eigen + GoogleTest, so they run on every push/PR in seconds and
+# guard the numerics independently of the heavier colcon build.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  estimator-core:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ libeigen3-dev libgtest-dev
+      - name: Build and run unit tests
+        run: ./scripts/run_unit_tests.sh

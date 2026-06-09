@@ -394,7 +394,8 @@ standalone justification.
 ## Phase 2 — Concurrency hardening
 
 **Status: 2.1 fixed (Phase 1.5 K1); 2.2 partially fixed (Phase 1.5 Fix C);
-2.3 still pending Phase 0 data.**
+2.3 still pending Phase 0 data; 2.4 (Push_Down race) design ready,
+implementation pending a ROS 2 + PCL toolchain.**
 
 Three independent items. 2.1 was preempted by Phase 1.5 (defensive shared
 lock); 2.2's immediate race was closed by Phase 1.5 Fix C, full state-enum
@@ -465,6 +466,80 @@ worker stalls, memory grows without backpressure. Fix:
 **Decision gate:** only do this if Phase 0 shows the buffers trend up under
 normal operation. On a clean system they should empty every IEKF cycle.
 
+### 2.4 Fix the ikd-Tree `Push_Down` child-write race — **DESIGN READY, IMPLEMENTATION PENDING**
+
+**Status: full design below; implementation deliberately deferred until a
+ROS 2 + PCL toolchain is available to compile-verify it (`ikd_Tree.cpp`
+needs PCL; the refactor touches ~140 sites). This is the last known
+ikd-Tree race and the reason the `num_threads=1` mitigation exists.**
+
+The race (documented in the `Push_Down` comment block, ikd_Tree.cpp ~1234):
+`Push_Down(P)` writes the propagation fields of P's CHILDREN
+(`tree_deleted`, `point_deleted`, `tree_downsample_deleted`,
+`point_downsample_deleted`, `down_del_num`, `invalid_point_num`,
+`need_push_down_to_*`) while holding only P's own `push_down_mutex_lock`
+(taken at the Search call site, ikd_Tree.cpp ~1104-1117). A concurrent
+`Search(C)` on the child holds C's mutex and reads/writes the same fields
+of C → the two locks don't overlap → data race. Additionally, mutators set
+`need_push_down_to_*` on subtree roots (sites at ~372, ~817, ~971) without
+the node's mutex → a `Push_Down` clearing the parent flag can lose a
+concurrent mutator's set (lost-update → deletions never propagate to that
+subtree until the next delete touches the path).
+
+**Key enabling observation:** every `KD_TREE_NODE` already carries a
+`pthread_mutex_t push_down_mutex_lock` (initialized in `InitTreeNode`,
+destroyed in `DeleteTreeNodes`) that is used at exactly ONE call site. The
+per-node lock infrastructure for the proper fix already exists.
+
+**Design (write-side mutual exclusion + read-side atomics):**
+1. **Centralize locking inside `Push_Down`** and simplify the Search call
+   site (~1104-1117) to a bare `Push_Down(root)` call:
+   - fast pre-check (atomic loads, no lock): both `need_push_down_to_*`
+     false → return;
+   - lock the PARENT's `push_down_mutex_lock` for the body (serializes
+     concurrent `Push_Down(P)` instances and protects P's flag clears);
+   - in each child block, additionally lock the CHILD's
+     `push_down_mutex_lock` around the child-field writes (including the
+     `*Rebuild_Ptr` branch, which keeps its existing `working_flag_mutex` +
+     `Rebuild_Logger` handling). Lock order is strictly parent→child along
+     tree edges → acyclic → deadlock-free. A thread holds at most two node
+     mutexes at a time.
+2. **Wrap the three mutator flag-set sites** (~372, ~817, ~971) with that
+   node's `push_down_mutex_lock`. Contract afterwards: *a node's deletion-
+   propagation fields are written only while holding that node's
+   `push_down_mutex_lock`; reads are lock-free atomics.* This closes the
+   lost-update window by mutual exclusion (no ordering subtleties left).
+3. **Convert the racy fields to atomics** so the lock-free reads in
+   `Search`/`Box_Search`/`Radius_Search`/`Criterion_Check`/`Update` are
+   defined behavior (TSan-clean): the six bools → `std::atomic<bool>`,
+   `down_del_num`/`invalid_point_num`/`TreeSize` → `std::atomic<int>`.
+   Mechanical notes from the site survey:
+   - `std::atomic<bool>` has no `|=` — the 12 `x |= y` sites (4 in
+     Push_Down blocks ×2 sides + ~362/363) become `if (y) x = true;`
+     (safe under the new per-node lock);
+   - no `KD_TREE_NODE` is copied by value and no flag/counter has its
+     address taken (verified by grep), so atomics are drop-in elsewhere;
+   - the two `memset(&range, ...)` calls (~116/133) touch only the local
+     `BoxPointType`, not nodes — no change needed;
+   - in-class initializers (`= false`, `= 0`, `= 1`) remain valid for
+     atomics.
+4. **Retire the mitigation:** remove the `num_threads=1` guidance from the
+   `Push_Down` comment and CLAUDE.md hazards table; multi-threaded k-NN
+   (OpenMP `findCorresp`) becomes safe by contract.
+
+**Verification:** colcon build; unit suite; the §2.1 gtest stress harness
+(N parallel `Nearest_Search` + concurrent `Add_Points`/`Delete_Point_Boxes`)
+under TSan — before/after comparison should show the Push_Down reports gone;
+bag replay (`scripts/run_sanitizer_replay.sh tsan <bag>`) as the end-to-end
+gate. Benchmark a bag with `num_threads=8` vs `=1` to quantify the recovered
+parallelism.
+
+**Complexity: medium-high** (mechanical breadth, not conceptual depth). The
+per-node mutex in the hot search path costs one uncontended pthread lock per
+node visited only when `need_push_down_to_*` is set (the pre-check skips the
+lock otherwise) — deletions are bursty (FOV segment + downsample), so the
+common search path stays lock-free.
+
 ---
 
 ## Phase 3 — Spline / mapping accuracy
@@ -508,23 +583,40 @@ clusters). No counters for dropped candidates.
 **Complexity: low-medium.** Numerical impact depends on parameter choices;
 benchmark against a known-good bag.
 
-### 3.3 Divergence detection and recovery
+### 3.3 Divergence detection and recovery — **DETECTION DONE**
 
-After each IEKF pass, the filter's health is invisible externally. Bad
-posterior covariance (collapse or NaN) propagates into published odometry
+After each IEKF pass, the filter's health was invisible externally. Bad
+posterior covariance (collapse or NaN) propagated into published odometry
 and downstream consumers without any warning.
 
-**Work:**
-- Compute posterior covariance trace and `λ_min` (via `SelfAdjointEigenSolver`).
-- Check: trace finite, `λ_min > 0`, no NaN in state.
-- Publish a `/localization/resple/status` topic with the health bool + the
-  metrics.
-- Action on trip: either (a) hold last estimate + skip publish until a stable
-  scan recovers it, or (b) reset filter with the last good pose.
+**Implemented (detection + IMU input health):**
+- `Estimator::update()` now computes the measurement-space NIS
+  `nu^T (H P H^T + R)^{-1} nu` in both branches (directly from the factored
+  `S` in the small-measurement branch; via the Woodbury identity reusing the
+  existing Cholesky factor in the information-form branch). A failed/skipped
+  update reports NIS = NaN. Exposed via `lastNis()` / `lastNisDof()`.
+- `utils/filter_health.h::NisDivergenceDetector` (unit-tested, ROS-free):
+  windowed NIS mean vs. dof with WARN / DIVERGED thresholds, consecutive-
+  breach counting, and hysteresis recovery. Fed by the worker each IEKF
+  cycle; verdict + window mean exported to diagnostics ("Filter Consistency
+  (NIS)"), with a throttled ERROR log on DIVERGED. Tunables:
+  `nis_window` (32), `nis_warn_ratio` (2.0), `nis_diverged_ratio` (4.0),
+  `nis_breach_limit` (3).
+- `utils/filter_health.h::ImuHealthMonitor` (unit-tested, ROS-free): per-
+  sample NaN / saturation / stuck-sensor / time-jump faults plus windowed
+  stationary noise-floor and bias estimates — aimed at poor built-in IMUs
+  (e.g. Ouster). Fed in `getImuCallback` (with `acc_ratio` scaling applied);
+  fault bits + stationary gyro-bias norm exported to diagnostics, throttled
+  WARN on faults.
 
-**Complexity: medium.** Eigendecomposition on 24x24 / 30x30 is cheap
-(< 1 ms). Choice of (a) vs. (b) is a policy decision — (a) is safer
-operationally, (b) recovers faster from a real divergence.
+**Remaining (recovery policy):**
+- Action on trip: either (a) hold last estimate + skip publish until a stable
+  scan recovers it, or (b) reset filter with the last good pose. This is a
+  policy decision — (a) is safer operationally, (b) recovers faster from a
+  real divergence. Detection currently logs + escalates diagnostics to ERROR
+  so downstream consumers can gate on `/diagnostics`; no automatic reset yet.
+- Optional: covariance trace / `λ_min` metrics on a dedicated status topic
+  (the NIS verdict largely subsumes them for divergence purposes).
 
 ### 3.4 Map pruning policy
 
