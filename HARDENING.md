@@ -394,7 +394,8 @@ standalone justification.
 ## Phase 2 — Concurrency hardening
 
 **Status: 2.1 fixed (Phase 1.5 K1); 2.2 partially fixed (Phase 1.5 Fix C);
-2.3 still pending Phase 0 data.**
+2.3 still pending Phase 0 data; 2.4 (Push_Down race) design ready,
+implementation pending a ROS 2 + PCL toolchain.**
 
 Three independent items. 2.1 was preempted by Phase 1.5 (defensive shared
 lock); 2.2's immediate race was closed by Phase 1.5 Fix C, full state-enum
@@ -464,6 +465,80 @@ worker stalls, memory grows without backpressure. Fix:
 
 **Decision gate:** only do this if Phase 0 shows the buffers trend up under
 normal operation. On a clean system they should empty every IEKF cycle.
+
+### 2.4 Fix the ikd-Tree `Push_Down` child-write race — **DESIGN READY, IMPLEMENTATION PENDING**
+
+**Status: full design below; implementation deliberately deferred until a
+ROS 2 + PCL toolchain is available to compile-verify it (`ikd_Tree.cpp`
+needs PCL; the refactor touches ~140 sites). This is the last known
+ikd-Tree race and the reason the `num_threads=1` mitigation exists.**
+
+The race (documented in the `Push_Down` comment block, ikd_Tree.cpp ~1234):
+`Push_Down(P)` writes the propagation fields of P's CHILDREN
+(`tree_deleted`, `point_deleted`, `tree_downsample_deleted`,
+`point_downsample_deleted`, `down_del_num`, `invalid_point_num`,
+`need_push_down_to_*`) while holding only P's own `push_down_mutex_lock`
+(taken at the Search call site, ikd_Tree.cpp ~1104-1117). A concurrent
+`Search(C)` on the child holds C's mutex and reads/writes the same fields
+of C → the two locks don't overlap → data race. Additionally, mutators set
+`need_push_down_to_*` on subtree roots (sites at ~372, ~817, ~971) without
+the node's mutex → a `Push_Down` clearing the parent flag can lose a
+concurrent mutator's set (lost-update → deletions never propagate to that
+subtree until the next delete touches the path).
+
+**Key enabling observation:** every `KD_TREE_NODE` already carries a
+`pthread_mutex_t push_down_mutex_lock` (initialized in `InitTreeNode`,
+destroyed in `DeleteTreeNodes`) that is used at exactly ONE call site. The
+per-node lock infrastructure for the proper fix already exists.
+
+**Design (write-side mutual exclusion + read-side atomics):**
+1. **Centralize locking inside `Push_Down`** and simplify the Search call
+   site (~1104-1117) to a bare `Push_Down(root)` call:
+   - fast pre-check (atomic loads, no lock): both `need_push_down_to_*`
+     false → return;
+   - lock the PARENT's `push_down_mutex_lock` for the body (serializes
+     concurrent `Push_Down(P)` instances and protects P's flag clears);
+   - in each child block, additionally lock the CHILD's
+     `push_down_mutex_lock` around the child-field writes (including the
+     `*Rebuild_Ptr` branch, which keeps its existing `working_flag_mutex` +
+     `Rebuild_Logger` handling). Lock order is strictly parent→child along
+     tree edges → acyclic → deadlock-free. A thread holds at most two node
+     mutexes at a time.
+2. **Wrap the three mutator flag-set sites** (~372, ~817, ~971) with that
+   node's `push_down_mutex_lock`. Contract afterwards: *a node's deletion-
+   propagation fields are written only while holding that node's
+   `push_down_mutex_lock`; reads are lock-free atomics.* This closes the
+   lost-update window by mutual exclusion (no ordering subtleties left).
+3. **Convert the racy fields to atomics** so the lock-free reads in
+   `Search`/`Box_Search`/`Radius_Search`/`Criterion_Check`/`Update` are
+   defined behavior (TSan-clean): the six bools → `std::atomic<bool>`,
+   `down_del_num`/`invalid_point_num`/`TreeSize` → `std::atomic<int>`.
+   Mechanical notes from the site survey:
+   - `std::atomic<bool>` has no `|=` — the 12 `x |= y` sites (4 in
+     Push_Down blocks ×2 sides + ~362/363) become `if (y) x = true;`
+     (safe under the new per-node lock);
+   - no `KD_TREE_NODE` is copied by value and no flag/counter has its
+     address taken (verified by grep), so atomics are drop-in elsewhere;
+   - the two `memset(&range, ...)` calls (~116/133) touch only the local
+     `BoxPointType`, not nodes — no change needed;
+   - in-class initializers (`= false`, `= 0`, `= 1`) remain valid for
+     atomics.
+4. **Retire the mitigation:** remove the `num_threads=1` guidance from the
+   `Push_Down` comment and CLAUDE.md hazards table; multi-threaded k-NN
+   (OpenMP `findCorresp`) becomes safe by contract.
+
+**Verification:** colcon build; unit suite; the §2.1 gtest stress harness
+(N parallel `Nearest_Search` + concurrent `Add_Points`/`Delete_Point_Boxes`)
+under TSan — before/after comparison should show the Push_Down reports gone;
+bag replay (`scripts/run_sanitizer_replay.sh tsan <bag>`) as the end-to-end
+gate. Benchmark a bag with `num_threads=8` vs `=1` to quantify the recovered
+parallelism.
+
+**Complexity: medium-high** (mechanical breadth, not conceptual depth). The
+per-node mutex in the hot search path costs one uncontended pthread lock per
+node visited only when `need_push_down_to_*` is set (the pre-check skips the
+lock otherwise) — deletions are bursty (FOV segment + downsample), so the
+common search path stays lock-free.
 
 ---
 
