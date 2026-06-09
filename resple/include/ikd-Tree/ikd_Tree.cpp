@@ -359,18 +359,27 @@ void KD_TREE<PointType>::run_operation(KD_TREE_NODE **root, Operation_Logger_Typ
         Delete_by_range(root, operation.boxpoint, false, true);
         break;
     case PUSH_DOWN:
-        (*root)->tree_downsample_deleted |= operation.tree_downsample_deleted;
-        (*root)->point_downsample_deleted |= operation.tree_downsample_deleted;
+        // Phase 2.4: deletion-propagation fields (incl. the need_push_down_to_*
+        // SET) are written only while holding the node's push_down_mutex_lock.
+        // This runs on the private rebuild tree (uncontended), but the lock
+        // keeps the write-side contract uniform across all mutator sites.
+        pthread_mutex_lock(&((*root)->push_down_mutex_lock));
+        if (operation.tree_downsample_deleted)
+        {
+            (*root)->tree_downsample_deleted = true;
+            (*root)->point_downsample_deleted = true;
+        }
         (*root)->tree_deleted = operation.tree_deleted || (*root)->tree_downsample_deleted;
         (*root)->point_deleted = (*root)->tree_deleted || (*root)->point_downsample_deleted;
         if (operation.tree_downsample_deleted)
-            (*root)->down_del_num = (*root)->TreeSize;
+            (*root)->down_del_num = (*root)->TreeSize.load();
         if (operation.tree_deleted)
-            (*root)->invalid_point_num = (*root)->TreeSize;
+            (*root)->invalid_point_num = (*root)->TreeSize.load();
         else
-            (*root)->invalid_point_num = (*root)->down_del_num;
+            (*root)->invalid_point_num = (*root)->down_del_num.load();
         (*root)->need_push_down_to_left = true;
         (*root)->need_push_down_to_right = true;
+        pthread_mutex_unlock(&((*root)->push_down_mutex_lock));
         break;
     default:
         break;
@@ -812,18 +821,23 @@ int KD_TREE<PointType>::Delete_by_range(KD_TREE_NODE **root, BoxPointType boxpoi
         return 0;
     if (boxpoint.vertex_min[0] <= (*root)->node_range_x[0] && boxpoint.vertex_max[0] > (*root)->node_range_x[1] && boxpoint.vertex_min[1] <= (*root)->node_range_y[0] && boxpoint.vertex_max[1] > (*root)->node_range_y[1] && boxpoint.vertex_min[2] <= (*root)->node_range_z[0] && boxpoint.vertex_max[2] > (*root)->node_range_z[1])
     {
+        // Phase 2.4: write this node's deletion-propagation fields (incl. the
+        // need_push_down_to_* SET) under its push_down_mutex_lock so the set
+        // cannot be lost against a concurrent Push_Down(node) clearing them.
+        pthread_mutex_lock(&((*root)->push_down_mutex_lock));
         (*root)->tree_deleted = true;
         (*root)->point_deleted = true;
         (*root)->need_push_down_to_left = true;
         (*root)->need_push_down_to_right = true;
         tmp_counter = (*root)->TreeSize - (*root)->invalid_point_num;
-        (*root)->invalid_point_num = (*root)->TreeSize;
+        (*root)->invalid_point_num = (*root)->TreeSize.load();
         if (is_downsample)
         {
             (*root)->tree_downsample_deleted = true;
             (*root)->point_downsample_deleted = true;
-            (*root)->down_del_num = (*root)->TreeSize;
+            (*root)->down_del_num = (*root)->TreeSize.load();
         }
+        pthread_mutex_unlock(&((*root)->push_down_mutex_lock));
         return tmp_counter;
     }
     if (!(*root)->point_deleted && boxpoint.vertex_min[0] <= (*root)->point.x && boxpoint.vertex_max[0] > (*root)->point.x && boxpoint.vertex_min[1] <= (*root)->point.y && boxpoint.vertex_max[1] > (*root)->point.y && boxpoint.vertex_min[2] <= (*root)->point.z && boxpoint.vertex_max[2] > (*root)->point.z)
@@ -966,16 +980,21 @@ void KD_TREE<PointType>::Add_by_range(KD_TREE_NODE **root, BoxPointType boxpoint
         return;
     if (boxpoint.vertex_min[0] <= (*root)->node_range_x[0] && boxpoint.vertex_max[0] > (*root)->node_range_x[1] && boxpoint.vertex_min[1] <= (*root)->node_range_y[0] && boxpoint.vertex_max[1] > (*root)->node_range_y[1] && boxpoint.vertex_min[2] <= (*root)->node_range_z[0] && boxpoint.vertex_max[2] > (*root)->node_range_z[1])
     {
+        // Phase 2.4: write this node's deletion-propagation fields (incl. the
+        // need_push_down_to_* SET) under its push_down_mutex_lock so the set
+        // cannot be lost against a concurrent Push_Down(node) clearing them.
+        pthread_mutex_lock(&((*root)->push_down_mutex_lock));
         (*root)->tree_deleted = false || (*root)->tree_downsample_deleted;
         (*root)->point_deleted = false || (*root)->point_downsample_deleted;
         (*root)->need_push_down_to_left = true;
         (*root)->need_push_down_to_right = true;
-        (*root)->invalid_point_num = (*root)->down_del_num;
+        (*root)->invalid_point_num = (*root)->down_del_num.load();
+        pthread_mutex_unlock(&((*root)->push_down_mutex_lock));
         return;
     }
     if (boxpoint.vertex_min[0] <= (*root)->point.x && boxpoint.vertex_max[0] > (*root)->point.x && boxpoint.vertex_min[1] <= (*root)->point.y && boxpoint.vertex_max[1] > (*root)->point.y && boxpoint.vertex_min[2] <= (*root)->point.z && boxpoint.vertex_max[2] > (*root)->point.z)
     {
-        (*root)->point_deleted = (*root)->point_downsample_deleted;
+        (*root)->point_deleted = (*root)->point_downsample_deleted.load();
     }
     Operation_Logger_Type add_box_log;
     // struct timespec Timeout;
@@ -1100,21 +1119,11 @@ void KD_TREE<PointType>::Search(KD_TREE_NODE *root, int k_nearest, PointType poi
     float max_dist_sqr = max_dist * max_dist;
     if (cur_dist > max_dist_sqr)
         return;
-    int retval;
-    if (root->need_push_down_to_left || root->need_push_down_to_right)
-    {
-        retval = pthread_mutex_trylock(&(root->push_down_mutex_lock));
-        if (retval == 0)
-        {
-            Push_Down(root);
-            pthread_mutex_unlock(&(root->push_down_mutex_lock));
-        }
-        else
-        {
-            pthread_mutex_lock(&(root->push_down_mutex_lock));
-            pthread_mutex_unlock(&(root->push_down_mutex_lock));
-        }
-    }
+    // Phase 2.4: Push_Down now does its own fast lock-free pre-check and takes
+    // the node's push_down_mutex_lock internally (parent lock for this node's
+    // flag clears, child lock for the child-field writes), so the call site is
+    // a bare call. The old trylock-or-wait dance here is no longer needed.
+    Push_Down(root);
     if (!root->point_deleted)
     {
         float dist = calc_dist(point, root->point);
@@ -1236,79 +1245,99 @@ bool KD_TREE<PointType>::Criterion_Check(KD_TREE_NODE *root)
 // push-down. Called from Search and from every kd-tree mutator before they
 // proceed past `root`.
 //
-// CONCURRENCY HAZARD (inherited from upstream HKU-MARS ikd-Tree, NOT introduced
-// by this fork): Push_Down acquires only the PARENT's push_down_mutex_lock
-// (via the trylock pattern at every caller site). It then writes to the
-// immediate CHILDREN's flag fields (tree_downsample_deleted, point_downsample_deleted,
+// CONCURRENCY (HARDENING Phase 2.4 — race FIXED; previously inherited from the
+// upstream HKU-MARS ikd-Tree). Push_Down(P) writes P's CHILDREN's
+// deletion-propagation fields (tree_downsample_deleted, point_downsample_deleted,
 // tree_deleted, point_deleted, down_del_num, invalid_point_num,
-// need_push_down_to_left, need_push_down_to_right) without holding any
-// per-child lock. Two threads concurrently calling Push_Down on different
-// parents whose children-paths overlap WILL race on those child fields.
+// need_push_down_to_left, need_push_down_to_right) and clears P's own
+// need_push_down_to_{left,right}. Two threads descending overlapping paths (the
+// dominant case is findCorresp's OpenMP-parallel Nearest_Search) used to race
+// on those child fields. The fix has three parts:
 //
-// Why we have not fixed it:
-//   - Per-child locking would require restructuring every Push_Down call site
-//     to take a lock on TWO nodes (parent + child) in a consistent order, with
-//     careful avoidance of self-deadlock when the same node is both parent
-//     and child in different traversals.
-//   - The race is on integer-and-bool struct fields aligned naturally on x86_64;
-//     individual writes are tearing-free, only the COMBINATION of writes is
-//     non-atomic. In practice this manifests as occasional flag transients
-//     that self-heal on the next Push_Down (the writes are idempotent: any
-//     subsequent Push_Down with the same root state writes the same values).
-//   - Fixing it cleanly probably requires rewriting Push_Down to use atomic
-//     RMWs on individual flags rather than read-modify-write of the whole
-//     bool field. That's a substantial change to ikd-Tree internals.
+//   1. WRITE-SIDE MUTUAL EXCLUSION. The body runs under root's own
+//      push_down_mutex_lock (taken here, not at the call sites), which
+//      serializes concurrent Push_Down(root) instances and protects root's
+//      flag clears. Each child block additionally takes the CHILD's
+//      push_down_mutex_lock around the child-field writes, which serializes a
+//      Push_Down(P) writing child C against a Push_Down(C) (where C is treated
+//      as the parent and holds the same mutex). Lock order is strictly
+//      parent->child along tree edges, so the order is acyclic, a thread holds
+//      at most two node mutexes, and it cannot deadlock. The internal
+//      working_flag_mutex / Rebuild_Logger handling in the rebuild branch is
+//      preserved, nested INSIDE the child lock (order: node -> working_flag).
 //
-// Mitigation in our fork:
-//   - num_threads parameter caps OpenMP fan-out in the IEKF (findCorresp's
-//     parallel for is the dominant concurrent caller). Setting num_threads=1
-//     in resple.yaml eliminates this race entirely at the cost of
-//     parallelism. Used during diagnostic runs.
+//   2. The mutators that SET need_push_down_to_* on a subtree root
+//      (Add_by_range / Delete_by_range / the run_operation PUSH_DOWN replay)
+//      take that node's push_down_mutex_lock around the write, closing the
+//      set-vs-clear lost-update window.
 //
-// If you suspect this race is causing production issues, set num_threads=1
-// and see if the symptom persists. If yes, the race is not your bug.
+//   3. The racy fields are std::atomic, so the lock-free reads in Search /
+//      Search_by_range / Search_by_radius / Criterion_Check / Update are
+//      defined behaviour (TSan-clean).
+//
+// Net effect: multi-threaded k-NN is safe by contract, so the old
+// num_threads=1 mitigation is retired.
 template <typename PointType>
 void KD_TREE<PointType>::Push_Down(KD_TREE_NODE *root)
 {
     if (root == nullptr)
         return;
+    // Fast lock-free pre-check (atomic loads): nothing to propagate -> return
+    // without touching any mutex. Keeps the common search path lock-free.
+    if (!root->need_push_down_to_left && !root->need_push_down_to_right)
+        return;
     Operation_Logger_Type operation;
     operation.op = PUSH_DOWN;
     operation.tree_deleted = root->tree_deleted;
     operation.tree_downsample_deleted = root->tree_downsample_deleted;
+    // Parent lock: serializes concurrent Push_Down(root) and protects the
+    // need_push_down_to_* clears below.
+    pthread_mutex_lock(&(root->push_down_mutex_lock));
     if (root->need_push_down_to_left && root->left_son_ptr != nullptr)
     {
-        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->left_son_ptr)
+        KD_TREE_NODE *child = root->left_son_ptr;
+        const bool tds = root->tree_downsample_deleted;
+        const bool td = root->tree_deleted;
+        // Child lock: serializes these child-field writes against a concurrent
+        // Push_Down(child).
+        pthread_mutex_lock(&(child->push_down_mutex_lock));
+        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != child)
         {
-            root->left_son_ptr->tree_downsample_deleted |= root->tree_downsample_deleted;
-            root->left_son_ptr->point_downsample_deleted |= root->tree_downsample_deleted;
-            root->left_son_ptr->tree_deleted = root->tree_deleted || root->left_son_ptr->tree_downsample_deleted;
-            root->left_son_ptr->point_deleted = root->left_son_ptr->tree_deleted || root->left_son_ptr->point_downsample_deleted;
-            if (root->tree_downsample_deleted)
-                root->left_son_ptr->down_del_num = root->left_son_ptr->TreeSize;
-            if (root->tree_deleted)
-                root->left_son_ptr->invalid_point_num = root->left_son_ptr->TreeSize;
+            if (tds)
+            {
+                child->tree_downsample_deleted = true;
+                child->point_downsample_deleted = true;
+            }
+            child->tree_deleted = td || child->tree_downsample_deleted;
+            child->point_deleted = child->tree_deleted || child->point_downsample_deleted;
+            if (tds)
+                child->down_del_num = child->TreeSize.load();
+            if (td)
+                child->invalid_point_num = child->TreeSize.load();
             else
-                root->left_son_ptr->invalid_point_num = root->left_son_ptr->down_del_num;
-            root->left_son_ptr->need_push_down_to_left = true;
-            root->left_son_ptr->need_push_down_to_right = true;
+                child->invalid_point_num = child->down_del_num.load();
+            child->need_push_down_to_left = true;
+            child->need_push_down_to_right = true;
             root->need_push_down_to_left = false;
         }
         else
         {
             pthread_mutex_lock(&working_flag_mutex);
-            root->left_son_ptr->tree_downsample_deleted |= root->tree_downsample_deleted;
-            root->left_son_ptr->point_downsample_deleted |= root->tree_downsample_deleted;
-            root->left_son_ptr->tree_deleted = root->tree_deleted || root->left_son_ptr->tree_downsample_deleted;
-            root->left_son_ptr->point_deleted = root->left_son_ptr->tree_deleted || root->left_son_ptr->point_downsample_deleted;
-            if (root->tree_downsample_deleted)
-                root->left_son_ptr->down_del_num = root->left_son_ptr->TreeSize;
-            if (root->tree_deleted)
-                root->left_son_ptr->invalid_point_num = root->left_son_ptr->TreeSize;
+            if (tds)
+            {
+                child->tree_downsample_deleted = true;
+                child->point_downsample_deleted = true;
+            }
+            child->tree_deleted = td || child->tree_downsample_deleted;
+            child->point_deleted = child->tree_deleted || child->point_downsample_deleted;
+            if (tds)
+                child->down_del_num = child->TreeSize.load();
+            if (td)
+                child->invalid_point_num = child->TreeSize.load();
             else
-                root->left_son_ptr->invalid_point_num = root->left_son_ptr->down_del_num;
-            root->left_son_ptr->need_push_down_to_left = true;
-            root->left_son_ptr->need_push_down_to_right = true;
+                child->invalid_point_num = child->down_del_num.load();
+            child->need_push_down_to_left = true;
+            child->need_push_down_to_right = true;
             if (rebuild_flag)
             {
                 pthread_mutex_lock(&rebuild_logger_mutex_lock);
@@ -1318,40 +1347,51 @@ void KD_TREE<PointType>::Push_Down(KD_TREE_NODE *root)
             root->need_push_down_to_left = false;
             pthread_mutex_unlock(&working_flag_mutex);
         }
+        pthread_mutex_unlock(&(child->push_down_mutex_lock));
     }
     if (root->need_push_down_to_right && root->right_son_ptr != nullptr)
     {
-        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->right_son_ptr)
+        KD_TREE_NODE *child = root->right_son_ptr;
+        const bool tds = root->tree_downsample_deleted;
+        const bool td = root->tree_deleted;
+        pthread_mutex_lock(&(child->push_down_mutex_lock));
+        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != child)
         {
-            root->right_son_ptr->tree_downsample_deleted |= root->tree_downsample_deleted;
-            root->right_son_ptr->point_downsample_deleted |= root->tree_downsample_deleted;
-            root->right_son_ptr->tree_deleted = root->tree_deleted || root->right_son_ptr->tree_downsample_deleted;
-            root->right_son_ptr->point_deleted = root->right_son_ptr->tree_deleted || root->right_son_ptr->point_downsample_deleted;
-            if (root->tree_downsample_deleted)
-                root->right_son_ptr->down_del_num = root->right_son_ptr->TreeSize;
-            if (root->tree_deleted)
-                root->right_son_ptr->invalid_point_num = root->right_son_ptr->TreeSize;
+            if (tds)
+            {
+                child->tree_downsample_deleted = true;
+                child->point_downsample_deleted = true;
+            }
+            child->tree_deleted = td || child->tree_downsample_deleted;
+            child->point_deleted = child->tree_deleted || child->point_downsample_deleted;
+            if (tds)
+                child->down_del_num = child->TreeSize.load();
+            if (td)
+                child->invalid_point_num = child->TreeSize.load();
             else
-                root->right_son_ptr->invalid_point_num = root->right_son_ptr->down_del_num;
-            root->right_son_ptr->need_push_down_to_left = true;
-            root->right_son_ptr->need_push_down_to_right = true;
+                child->invalid_point_num = child->down_del_num.load();
+            child->need_push_down_to_left = true;
+            child->need_push_down_to_right = true;
             root->need_push_down_to_right = false;
         }
         else
         {
             pthread_mutex_lock(&working_flag_mutex);
-            root->right_son_ptr->tree_downsample_deleted |= root->tree_downsample_deleted;
-            root->right_son_ptr->point_downsample_deleted |= root->tree_downsample_deleted;
-            root->right_son_ptr->tree_deleted = root->tree_deleted || root->right_son_ptr->tree_downsample_deleted;
-            root->right_son_ptr->point_deleted = root->right_son_ptr->tree_deleted || root->right_son_ptr->point_downsample_deleted;
-            if (root->tree_downsample_deleted)
-                root->right_son_ptr->down_del_num = root->right_son_ptr->TreeSize;
-            if (root->tree_deleted)
-                root->right_son_ptr->invalid_point_num = root->right_son_ptr->TreeSize;
+            if (tds)
+            {
+                child->tree_downsample_deleted = true;
+                child->point_downsample_deleted = true;
+            }
+            child->tree_deleted = td || child->tree_downsample_deleted;
+            child->point_deleted = child->tree_deleted || child->point_downsample_deleted;
+            if (tds)
+                child->down_del_num = child->TreeSize.load();
+            if (td)
+                child->invalid_point_num = child->TreeSize.load();
             else
-                root->right_son_ptr->invalid_point_num = root->right_son_ptr->down_del_num;
-            root->right_son_ptr->need_push_down_to_left = true;
-            root->right_son_ptr->need_push_down_to_right = true;
+                child->invalid_point_num = child->down_del_num.load();
+            child->need_push_down_to_left = true;
+            child->need_push_down_to_right = true;
             if (rebuild_flag)
             {
                 pthread_mutex_lock(&rebuild_logger_mutex_lock);
@@ -1361,7 +1401,9 @@ void KD_TREE<PointType>::Push_Down(KD_TREE_NODE *root)
             root->need_push_down_to_right = false;
             pthread_mutex_unlock(&working_flag_mutex);
         }
+        pthread_mutex_unlock(&(child->push_down_mutex_lock));
     }
+    pthread_mutex_unlock(&(root->push_down_mutex_lock));
     return;
 }
 
@@ -1502,8 +1544,8 @@ void KD_TREE<PointType>::Update(KD_TREE_NODE *root)
         root->TreeSize = 1;
         root->invalid_point_num = (root->point_deleted ? 1 : 0);
         root->down_del_num = (root->point_downsample_deleted ? 1 : 0);
-        root->tree_downsample_deleted = root->point_downsample_deleted;
-        root->tree_deleted = root->point_deleted;
+        root->tree_downsample_deleted = root->point_downsample_deleted.load();
+        root->tree_deleted = root->point_deleted.load();
         tmp_range_x[0] = root->point.x;
         tmp_range_x[1] = root->point.x;
         tmp_range_y[0] = root->point.y;

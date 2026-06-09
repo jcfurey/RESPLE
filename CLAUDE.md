@@ -212,6 +212,33 @@ rebuild thread's subtree swap. `Nearest_Search` now unconditionally takes
 (rebuild only takes unique briefly during the swap). Worth it — the racy
 fast-path was a HIGH-severity UAF window in the IEKF k-NN parallel-for.
 
+### ikd-Tree `Push_Down` per-node locking (Phase 2.4)
+
+`Push_Down(P)` propagates deletion flags to `P`'s children. Concurrent
+searchers (the IEKF runs `findCorresp` as an OpenMP parallel-for, so many
+threads call `Nearest_Search` → `Push_Down` at once) used to race on the
+child nodes' flag fields. The fix:
+- `Push_Down` takes `P`'s own `push_down_mutex_lock` for the body (serializing
+  concurrent `Push_Down(P)` and protecting `P`'s flag clears) **and** each
+  child's `push_down_mutex_lock` around that child's field writes (serializing
+  a `Push_Down(P)`-writes-`C` against a `Push_Down(C)`). Lock order is strictly
+  parent→child along tree edges → acyclic → deadlock-free; a thread holds at
+  most two node mutexes. The call sites are now bare `Push_Down(root)` — the
+  old trylock dance moved inside.
+- The mutators that SET `need_push_down_to_*` on a subtree root (`Add_by_range`,
+  `Delete_by_range`, `run_operation`'s PUSH_DOWN replay) take that node's
+  `push_down_mutex_lock` around the write, closing the set-vs-clear lost-update.
+- The racy `KD_TREE_NODE` fields (`TreeSize`, `invalid_point_num`,
+  `down_del_num`, and the six deletion/propagation bools) are `std::atomic`, so
+  the lock-free reads in `Search` / `Search_by_range` / `Search_by_radius` /
+  `Criterion_Check` / `Update` are defined behaviour.
+
+This makes multi-threaded k-NN safe by contract; the old `num_threads=1`
+mitigation is retired. Verified with `resple/test/test_ikdtree_concurrency.cpp`
+under ThreadSanitizer (reader-vs-reader `Push_Down` races 16→0). Two
+pre-existing, independent rebuild-path hazards remain (hazard 34 above), tracked
+as Phase 2.5 and listed in `resple/test/tsan_suppressions.txt`.
+
 ## Build configuration
 
 Flags are defined in `src/packages/localization/resple/resple/CMakeLists.txt`.
@@ -291,7 +318,8 @@ reference (status as of latest pass):
 | 30 | `map_update_future_.wait()` had no timeout → if lambda hangs, worker permanently locks (no IEKF, no publishes, node alive but silent) | **fixed** (`wait_for(5s)` + skip cycle on timeout + ERROR log) | post-1.5 |
 | 31 | `processData` worker loop body unwrapped → throw anywhere kills worker thread silently → "alive but doing nothing" | **fixed** (try/catch around iteration body, log + 50ms sleep + continue) | post-1.5 |
 | 32 | `mapIncremental` passed NaN/Inf points straight to ikd-Tree `Add_by_point`, where `calc_dist` returns NaN, `<` comparisons all false, recursion takes wrong branch, tree state corrupts silently | **fixed** (skip non-finite points; surface counter via WARN_THROTTLE) | post-1.5 |
-| 33 | `ikd-Tree::Push_Down` writes to children's flag fields holding only the parent's per-node lock → races on overlapping subtree paths | **documented** (inherited from upstream HKU-MARS; mitigated via `num_threads=1` if symptomatic) | post-1.5 |
+| 33 | `ikd-Tree::Push_Down` writes to children's flag fields holding only the parent's per-node lock → races on overlapping subtree paths (dominant caller: findCorresp's OpenMP parallel `Nearest_Search`) | **fixed** (Phase 2.4: `Push_Down` takes the parent's *and* the child's `push_down_mutex_lock`; mutator flag-SET sites take the node's lock; the racy node fields are `std::atomic`; `num_threads=1` mitigation retired). TSan-verified reader-vs-reader races 16→0 via `test_ikdtree_concurrency` | 2.4 |
+| 34 | ikd-Tree background rebuild thread reads `KD_TREE_NODE::father_ptr` while a concurrent mutator's `Update` writes it; and a `working_flag_mutex`↔`search_rw_mutex_` lock-order inversion via the inline `Rebuild` path | **documented, deferred to Phase 2.5** (pre-existing, inherited from HKU-MARS; independent of Phase 2.4 — surfaced by `test_ikdtree_concurrency` under TSan and listed in `resple/test/tsan_suppressions.txt`) | 2.4 |
 
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7

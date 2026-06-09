@@ -7,6 +7,16 @@
 #
 #   sudo apt-get install -y libeigen3-dev libgtest-dev cmake g++
 #   ./scripts/run_unit_tests.sh
+#
+# If PCL is also installed, the ikd-Tree concurrency regression
+# (test_ikdtree_concurrency, HARDENING Phase 2.4) is built and run too. For the
+# strongest signal run it under ThreadSanitizer with the suppressions file:
+#
+#   cmake -S resple/test -B build/tsan \
+#     -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1 -fno-omit-frame-pointer"
+#   cmake --build build/tsan -j"$(nproc)"
+#   TSAN_OPTIONS="suppressions=$PWD/resple/test/tsan_suppressions.txt" \
+#     ctest --test-dir build/tsan --output-on-failure -R IkdTreeConcurrency
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -18,7 +18,7 @@ Companion docs:
 | 1   | Safety fixes (initial) | **Complete** | `512da1d` |
 | 1.5 | Defensive crash-hardening (3-pass) | **Complete** | `14e9be8` |
 | 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete (this commit)** — see "Phase 1.6" below | this commit |
-| 2   | Concurrency hardening | **Largely subsumed by 1.5/1.6** — see below | — |
+| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 Push_Down race IMPLEMENTED + TSan-verified (this commit); 2.3 pending data; 2.5 deferred** — see below | this commit |
 | 3   | Spline / mapping accuracy | Pending Phase 0 data | — |
 | 4   | Diagnostics publisher | Can start after Phase 3 begins | — |
 | 5   | Regression tests | Last | — |
@@ -394,12 +394,14 @@ standalone justification.
 ## Phase 2 — Concurrency hardening
 
 **Status: 2.1 fixed (Phase 1.5 K1); 2.2 partially fixed (Phase 1.5 Fix C);
-2.3 still pending Phase 0 data; 2.4 (Push_Down race) design ready,
-implementation pending a ROS 2 + PCL toolchain.**
+2.3 still pending Phase 0 data; 2.4 (Push_Down race) IMPLEMENTED + TSan-verified
+(this commit); 2.5 (newly-found rebuild-path hazards) documented, deferred.**
 
 Three independent items. 2.1 was preempted by Phase 1.5 (defensive shared
 lock); 2.2's immediate race was closed by Phase 1.5 Fix C, full state-enum
-refactor still optional; 2.3 unchanged.
+refactor still optional; 2.3 unchanged. 2.4 landed once a ROS 2 + PCL toolchain
+was available to compile- and TSan-verify it; verification surfaced two
+pre-existing rebuild-path hazards now tracked as 2.5.
 
 ### 2.1 Verify ikd-Tree `Nearest_Search` lock contract
 
@@ -466,12 +468,46 @@ worker stalls, memory grows without backpressure. Fix:
 **Decision gate:** only do this if Phase 0 shows the buffers trend up under
 normal operation. On a clean system they should empty every IEKF cycle.
 
-### 2.4 Fix the ikd-Tree `Push_Down` child-write race — **DESIGN READY, IMPLEMENTATION PENDING**
+### 2.4 Fix the ikd-Tree `Push_Down` child-write race — **IMPLEMENTED + TSan-VERIFIED**
 
-**Status: full design below; implementation deliberately deferred until a
-ROS 2 + PCL toolchain is available to compile-verify it (`ikd_Tree.cpp`
-needs PCL; the refactor touches ~140 sites). This is the last known
-ikd-Tree race and the reason the `num_threads=1` mitigation exists.**
+**Status: landed this commit. The design (below) was implemented verbatim and
+compile-/TSan-verified once a ROS 2 + PCL toolchain became available. The
+`num_threads=1` mitigation is retired.**
+
+**Implementation (files `resple/include/ikd-Tree/ikd_Tree.{h,cpp}`):**
+- `KD_TREE_NODE`: `TreeSize`, `invalid_point_num`, `down_del_num` →
+  `std::atomic<int>`; the six deletion/propagation bools → `std::atomic<bool>`
+  (`<atomic>` added). `working_flag` stays a plain bool (rebuild handshake,
+  out of scope). Same-field-type assignments (`a = b` where both are atomic)
+  use explicit `.load()` since `atomic = atomic` selects the deleted copy.
+- `Push_Down`: fast lock-free pre-check; then PARENT `push_down_mutex_lock` for
+  the body and the CHILD's lock around each child block (incl. the `*Rebuild_Ptr`
+  branch, with `working_flag_mutex`/`Rebuild_Logger` nested inside the child
+  lock → order node→working_flag, no inversion). `|=` sites became `if (x) y =
+  true;`.
+- Search call site simplified to a bare `Push_Down(root)`.
+- Mutator flag-SET blocks in `Add_by_range`, `Delete_by_range`, and
+  `run_operation`'s PUSH_DOWN replay wrapped in the node's `push_down_mutex_lock`.
+
+**Verification performed:**
+- Standalone compile of `ikd_Tree.cpp` (all three explicit instantiations:
+  `PointXYZ`, `PointXYZI`, `PointXYZINormal`) clean under `-Wall -Wextra`.
+- New gtest `resple/test/test_ikdtree_concurrency.cpp` — phased stress mirroring
+  RESPLE's `mtx_map_` discipline (single-threaded delete/add arms a
+  need_push_down frontier; a barrier then releases N readers that push it down
+  concurrently). Functional run passes; the real gate is ThreadSanitizer.
+- **Before/after under TSan** (same test, pre-2.4 tree vs this commit):
+  reader-vs-reader `Push_Down` races on the node fields **16 → 0**. My new
+  per-node mutexes appear in **no** lock-order cycle.
+- See `resple/test/tsan_suppressions.txt` — it suppresses ONLY the two
+  pre-existing, independent hazards now tracked as **2.5**, never `Search` /
+  `Push_Down`, so a 2.4 regression still fails.
+
+The full original design is retained below for reference.
+
+---
+
+**Original race (documented in the old `Push_Down` comment block):**
 
 The race (documented in the `Push_Down` comment block, ikd_Tree.cpp ~1234):
 `Push_Down(P)` writes the propagation fields of P's CHILDREN
@@ -539,6 +575,35 @@ per-node mutex in the hot search path costs one uncontended pthread lock per
 node visited only when `need_push_down_to_*` is set (the pre-check skips the
 lock otherwise) — deletions are bursty (FOV segment + downsample), so the
 common search path stays lock-free.
+
+### 2.5 Pre-existing rebuild-path hazards surfaced by the 2.4 stress test — **DOCUMENTED, DEFERRED**
+
+**Status: found while TSan-verifying 2.4; present in the tree with AND without
+the 2.4 change (confirmed by running `test_ikdtree_concurrency` against the
+pre-2.4 code), so they are independent of 2.4 and out of its scope. Both are
+inherited from upstream HKU-MARS. Suppressed in `resple/test/tsan_suppressions.txt`
+so the 2.4 regression signal stays isolated.**
+
+1. **Rebuild-thread vs. mutator race on `father_ptr`.** `multi_thread_rebuild`
+   reads `(*Rebuild_Ptr)->father_ptr` (`ikd_Tree.cpp` ~255) while a concurrent
+   mutator's `Update` writes `left/right_son_ptr->father_ptr` (~1564). TSan
+   flags it as a data race. Likely benign in practice (pointer-sized aligned
+   write, and the swap is gated elsewhere) but not provably safe.
+2. **`working_flag_mutex` ↔ `search_rw_mutex_` lock-order inversion (potential
+   deadlock).** The inline `Rebuild` path (taken from `Add_by_*`/`Delete_by_*`
+   when `Criterion_Check` trips for a small subtree) holds `search_rw_mutex_`
+   unique and takes `working_flag_mutex`, while the background rebuild thread
+   holds `working_flag_mutex` and takes `search_rw_mutex_` unique
+   (`multi_thread_rebuild` ~258). TSan reports the cycle; under heavy
+   concurrent mutation+search it can actually hang (observed at high stress —
+   hence the gtest `TIMEOUT`). This is the more serious of the two.
+
+**Why deferred, not fixed here:** both live in the rebuild/`Update` machinery,
+not the `Push_Down` propagation that 2.4 targets; fixing them safely needs its
+own design pass and TSan gate. Hazard #2 in particular warrants a dedicated
+look (consistent lock ordering between the inline-rebuild swap and the
+background rebuild thread, or routing all rebuilds through the one thread).
+Tracked as a follow-up phase; do not fold into 2.4.
 
 ---
 

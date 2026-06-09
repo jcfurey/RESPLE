@@ -48,6 +48,7 @@
 #include <math.h>
 #include <algorithm>
 #include <memory.h>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <pcl/point_types.h>
@@ -102,15 +103,27 @@ public:
     {
         PointType point;
         int division_axis;
-        int TreeSize = 1;
-        int invalid_point_num = 0;
-        int down_del_num = 0;
-        bool point_deleted = false;
-        bool tree_deleted = false;
-        bool point_downsample_deleted = false;
-        bool tree_downsample_deleted = false;
-        bool need_push_down_to_left = false;
-        bool need_push_down_to_right = false;
+        // Deletion-propagation counters and flags (HARDENING Phase 2.4).
+        //
+        // These are written by Push_Down (which now holds the writer node's
+        // push_down_mutex_lock — the PARENT's lock for its own flag clears, the
+        // CHILD's lock for the child-field writes) and by the Add_/Delete_
+        // mutators (under that node's push_down_mutex_lock). They are read
+        // lock-free from the search hot paths (Search / Search_by_range /
+        // Search_by_radius / Criterion_Check / Update). Making them atomic is
+        // what makes those lock-free reads defined behaviour (TSan-clean); the
+        // per-node mutex provides the write-side mutual exclusion that closes
+        // the lost-update window on the bool flags. See ikd_Tree.cpp's Push_Down
+        // comment block for the full contract.
+        std::atomic<int> TreeSize{1};
+        std::atomic<int> invalid_point_num{0};
+        std::atomic<int> down_del_num{0};
+        std::atomic<bool> point_deleted{false};
+        std::atomic<bool> tree_deleted{false};
+        std::atomic<bool> point_downsample_deleted{false};
+        std::atomic<bool> tree_downsample_deleted{false};
+        std::atomic<bool> need_push_down_to_left{false};
+        std::atomic<bool> need_push_down_to_right{false};
         bool working_flag = false;
         pthread_mutex_t push_down_mutex_lock;
         float node_range_x[2], node_range_y[2], node_range_z[2];

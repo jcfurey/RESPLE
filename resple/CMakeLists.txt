@@ -301,6 +301,25 @@ if(BUILD_TESTING)
     endif()
   endforeach()
 
+  # ikd-Tree concurrency regression (HARDENING Phase 2.4 Push_Down race). Unlike
+  # the cores above this one needs PCL (pcl::PointXYZINormal) — a hard package
+  # dep — and compiles the kd-tree TU directly. It is a short multi-threaded
+  # stress; the TIMEOUT guards against the pre-existing rebuild-path deadlock
+  # (see resple/test/tsan_suppressions.txt) surfacing as a hang under load.
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/test_ikdtree_concurrency.cpp)
+    ament_add_gtest(test_ikdtree_concurrency
+      test/test_ikdtree_concurrency.cpp
+      include/ikd-Tree/ikd_Tree.cpp
+      TIMEOUT 120)
+    target_include_directories(test_ikdtree_concurrency PRIVATE
+      include ${PCL_INCLUDE_DIRS})
+    target_compile_definitions(test_ikdtree_concurrency PRIVATE ${PCL_DEFINITIONS})
+    if(TARGET Eigen3::Eigen)
+      target_link_libraries(test_ikdtree_concurrency Eigen3::Eigen)
+    endif()
+    target_link_libraries(test_ikdtree_concurrency ${PCL_LIBRARIES})
+  endif()
+
   # Full PCL + ROS 2 pipeline tests. These link the heavy stack and are NOT run
   # automatically (neither here nor in CI) — they are for a developer with a
   # full workspace. Enable explicitly:
