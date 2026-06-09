@@ -546,11 +546,18 @@ public:
                     }
                 }
             for (auto& [lidar_name, lidar_data] : lidars_data) {
-                while (!lidar_data.t_buff.empty()) {
+                while (true) {
                     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame(new pcl::PointCloud<pcl::PointXYZINormal>());
                     int64_t time_begin;
                     {
                         std::lock_guard<std::mutex> lock(lidar_data.mtx_pc);
+                        // Check emptiness UNDER mtx_pc. This used to be the
+                        // while-condition (`while (!t_buff.empty())`) read outside
+                        // the lock, racing with the sensor callback's locked
+                        // push_back on the same deque (TSan-flagged data race on
+                        // the deque internals — same class as the Phase 1.5 IMU
+                        // imu_int_buff fix).
+                        if (lidar_data.t_buff.empty()) break;
                         pc_frame->points = lidar_data.pc_buff.front();
                         lidar_data.pc_buff.pop_front();
                         time_begin = lidar_data.t_buff.front();
@@ -2631,10 +2638,22 @@ private:
         // negative components, biasing the local-map cube ~500m off-axis.
         Eigen::Vector3d pos_lidar_max(std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(),
                 std::numeric_limits<double>::lowest());
-        for (const auto& [lidar_name, lidar] : lidars) {
-            Eigen::Vector3d pos_lidar = getPositionLiDAR(spline->maxTimeNs(), lidar.t_bl);
-            pos_lidar_min = pos_lidar_min.array().min(pos_lidar.array()).matrix();
-            pos_lidar_max = pos_lidar_max.array().max(pos_lidar.array()).matrix();
+        {
+            // Read the spline (maxTimeNs + getPositionLiDAR's itpPosition/
+            // itpQuaternion) under spline_mutex_. lasermapFovSegment runs in the
+            // async map-update task holding mtx_map_ UNIQUE, but the worker grows
+            // the spline (collectMeasurements -> addOneStateKnot) under
+            // spline_mutex_ ALONE (no mtx_map_) — so mtx_map_ does not exclude
+            // that write and the previously-unlocked read here raced with it
+            // (TSan-flagged). Lock order mtx_map_ -> spline_mutex_ is preserved
+            // (the caller already holds mtx_map_ unique). getPositionLiDAR is
+            // pure-read and takes no lock itself, so no double-lock.
+            std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+            for (const auto& [lidar_name, lidar] : lidars) {
+                Eigen::Vector3d pos_lidar = getPositionLiDAR(spline->maxTimeNs(), lidar.t_bl);
+                pos_lidar_min = pos_lidar_min.array().min(pos_lidar.array()).matrix();
+                pos_lidar_max = pos_lidar_max.array().max(pos_lidar.array()).matrix();
+            }
         }
         if (!localmap_initialized_){
             for (int i = 0; i < 3; i++){

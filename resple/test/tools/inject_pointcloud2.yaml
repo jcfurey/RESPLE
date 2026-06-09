@@ -1,0 +1,31 @@
+/**:
+  ros__parameters:
+    odom/frame_id: odom
+    map/frame_id: map
+    frame_id: base_link
+    odom/publish_tf: true
+    map/publish_tf: false
+    publish_tf: true
+    topic_imu: /imu/data
+    acc_ratio: false
+    knot_hz: 100
+    if_lidar_only: false
+    ds_scan_voxel: 0.2
+    ds_lm_voxel: 0.2
+    nn_thresh: 0.5
+    num_match_points: 8
+    cube_len: 1000.0
+    n_iter: 1
+    num_points_upd: 500
+    num_threads: 4
+    imu_init_num_samples: 50
+    imu_init_max_variance: 5.0
+    lidars: ["Generic"]
+    Generic:
+      topic_lidar: /points
+      lidar_type: PointCloud2
+      scan_line: 0
+      blind: 0.5
+      q_lb: [1.0, 0.0, 0.0, 0.0]
+      t_lb: [0.0, 0.0, 0.0]
+      w_pt: 0.01

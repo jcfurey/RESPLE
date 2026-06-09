@@ -200,8 +200,18 @@ was mutating `Estimator::cov_rcp` from inside the async map-update lambda,
 which holds only `mtx_map_` (unique) — not `spline_mutex_`. The mutation
 was race-free only because the IEKF needs `mtx_map_` shared and was
 blocked, but the implicit lock-coupling was fragile. The function is now
-pure-read; lock discipline matches the documented contract. If you re-add
-a mutating call here, take `spline_mutex_` first or refactor the caller.
+pure-read; if you re-add a mutating call here, take `spline_mutex_` first
+or refactor the caller.
+
+**It is pure-read but it still READS the spline** (`itpPosition` /
+`itpQuaternion`), so its single caller `lasermapFovSegment` must hold
+`spline_mutex_` around the call. The "race-free because the IEKF holds
+`mtx_map_` shared" reasoning above does NOT cover the spline *read*: the
+worker grows the spline via `collectMeasurements → addOneStateKnot` under
+`spline_mutex_` **alone** (no `mtx_map_`), so `mtx_map_` unique does not
+exclude that write. The async task reading the spline under only `mtx_map_`
+raced with it (TSan, data-path sweep). Fixed by taking `spline_mutex_` in
+`lasermapFovSegment` (order `mtx_map_ → spline_mutex_` preserved).
 
 ### ikd-Tree `Nearest_Search` always takes the shared lock
 
@@ -356,6 +366,8 @@ reference (status as of latest pass):
 | 33 | `ikd-Tree::Push_Down` writes to children's flag fields holding only the parent's per-node lock → races on overlapping subtree paths (dominant caller: findCorresp's OpenMP parallel `Nearest_Search`) | **fixed** (Phase 2.4: `Push_Down` takes the parent's *and* the child's `push_down_mutex_lock`; mutator flag-SET sites take the node's lock; the racy node fields are `std::atomic`; `num_threads=1` mitigation retired). TSan-verified reader-vs-reader races 16→0 via `test_ikdtree_concurrency` | 2.4 |
 | 34 | `working_flag_mutex`↔`search_rw_mutex_` lock-order inversion (real deadlock): Phase 1.5 K1 wrapped the *mutating* fast-path calls in `Add_Points`/`Delete_Points`/etc. in `search_rw_mutex_` shared, but those take `working_flag_mutex` at a deeper rebuild boundary — opposite order to the rebuild thread (`working_flag`→`search_rw` unique). TSan-confirmed; observed to hang | **fixed** (Phase 2.5 #2: drop the shared lock from the 5 mutating fast paths — mutators self-coordinate via `working_flag_mutex`, the upstream mechanism; K1's lock kept on the *search* fns + the genuine `Search_by_range` read). Verified deadlock-free under TSan | 2.5 |
 | 35 | ikd-Tree background rebuild thread vs. concurrent mutator data race on `KD_TREE_NODE` fields (`father_ptr` at `multi_thread_rebuild` ~255 vs `Update` ~1564; ancestor Update-walk during swap) | **documented, deferred to Phase 2.5 #1** (pre-existing upstream HKU-MARS baseline — vanilla ikd-Tree races identically; benign in testing, `err=0`; only the aggressive focused stress triggers it, suppressed in `resple/test/tsan_suppressions.txt`) | 2.5 |
+| 36 | `processData` lidar-buffer drain checked `while (!lidar_data.t_buff.empty())` OUTSIDE `mtx_pc`, racing the sensor callback's locked `t_buff.push_back` on the deque internals | **fixed** (Phase 2.6: check emptiness under `mtx_pc` — `while(true){ lock; if(empty) break; … }`). TSan data-path sweep, real-race count 18→0 | 2.6 |
+| 37 | async map-update task read the spline (`lasermapFovSegment → getPositionLiDAR → itpPosition/itpQuaternion`) holding only `mtx_map_`, while the worker grows the spline (`collectMeasurements → addOneStateKnot`) under `spline_mutex_` ALONE (no `mtx_map_`) → race | **fixed** (Phase 2.6: take `spline_mutex_` in `lasermapFovSegment`; order `mtx_map_ → spline_mutex_` preserved). TSan-verified | 2.6 |
 
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7

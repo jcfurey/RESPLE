@@ -18,7 +18,7 @@ Companion docs:
 | 1   | Safety fixes (initial) | **Complete** | `512da1d` |
 | 1.5 | Defensive crash-hardening (3-pass) | **Complete** | `14e9be8` |
 | 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete (this commit)** — see "Phase 1.6" below | this commit |
-| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 Push_Down race + 2.5 #2 rebuild deadlock FIXED + TSan-verified; 2.3 pending data; 2.5 #1 rebuild-vs-mutator race deferred** — see below | this commit |
+| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 Push_Down race + 2.5 #2 deadlock + 2.6 two data-path races FIXED + TSan-verified; 2.3 pending data; 2.5 #1 rebuild-vs-mutator race deferred** — see below | this commit |
 | 3   | Spline / mapping accuracy | Pending Phase 0 data | — |
 | 4   | Diagnostics publisher | Can start after Phase 3 begins | — |
 | 5   | Regression tests | Last | — |
@@ -645,6 +645,64 @@ rebuild thread's critical sections) without self-deadlocking on the internal
 boundary acquisition; or routing all rebuilds through the single background
 thread; or making the few raced `KD_TREE_NODE` pointer/aggregate fields atomic.
 Each needs bag-replay validation (no bag available yet) before landing.
+
+---
+
+## Phase 2.6 — Live data-path TSan sweep (synthetic injection) — **2 races FIXED**
+
+**Status: the Phase 0 sanitizer sweep, finally run against the LIVE data path.**
+
+The earlier lifecycle-only sanitizer runs (TSan + ASan, clean) never exercised
+the data-processing concurrency because no LiDAR/IMU data flowed. With the ROS
+Python stack unusable in the sandbox (`rclpy`'s `_rclpy_pybind11` C extension is
+absent, so `ros2`/`ros2 bag`/`launch_test` don't run), a small **C++ rclcpp
+injector** drives the node instead: it publishes static TF + stationary IMU
+(100 Hz) + a static "room" `PointCloud2` (10 Hz) with zero motion, so the
+estimator gravity-inits, tracks at the origin, and the worker runs its full
+pipeline (deskew → `findCorresp` parallel k-NN → IEKF → `mapIncremental`
+`Add_Points` → `lasermapFovSegment` `Delete_Point_Boxes` → spline growth).
+
+**Method note (important for anyone repeating this):** with the default
+`num_threads=4`, TSan reports ~253 races, but the vast majority are **GCC
+`libgomp` false positives** — TSan does not model libgomp's parallel-for
+barriers, so it flags benign accesses across the implicit barrier between IEKF
+phases. Re-running with `num_threads=1` (OpenMP serialized) collapses that to
+**18 genuine cross-thread races**, which are the real signal. (A bag replay
+should use the same `num_threads=1` trick, or a TSan-aware OpenMP runtime.)
+
+The 18 reduced to two distinct real bugs, both now fixed (TSan before/after:
+18 → 0 with `num_threads=1`, the known 2.5 #1 rebuild race suppressed):
+
+1. **Lidar input-buffer `empty()` race (`RESPLE.cpp` ~549).** `processData`
+   drained the per-LiDAR buffer with `while (!lidar_data.t_buff.empty())` — the
+   `empty()` read was OUTSIDE `mtx_pc`, racing the sensor callback's locked
+   `t_buff.push_back` on the deque internals. Exactly the bug class Phase 1.5
+   Fix C closed for the IMU `imu_int_buff`, but on the LiDAR path. **Fix:** check
+   emptiness under `mtx_pc` (`while (true) { lock; if (empty) break; … }`).
+
+2. **Spline read in the async map task without `spline_mutex_`
+   (`RESPLE.cpp` `lasermapFovSegment`).** The async map-update task read the
+   spline via `getPositionLiDAR → itpPosition/itpQuaternion` holding only
+   `mtx_map_` (unique), while the worker GROWS the spline via
+   `collectMeasurements → addOneStateKnot` under `spline_mutex_` **alone** (no
+   `mtx_map_`). So `mtx_map_` unique did NOT exclude that write — the unlocked
+   read raced with it. The `getPositionLiDAR` "race-free" comment only accounted
+   for the IEKF spline *reads* (which hold `mtx_map_` shared), not the
+   `collectMeasurements` spline *writes*. **Fix:** take `spline_mutex_` around
+   the spline reads in `lasermapFovSegment`; lock order `mtx_map_ → spline_mutex_`
+   is preserved (the async task already holds `mtx_map_` unique, and the worker's
+   spline-growth path holds `spline_mutex_` alone, so no cycle).
+
+**Verification:** `colcon build` (TSan and RelWithDebInfo) green; the synthetic
+injector reaches steady state (IEKF running, spline growing); TSan real-race
+count 18 → 0. The sweep is reproducible via `./scripts/run_data_sweep.sh`
+(injector package + config under `resple/test/tools/`). For a
+production-confidence pass, replay a real bag through the same TSan build with
+`num_threads=1`.
+
+**Also confirmed (not bugs):** the lifecycle/shutdown paths are TSan- AND
+ASan/UBSan-clean; and `Spline Knots` grows unboundedly under zero pruning
+(hazard 4 / Phase 3.1 — expected, measured live here for the first time).
 
 ---
 
