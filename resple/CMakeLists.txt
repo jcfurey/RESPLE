@@ -298,6 +298,14 @@ if(BUILD_TESTING)
       if(TARGET Eigen3::Eigen)
         target_link_libraries(${_test_name} Eigen3::Eigen)
       endif()
+      # -DEIGEN_USE_BLAS is added globally above when BLAS is found, so every
+      # target that exercises Eigen's matrix-product paths (e.g. the geometry
+      # core's Cholesky/GEMM) must also LINK BLAS or it fails with undefined
+      # references to dgemm_/dtrmm_/... The main library links it at the bottom;
+      # the test executables need it too.
+      if(BLAS_FOUND)
+        target_link_libraries(${_test_name} ${BLAS_LIBRARIES})
+      endif()
     endif()
   endforeach()
 
@@ -318,6 +326,9 @@ if(BUILD_TESTING)
       target_link_libraries(test_ikdtree_concurrency Eigen3::Eigen)
     endif()
     target_link_libraries(test_ikdtree_concurrency ${PCL_LIBRARIES})
+    if(BLAS_FOUND)
+      target_link_libraries(test_ikdtree_concurrency ${BLAS_LIBRARIES})
+    endif()
   endif()
 
   # Full PCL + ROS 2 pipeline tests. These link the heavy stack and are NOT run
@@ -340,6 +351,9 @@ if(BUILD_TESTING)
         ament_target_dependencies(${_it_name}
           ${${PROJECT_NAME}_FOUND_BUILD_DEPENDS})
         target_link_libraries(${_it_name} ${PCL_LIBRARIES})
+        if(BLAS_FOUND)
+          target_link_libraries(${_it_name} ${BLAS_LIBRARIES})
+        endif()
       endif()
     endforeach()
     # The launch_testing pipeline test is registered via add_launch_test so it
