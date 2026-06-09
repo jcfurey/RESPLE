@@ -19,8 +19,10 @@ colcon test --packages-select resple
 ```
 
 What they guard: plane-fit recovery + degenerate cases, Joseph-form covariance
-(symmetry/PSD), NIS, and generic PointCloud2 field resolution / multi-datatype
-& endianness reads / time normalization.
+(symmetry/PSD), NIS, generic PointCloud2 field resolution / multi-datatype
+& endianness reads / time normalization, and the runtime health monitors
+(windowed NIS divergence detection with hysteresis, IMU fault detection:
+NaN/saturation/stuck/time-jump/noise/bias).
 
 ## 2. Integration tests — full PCL + ROS 2, run manually
 

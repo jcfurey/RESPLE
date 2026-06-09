@@ -27,6 +27,7 @@ enable_testing()
 set(RESPLE_TEST_SOURCES
   test_geometry_core.cpp
   test_point_cloud_adapter.cpp
+  test_filter_health.cpp
 )
 
 foreach(src ${RESPLE_TEST_SOURCES})

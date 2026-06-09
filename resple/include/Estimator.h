@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include "SplineState.h"
 #include "Association.h"
 
@@ -19,6 +20,14 @@ class Estimator
     // thread while the worker is mid-IEKF. Monotonic; no reset — the diagnostics
     // publisher snapshots deltas.
     std::atomic<uint64_t> num_numerical_failures_{0};
+
+    // NIS (normalized innovation squared) of the most recent update() call,
+    // consumed by the HARDENING §3.3 divergence detector
+    // (utils/filter_health.h). NaN when that update was skipped for numerical
+    // reasons — the detector counts a non-finite NIS as a breach. Written and
+    // read on the worker thread only (not atomic by design).
+    double lastNis() const { return last_nis_; }
+    int lastNisDof() const { return last_nis_dof_; }
 
     Estimator() {};
 
@@ -395,6 +404,10 @@ class Estimator
     // P_post = (I - KH) P_prior (I - KH)^T + K R K^T -- numerically PSD-preserving
     // in floating point, unlike the simpler (I - KH) P_prior form.
     Eigen::Matrix<double, XSIZE, XSIZE> cov_post_ = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
+    // See lastNis(): measurement-space NIS nu^T S^{-1} nu of the latest
+    // update(); NaN if that update failed. Written by update() only.
+    double last_nis_ = std::numeric_limits<double>::quiet_NaN();
+    int last_nis_dof_ = 0;
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> cov_inv_buf_;
@@ -595,8 +608,12 @@ class Estimator
         const Eigen::Matrix<double, XSIZE, 1>& x_prop, const Eigen::Matrix<double, XSIZE, XSIZE>& cov_prop)
     {
         int num_pts = innov.rows();
+        // Pessimistic default: any early (failure) exit leaves NIS = NaN so the
+        // divergence detector counts the skipped update as a breach.
+        last_nis_dof_ = num_pts;
+        last_nis_ = std::numeric_limits<double>::quiet_NaN();
         Eigen::Matrix<double, XSIZE, 1> RCPs_post;
-        Eigen::MatrixXd I_X = Eigen::MatrixXd::Identity(XSIZE, XSIZE); 
+        Eigen::MatrixXd I_X = Eigen::MatrixXd::Identity(XSIZE, XSIZE);
         if (num_pts > XSIZE) {
             auto llt_prop = cov_prop.llt();
             if (llt_prop.info() != Eigen::Success) {
@@ -619,6 +636,17 @@ class Estimator
             Eigen::Matrix<double, XSIZE, XSIZE> S_inv = llt_S.solve(I_X);
             Eigen::Matrix<double, XSIZE, RSIZE> K;
             K.noalias() = S_inv * HT_R_inv;
+
+            // Measurement-space NIS via the Woodbury identity: with
+            // S = P^{-1} + H^T R^{-1} H (the state-space matrix factored above),
+            //   nu^T (H P H^T + R)^{-1} nu = nu^T R^{-1} nu - b^T S^{-1} b,
+            // where b = H^T R^{-1} nu. Reuses the existing Cholesky factor, so
+            // the extra cost is one XSIZE-vector solve and two dot products.
+            {
+                const Eigen::Matrix<double, RSIZE, 1> Rinv_nu = R_inv.cwiseProduct(innov);
+                const Eigen::Matrix<double, XSIZE, 1> b = H.transpose() * Rinv_nu;
+                last_nis_ = innov.dot(Rinv_nu) - b.dot(llt_S.solve(b));
+            }
 
             KH.noalias() = S_inv * HT_R_inv_H;
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
@@ -644,6 +672,9 @@ class Estimator
             Eigen::Matrix<double, XSIZE, RSIZE> K;
             K.noalias() = cov_prop * H.transpose() * lu_S.inverse();
             KH.noalias() = K * H;
+            // Measurement-space NIS directly from S = H P H^T + R (already
+            // factored for the gain): nu^T S^{-1} nu.
+            last_nis_ = innov.dot(lu_S.solve(innov));
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
             Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;
             RCPs_post.noalias() = getState() + deltax;
@@ -662,6 +693,9 @@ class Estimator
         // reset-to-prior + numerical-failure-counter path.
         if (!cov_post_.allFinite() || !RCPs_post.allFinite()) {
             std::cerr << "[Estimator] non-finite posterior/state update, skipping\n";
+            // A rejected update is a consistency breach regardless of the NIS
+            // value computed mid-branch — restore the NaN sentinel.
+            last_nis_ = std::numeric_limits<double>::quiet_NaN();
             return false;
         }
         updateState(RCPs_post);

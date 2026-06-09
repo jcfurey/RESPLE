@@ -71,6 +71,7 @@
 #include "estimate_msgs/action/save_map.hpp"
 #include "Estimator.h"
 #include "utils/point_cloud_ingest.h"
+#include "utils/filter_health.h"
 #ifdef RESPLE_USE_CUDA
 #include "gpu/cuda_knn.h"
 #endif
@@ -701,6 +702,32 @@ public:
                     }
                 }
                 {
+                    // HARDENING §3.3: feed the windowed NIS consistency
+                    // detector with the final IEKF iteration's innovation
+                    // statistic (NaN when the update was skipped — counted as
+                    // a breach). Worker-thread state; verdicts exported via
+                    // atomics for the executor-thread diagnostics.
+                    double nis_v;
+                    int nis_dof;
+                    if (if_lidar_only) {
+                        nis_v = estimator_lo.lastNis();
+                        nis_dof = estimator_lo.lastNisDof();
+                    } else {
+                        nis_v = estimator_lio.lastNis();
+                        nis_dof = estimator_lio.lastNisDof();
+                    }
+                    const auto fh_state = nis_detector_.feed(nis_v, nis_dof);
+                    filter_health_state_.store(static_cast<int>(fh_state), std::memory_order_relaxed);
+                    nis_window_mean_.store(nis_detector_.lastWindowMean(), std::memory_order_relaxed);
+                    if (fh_state == resple::health::FilterState::DIVERGED) {
+                        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "[RESPLE] NIS divergence detected: windowed NIS mean %.2fx dof "
+                            "(consistent filter expects ~1.0). The filter is over-confident "
+                            "or correspondences are inconsistent — pose covariance is no "
+                            "longer trustworthy.", nis_detector_.lastWindowMean());
+                    }
+                }
+                {
                     // pointBodyToWorld reads spline; keep serialized with
                     // IEKF writes via spline_mutex_.
                     std::lock_guard<std::mutex> spline_lock(spline_mutex_);
@@ -941,6 +968,17 @@ private:
     std::atomic<int64_t> cached_lidar_buf_{0};
     std::atomic<int64_t> cached_imu_buf_{0};
     std::atomic<int64_t> cached_pt_meas_{0};
+    // HARDENING §3.3 runtime health monitors (utils/filter_health.h).
+    // nis_detector_ is fed by the worker thread only; imu_health_ is fed by
+    // getImuCallback under m_buff (sensor callbacks are mutually exclusive).
+    // The atomics export their verdicts to updateDiagnostics on the executor
+    // thread, same pattern as the cached_* metrics above.
+    resple::health::NisDivergenceDetector nis_detector_;
+    resple::health::ImuHealthMonitor imu_health_;
+    std::atomic<int> filter_health_state_{0};        // FilterState as int
+    std::atomic<double> nis_window_mean_{0.0};
+    std::atomic<uint32_t> imu_fault_bits_{0};
+    std::atomic<double> imu_gyro_bias_norm_{0.0};
     // Per-window baseline for IEKF numerical-failure deltas (published as a
     // per-second rate, not a cumulative count).
     uint64_t last_numerical_failures_lo_ = 0;
@@ -1241,6 +1279,20 @@ private:
         if_lidar_only = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "if_lidar_only", false);
         if (!if_lidar_only) {
             acc_ratio = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "acc_ratio", false);
+
+            // HARDENING §3.3 divergence-detector tuning. Defaults suit the
+            // 20 Hz worker; with nis_window=32 a verdict lands every ~1.6 s
+            // and nis_breach_limit=3 means ~5 s of sustained inconsistency
+            // before DIVERGED is declared.
+            {
+                resple::health::NisDetectorConfig nis_cfg;
+                nis_cfg.window = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "nis_window", 32);
+                nis_cfg.warn_ratio = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "nis_warn_ratio", 2.0);
+                nis_cfg.diverged_ratio = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "nis_diverged_ratio", 4.0);
+                nis_cfg.breach_limit = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "nis_breach_limit", 3);
+                nis_detector_ = resple::health::NisDivergenceDetector(nis_cfg);
+                imu_health_ = resple::health::ImuHealthMonitor(resple::health::ImuHealthConfig{});
+            }
             std::vector<double> bias_acc_var = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_ba", {0.2, 0.2, 0.2});
             cov_ba << bias_acc_var.at(0), bias_acc_var.at(1), bias_acc_var.at(2);
             std::vector<double> bias_gyro_var = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_bg", {0.2, 0.2, 0.2});
@@ -1477,6 +1529,29 @@ private:
             return;
         }
 
+        // IMU input-quality monitor (HARDENING §3.3): every sample the
+        // pipeline will actually consume passes through here (pre-init in any
+        // mode, post-init in LIO). acc_ratio configs deliver accel in g —
+        // scale to m/s^2 to match the monitor's gravity-based checks (the
+        // same scaling the worker applies when it consumes the buffer).
+        {
+            const auto& a = imu_msg->linear_acceleration;
+            const auto& w = imu_msg->angular_velocity;
+            const double a_scale = acc_ratio ? 9.81 : 1.0;
+            const auto& imu_rep = imu_health_.feed(
+                rclcpp::Time(imu_msg->header.stamp).nanoseconds(),
+                Eigen::Vector3d(w.x, w.y, w.z),
+                a_scale * Eigen::Vector3d(a.x, a.y, a.z));
+            imu_fault_bits_.store(imu_rep.faults, std::memory_order_relaxed);
+            imu_gyro_bias_norm_.store(imu_rep.gyro_bias.norm(), std::memory_order_relaxed);
+            if (!imu_rep.ok()) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                    "[RESPLE] IMU health faults=0x%x (1=non-finite 2=accel-sat "
+                    "4=gyro-sat 8=stuck 16=time-jump 32=noisy 64=bias-large)",
+                    imu_rep.faults);
+            }
+        }
+
         // One-shot confirmation that IMU data is actually flowing — pairs
         // with the "Waiting for N IMU samples" warn so users can tell at a
         // glance whether the bag is producing IMU or the topic is wrong.
@@ -1601,6 +1676,27 @@ private:
             && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
             level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
             msg = "IEKF numerical update failures observed this window";
+        }
+
+        // HARDENING §3.3: NIS consistency verdict + IMU input health.
+        const int fh_state = filter_health_state_.load(std::memory_order_relaxed);
+        const char* fh_str = (fh_state == 2) ? "DIVERGED"
+                            : (fh_state == 1) ? "WARN" : "OK";
+        stat.add("Filter Consistency (NIS)", fh_str);
+        stat.add("NIS Window Mean (x dof, ~1 healthy)",
+                 nis_window_mean_.load(std::memory_order_relaxed));
+        const uint32_t imu_faults = imu_fault_bits_.load(std::memory_order_relaxed);
+        stat.add("IMU Fault Bits", static_cast<int>(imu_faults));
+        stat.add("IMU Gyro Bias (rad/s, stationary est.)",
+                 imu_gyro_bias_norm_.load(std::memory_order_relaxed));
+        if (fh_state == 2) {
+            level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+            msg = "Filter divergence detected (windowed NIS)";
+        } else if ((fh_state == 1 || imu_faults != 0)
+                   && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+            level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            msg = (fh_state == 1) ? "Filter consistency warning (windowed NIS)"
+                                  : "IMU input faults detected";
         }
 
         stat.summary(level, msg);

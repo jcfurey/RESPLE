@@ -508,23 +508,40 @@ clusters). No counters for dropped candidates.
 **Complexity: low-medium.** Numerical impact depends on parameter choices;
 benchmark against a known-good bag.
 
-### 3.3 Divergence detection and recovery
+### 3.3 Divergence detection and recovery — **DETECTION DONE**
 
-After each IEKF pass, the filter's health is invisible externally. Bad
-posterior covariance (collapse or NaN) propagates into published odometry
+After each IEKF pass, the filter's health was invisible externally. Bad
+posterior covariance (collapse or NaN) propagated into published odometry
 and downstream consumers without any warning.
 
-**Work:**
-- Compute posterior covariance trace and `λ_min` (via `SelfAdjointEigenSolver`).
-- Check: trace finite, `λ_min > 0`, no NaN in state.
-- Publish a `/localization/resple/status` topic with the health bool + the
-  metrics.
-- Action on trip: either (a) hold last estimate + skip publish until a stable
-  scan recovers it, or (b) reset filter with the last good pose.
+**Implemented (detection + IMU input health):**
+- `Estimator::update()` now computes the measurement-space NIS
+  `nu^T (H P H^T + R)^{-1} nu` in both branches (directly from the factored
+  `S` in the small-measurement branch; via the Woodbury identity reusing the
+  existing Cholesky factor in the information-form branch). A failed/skipped
+  update reports NIS = NaN. Exposed via `lastNis()` / `lastNisDof()`.
+- `utils/filter_health.h::NisDivergenceDetector` (unit-tested, ROS-free):
+  windowed NIS mean vs. dof with WARN / DIVERGED thresholds, consecutive-
+  breach counting, and hysteresis recovery. Fed by the worker each IEKF
+  cycle; verdict + window mean exported to diagnostics ("Filter Consistency
+  (NIS)"), with a throttled ERROR log on DIVERGED. Tunables:
+  `nis_window` (32), `nis_warn_ratio` (2.0), `nis_diverged_ratio` (4.0),
+  `nis_breach_limit` (3).
+- `utils/filter_health.h::ImuHealthMonitor` (unit-tested, ROS-free): per-
+  sample NaN / saturation / stuck-sensor / time-jump faults plus windowed
+  stationary noise-floor and bias estimates — aimed at poor built-in IMUs
+  (e.g. Ouster). Fed in `getImuCallback` (with `acc_ratio` scaling applied);
+  fault bits + stationary gyro-bias norm exported to diagnostics, throttled
+  WARN on faults.
 
-**Complexity: medium.** Eigendecomposition on 24x24 / 30x30 is cheap
-(< 1 ms). Choice of (a) vs. (b) is a policy decision — (a) is safer
-operationally, (b) recovers faster from a real divergence.
+**Remaining (recovery policy):**
+- Action on trip: either (a) hold last estimate + skip publish until a stable
+  scan recovers it, or (b) reset filter with the last good pose. This is a
+  policy decision — (a) is safer operationally, (b) recovers faster from a
+  real divergence. Detection currently logs + escalates diagnostics to ERROR
+  so downstream consumers can gate on `/diagnostics`; no automatic reset yet.
+- Optional: covariance trace / `λ_min` metrics on a dedicated status topic
+  (the NIS verdict largely subsumes them for divergence purposes).
 
 ### 3.4 Map pruning policy
 
