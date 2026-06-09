@@ -264,6 +264,39 @@ executable and the `Mapping` standalone executable. The component registration
 is `PLUGIN "RESPLE" EXECUTABLE RESPLE_node` — we launch the executable, not
 the composable node.
 
+### Building (full colcon build, incl. in a web session)
+
+One command from the repo root:
+
+```bash
+./scripts/build_workspace.sh          # build --packages-up-to resple
+./scripts/build_workspace.sh --test   # + colcon test
+```
+
+It assembles a clean workspace and builds against the real ROS 2 / PCL stack.
+The dependency-light estimator-core tests build/run without ROS at all via
+`./scripts/run_unit_tests.sh` (Eigen + GTest; the ikd-Tree concurrency test
+additionally needs PCL and is gated on it).
+
+Non-obvious things the script and the SessionStart hook handle (learned the
+hard way bringing the full build up on Claude Code on the web):
+
+- **The Livox message packages are already in this repo**, just under other
+  directory names: `AviaResple_msgs`=`livox_interfaces`,
+  `Mid70Avia_msgs`=`livox_ros_driver`, `HAP360_msgs`=`livox_ros_driver2` (plus
+  `estimate_msgs`). No external clones — the script symlinks them into the ws.
+- **ROS apt over http.** Some network policies 503 the TLS `packages.ros.org`
+  but allow plain http; apt still verifies the GPG signature, so the hook adds
+  an `http://` source as a fallback.
+- **NumPy + the right Python.** rosidl's message generator does
+  `find_package(Python3 ... NumPy)`. The image has several Pythons and
+  `/usr/local/bin/python3` may be a 3.11 with no working NumPy; the script picks
+  an interpreter that can import NumPy (prefers the ROS `python3.12`) and passes
+  it as `-DPython3_EXECUTABLE`. The hook installs `python3-numpy`/`python3-dev`.
+- **BLAS must be linked by test targets.** `-DEIGEN_USE_BLAS` is added globally,
+  so every gtest that touches Eigen matrix products links `${BLAS_LIBRARIES}`
+  (hook installs `libblas-dev`/`liblapack-dev`).
+
 ## Hardening status
 
 Full phased roadmap and rationale in **[`HARDENING.md`](HARDENING.md)** (same
