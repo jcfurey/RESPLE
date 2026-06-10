@@ -394,7 +394,7 @@ standalone justification.
 ## Phase 2 — Concurrency hardening
 
 **Status: 2.1 fixed (Phase 1.5 K1); 2.2 partially fixed (Phase 1.5 Fix C);
-2.3 still pending Phase 0 data; 2.4 (Push_Down race) IMPLEMENTED + TSan-verified;
+2.3 capability landed (drop-oldest caps + counters; scan cap default-off); 2.4 (Push_Down race) IMPLEMENTED + TSan-verified;
 2.5 #2 (rebuild lock-order deadlock) FIXED + TSan-verified; 2.5 #1
 (rebuild-vs-mutator data race) FIXED + TSan-verified (recursive whole-op
 working_flag_mutex — see 2.5 below).**
@@ -458,17 +458,30 @@ state atomic — more explicit, less fragile.
 **Cost:** small refactor across `on_activate`, `on_deactivate`, `on_cleanup`,
 `getImuCallback`, `initialization()`. Can be done without Phase 0 data.
 
-### 2.3 Bounded input buffers
+### 2.3 Bounded input buffers — **IMPLEMENTED (scan cap off by default)**
 
-`pc_buff` (per-LiDAR) and `imu_int_buff` are unbounded `std::deque`s. If the
-worker stalls, memory grows without backpressure. Fix:
-- Parameter-configurable max size (default: sized from Phase 0 measured peak
-  × 2).
-- Drop-oldest on overflow.
-- Counter published in diagnostics (`… dropped this window`).
+`pc_buff` (per-LiDAR) was unbounded; `imu_int_buff` had a HARDCODED
+drop-oldest cap of 2000 (uncounted, unparameterized).
 
-**Decision gate:** only do this if Phase 0 shows the buffers trend up under
-normal operation. On a clean system they should empty every IEKF cycle.
+**Implemented (this commit):**
+- `max_scan_buffer` (scans per LiDAR, default **0 = unbounded** — the
+  decision gate asked for live evidence of growth under NORMAL operation,
+  and the growth observed so far came from a deliberately overloaded
+  sandbox worker, so the cap ships as an operational knob rather than a
+  default). All 7 LiDAR callbacks push through one `pushScanBounded`
+  helper: drop-oldest of `pc_buff`+`t_buff` in lock-step under `mtx_pc`.
+- `max_imu_staging` (samples, default **2000** = the previously hardcoded
+  value; 0 disables) replaces the magic constant in `getImuCallback`.
+- Drops are counted (`dropped_scans_` / `dropped_imu_` atomics) and exposed
+  in BOTH the `diagnostic_updater` output ("Scans/IMU Samples Dropped") and
+  the Phase 4 `Diagnostics` message — non-zero means the caps are engaging
+  (worker not keeping up with the sensors).
+
+**Verification:** live injector run with deliberately tight caps
+(`max_scan_buffer=2`, `max_imu_staging=300`, `num_threads=1`): staging depth
+pins at exactly 300, drop counters advance (127 scans / 200 samples), and
+the estimator stays healthy under the backpressure (NIS ~1–3, state OK,
+IEKF at full rate) — graceful degradation instead of unbounded growth.
 
 ### 2.4 Fix the ikd-Tree `Push_Down` child-write race — **IMPLEMENTED + TSan-VERIFIED**
 

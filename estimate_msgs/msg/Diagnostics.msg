@@ -41,6 +41,10 @@ uint64 deskew_out_of_range  # cumulative out-of-spline-range deskew queries
 int64 map_size              # ikd-tree node count
 uint64 map_radius_prunes    # §3.4 radius-prune operations, cumulative
 
+# --- bounded-buffer drops (§2.3, cumulative; non-zero = caps engaging) ---
+uint64 dropped_scans
+uint64 dropped_imu
+
 # --- worker stage timings, last frame (ms) ---
 float32 drain_ms            # buffer drain + measurement collection
 float32 iekf_ms             # propRCP + updateIEKF*

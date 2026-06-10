@@ -319,7 +319,7 @@ directory). Summary:
 | 0   | Instrumentation + sanitizer builds | code complete (`74f9078`); bag replay pending |
 | 1   | Safety fixes (initial)             | complete (`512da1d`) |
 | 1.5 | Defensive crash-hardening          | complete (`14e9be8`) — 13 fixes across 3 passes |
-| 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 still pending Phase 0 data |
+| 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 capability landed (default-off scan cap); 2.5 #1 fixed |
 | 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.2 instrumented/parameterized (tuning pending bags); 3.3 detection + recovery (off/hold/reset) done; 3.4 radius pruning done (off by default) |
 | 4   | Diagnostics publisher              | done (`estimate_msgs/Diagnostics` on `resple_diagnostics`, ~20 Hz typed; see HARDENING §4) |
 | 5   | Regression tests                   | last |
@@ -335,7 +335,7 @@ reference (status as of latest pass):
 | 2  | Init state machine is a bool pair (fragile) | **race fixed** (atomic bools); enum refactor optional | 1.5 C / 2.2 |
 | 3  | `map_update_future_.valid()` racy read | **fixed** | 1 |
 | 4  | Unbounded knot growth | **fixed** (sliding-window prune in both nodes: `SplineState::pruneFrontKnots` slides the idle window so retained-range interpolation is bit-identical; absolute est_window indexing kept via `totalKnots()`; param `spline_prune_keep_knots`, default 600, 0 disables) | 3.1 |
-| 5  | Unbounded input buffers | open, measuring | 2.3 |
+| 5  | Unbounded input buffers | **capability landed** (`max_scan_buffer` per-LiDAR drop-oldest, default 0=off; `max_imu_staging` default 2000 replaces the old hardcoded cap; drop counters in diagnostics + the Phase 4 msg) | 2.3 |
 | 6  | `assert()` in hot paths → silent UB under `-DNDEBUG` | **fixed** | 1 |
 | 7  | No divergence detection | **fixed** (NIS detector + `nis_recovery_mode` off/hold/reset; hold gates odom/TF while DIVERGED, reset reinflates the IEKF covariance to the prior) | 0 → 3.3 |
 | 8  | Plane-fit outlier rejection incomplete | **instrumented + parameterized** (CorrespConfig: `nn_max_sq_dist`/`plane_fit_thresh`/`plane_min_cond_ratio` params, degeneracy guard off by default pending bag benchmark; per-window funnel counters in diagnostics) | 3.2 |
@@ -395,6 +395,8 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `plane_min_cond_ratio` | §3.2 plane-fit degeneracy guard (QR pivot ratio; 0 = off, pending bag benchmark) | `0.0` |
 | `map_prune_radius` | §3.4 keep only map points within this distance (m) of the pose; floored at 2×det_range; 0 = off (cube-only) | `0.0` |
 | `nis_recovery_mode` | §3.3 divergence recovery: `off` (detect-only) / `hold` (gate odom+TF while DIVERGED) / `reset` (reinflate IEKF covariance to prior) | `off` |
+| `max_scan_buffer` | §2.3 per-LiDAR raw-scan cap (scans, drop-oldest; 0 = unbounded) | `0` |
+| `max_imu_staging` | §2.3 IMU staging cap (samples, drop-oldest; was hardcoded 2000) | `2000` |
 
 The `cube_len` hardcoded default in code (`RESPLE.cpp:580`, value 2000) is
 overridden by the param; check the logged value on startup rather than reading

@@ -1084,6 +1084,8 @@ public:
                     dmsg.deskew_out_of_range = Association::out_of_range_queries_.load(std::memory_order_relaxed);
                     dmsg.map_size = ikdtree.size();
                     dmsg.map_radius_prunes = radius_prune_ops_.load(std::memory_order_relaxed);
+                    dmsg.dropped_scans = dropped_scans_.load(std::memory_order_relaxed);
+                    dmsg.dropped_imu = dropped_imu_.load(std::memory_order_relaxed);
                     dmsg.drain_ms = drain_ms;
                     dmsg.iekf_ms = std::chrono::duration<float, std::milli>(iekf_end - frame_start).count();
                     dmsg.deskew_ms = std::chrono::duration<float, std::milli>(deskew_end - iekf_end).count();
@@ -1299,6 +1301,31 @@ private:
         std::atomic<int64_t> last_t_ns{0};
     };
     std::map<std::string, LidarData> lidars_data;    
+    // HARDENING §2.3: bounded input buffers. 0 = unbounded (legacy); when
+    // set, the scan push drops the OLDEST scan (pc_buff+t_buff in lock-step)
+    // and the IMU staging cap below replaces the old hardcoded 2000. Drops
+    // are counted for diagnostics — on a healthy system both stay 0.
+    int max_scan_buffer_ = 0;
+    int max_imu_staging_ = 2000;
+    std::atomic<uint64_t> dropped_scans_{0};
+    std::atomic<uint64_t> dropped_imu_{0};
+
+    // Single push path for every LiDAR callback (HARDENING §2.3).
+    template<typename PtsT>
+    void pushScanBounded(LidarData& ld, PtsT&& pts, int64_t t_begin)
+    {
+        std::lock_guard<std::mutex> lock(ld.mtx_pc);
+        if (max_scan_buffer_ > 0) {
+            while (static_cast<int>(ld.pc_buff.size()) >= max_scan_buffer_) {
+                ld.pc_buff.pop_front();
+                ld.t_buff.pop_front();
+                dropped_scans_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        ld.pc_buff.push_back(std::forward<PtsT>(pts));
+        ld.t_buff.push_back(t_begin);
+    }
+
     Eigen::aligned_deque<PointData> pt_meas;    
 
     // Atomic: worker reads this in processData without m_buff. Set once during
@@ -1548,6 +1575,13 @@ private:
                 spline_prune_keep_knots_);
             spline_prune_keep_knots_ = 100;
         }
+        // HARDENING §2.3 bounded input buffers. max_scan_buffer caps each
+        // per-LiDAR raw-scan deque in SCANS (0 = unbounded legacy);
+        // max_imu_staging caps imu_int_buff in SAMPLES (default keeps the
+        // previously hardcoded 2000; 0 disables). Drop-oldest + counters.
+        max_scan_buffer_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_scan_buffer", 0);
+        max_imu_staging_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_imu_staging", 2000);
+
         // HARDENING §3.3 divergence recovery policy: off (detection-only,
         // legacy) | hold (gate odometry/TF while DIVERGED) | reset
         // (reinflate IEKF covariance to the prior on DIVERGED).
@@ -1862,8 +1896,12 @@ private:
                 imu_msg->header.frame_id.c_str());
         }
 
-        if (imu_int_buff.size() >= 2000) {
+        // HARDENING §2.3: parameterized staging cap (was hardcoded 2000),
+        // drop-oldest + counted. 0 disables.
+        if (max_imu_staging_ > 0 &&
+            static_cast<int>(imu_int_buff.size()) >= max_imu_staging_) {
             imu_int_buff.erase(imu_int_buff.begin());
+            dropped_imu_.fetch_add(1, std::memory_order_relaxed);
         }
 
         // Pre-init: accept raw IMU for gravity alignment. Gravity direction is
@@ -1991,6 +2029,13 @@ private:
         stat.add("Map Radius Prunes (cumulative)",
                  static_cast<int>(radius_prune_ops_.load(std::memory_order_relaxed)));
 
+        // HARDENING §2.3: drop-oldest counters (non-zero means the caps are
+        // engaging — the worker is not keeping up with the sensors).
+        stat.add("Scans Dropped (cumulative)",
+                 static_cast<int>(dropped_scans_.load(std::memory_order_relaxed)));
+        stat.add("IMU Samples Dropped (cumulative)",
+                 static_cast<int>(dropped_imu_.load(std::memory_order_relaxed)));
+
         // HARDENING §3.3 recovery-policy observability: whether odometry/TF
         // publication is currently held, and how many covariance resets the
         // 'reset' mode has performed.
@@ -2103,11 +2148,7 @@ private:
         // Transform point cloud to body frame
         pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_last->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_last->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2181,11 +2222,7 @@ private:
         // Transform point cloud to body frame
         pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_last->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_last->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2248,11 +2285,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_transformed->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2314,11 +2347,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_transformed->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2381,11 +2410,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_transformed->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2439,11 +2464,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs_hesai.mtx_pc);
-            lidar_buffs_hesai.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs_hesai.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs_hesai, pc_transformed->points, time_begin);
         lidar_buffs_hesai.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2495,11 +2516,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs_boxi.mtx_pc);
-            lidar_buffs_boxi.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs_boxi.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs_boxi, pc_transformed->points, time_begin);
         lidar_buffs_boxi.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
