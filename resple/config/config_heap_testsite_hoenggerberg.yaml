@@ -64,3 +64,7 @@
 
     imu_init_num_samples: 50     # IMU samples averaged during stationary init
     imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+
+    # Robustness/diagnostics parameters (knot pruning, NIS recovery, map
+    # radius pruning, bounded buffers, ...) keep their defaults here —
+    # see doc/PARAMETERS.md for the full reference.

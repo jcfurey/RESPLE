@@ -14,6 +14,9 @@ def generate_launch_description():
     #   ros2 launch resple resple_pointcloud2.launch.py \
     #       lidar_frame:=os_sensor
     # and set the topics in config_pointcloud2.yaml (or pass a copied config).
+    # Runtime health is published on `resple_diagnostics`
+    # (estimate_msgs/Diagnostics, ~20 Hz) — see doc/PARAMETERS.md for the
+    # full parameter & topic reference.
     start_delay_arg = DeclareLaunchArgument(
         'start_delay', default_value='0.0',
         description='Seconds to wait before launching RESPLE.')

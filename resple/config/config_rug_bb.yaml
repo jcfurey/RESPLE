@@ -56,3 +56,7 @@
 
     imu_init_num_samples: 50
     imu_init_max_variance: 5.0
+
+    # Robustness/diagnostics parameters (knot pruning, NIS recovery, map
+    # radius pruning, bounded buffers, ...) keep their defaults here —
+    # see doc/PARAMETERS.md for the full reference.
