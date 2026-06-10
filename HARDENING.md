@@ -867,19 +867,34 @@ and downstream consumers without any warning.
 - Optional: covariance trace / `λ_min` metrics on a dedicated status topic
   (the NIS verdict largely subsumes them for divergence purposes).
 
-### 3.4 Map pruning policy
+### 3.4 Map pruning policy — **RADIUS PRUNING IMPLEMENTED (off by default)**
 
-`lasermapFovSegment` uses a hardcoded cube around the current pose (size set
-by `cube_len` param). Two issues: no radius-based pruning, and no temporal
-decay (dynamic obstacles never drop out).
+`lasermapFovSegment` uses a sliding cube around the current pose (size set by
+`cube_len`). The cube only deletes when the pose nears its edge — wandering
+inside a large cube (the shipping `cube_len` is 1000 m) keeps stale far
+geometry alive for the whole run.
 
-**Work:**
-- Add radius-based pruning (drop cells > `prune_radius` m from current pose)
-  as an alternative or supplement to the cube.
-- Optional temporal decay: drop cells not hit in `temporal_half_life` seconds
-  (requires a per-cell timestamp — potentially expensive, defer).
+**Implemented (this commit):**
+- `RESPLE::pruneMapRadius` — when `map_prune_radius > 0`, keep only the
+  axis-aligned box of half-extent R centered on the current lidar pose: on
+  first activation, and whenever the pose has moved > 10% of R since the last
+  prune, delete the slabs of the local-map cube outside the retention box.
+  Runs inside the async map task under `mtx_map_` unique (same locking as the
+  cube deletions), every tick of `lasermapFovSegment` with its own movement
+  hysteresis.
+- R is floored at **2× `det_range`** so pruning can never bite into the
+  sensor's live measurement sphere (all findCorresp matches are within
+  `det_range`); a configure-time WARN reports the effective radius.
+- The cube∖box slab decomposition lives in the geometry core
+  (`resple::geom::subtractBox`, ≤6 disjoint slabs) with unit tests proving
+  disjointness + exact tiling by dense sampling.
+- Diagnostics: `Map Radius Prunes (cumulative)`.
+- **Default `map_prune_radius = 0` (disabled)** — legacy cube-only behaviour.
+  Enabling it is an operational choice per environment (e.g. long tunnel
+  traverses vs loopy sites where revisited geometry is useful).
 
-**Complexity: medium-low.** Radius is cheap; temporal decay needs storage.
+**Deliberately not done:** temporal decay (per-cell timestamps — storage cost;
+deferred, as originally planned).
 
 ---
 

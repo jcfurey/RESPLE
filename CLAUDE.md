@@ -320,7 +320,7 @@ directory). Summary:
 | 1   | Safety fixes (initial)             | complete (`512da1d`) |
 | 1.5 | Defensive crash-hardening          | complete (`14e9be8`) — 13 fixes across 3 passes |
 | 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 still pending Phase 0 data |
-| 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.2 instrumented/parameterized (tuning pending bags); 3.3 detection done; 3.4 pending |
+| 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.2 instrumented/parameterized (tuning pending bags); 3.3 detection done; 3.4 radius pruning done (off by default) |
 | 4   | Diagnostics publisher              | after Phase 3 begins |
 | 5   | Regression tests                   | last |
 
@@ -393,6 +393,7 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `nn_max_sq_dist` | §3.2 k-th-neighbor squared-distance gate (m²); search radius = sqrt of this | `5.0` |
 | `plane_fit_thresh` | §3.2 esti_plane residual threshold (m) | `0.1` |
 | `plane_min_cond_ratio` | §3.2 plane-fit degeneracy guard (QR pivot ratio; 0 = off, pending bag benchmark) | `0.0` |
+| `map_prune_radius` | §3.4 keep only map points within this distance (m) of the pose; floored at 2×det_range; 0 = off (cube-only) | `0.0` |
 
 The `cube_len` hardcoded default in code (`RESPLE.cpp:580`, value 2000) is
 overridden by the param; check the logged value on startup rather than reading

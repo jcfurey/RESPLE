@@ -163,3 +163,87 @@ TEST(Nis, NonSpdCovarianceReturnsNaN) {
   S << 1, 0, 0, -1;  // indefinite -> LLT fails
   EXPECT_TRUE(std::isnan(nis(v, S)));
 }
+
+// ---------------------------------------------------------------------------
+// subtractBox (HARDENING §3.4 radius map pruning)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using resple::geom::AabBox;
+using resple::geom::subtractBox;
+
+double boxVolume(const AabBox& b) {
+  return (b.max - b.min).prod();
+}
+
+bool contains(const AabBox& b, const Eigen::Vector3d& p) {
+  return (p.array() >= b.min.array()).all() && (p.array() < b.max.array()).all();
+}
+
+AabBox makeBox(double x0, double y0, double z0, double x1, double y1, double z1) {
+  AabBox b;
+  b.min = Eigen::Vector3d(x0, y0, z0);
+  b.max = Eigen::Vector3d(x1, y1, z1);
+  return b;
+}
+
+}  // namespace
+
+TEST(SubtractBox, InnerFullyInsideGivesSixSlabsTilingTheComplement) {
+  const AabBox outer = makeBox(-10, -10, -10, 10, 10, 10);
+  const AabBox inner = makeBox(-2, -3, -4, 5, 4, 3);
+  const auto slabs = subtractBox(outer, inner);
+  ASSERT_EQ(slabs.size(), 6u);
+
+  double vol = 0;
+  for (const auto& s : slabs) vol += boxVolume(s);
+  EXPECT_NEAR(vol, boxVolume(outer) - boxVolume(inner), 1e-9);
+
+  // Deterministic dense sampling: every sample inside `outer` must be in the
+  // inner box XOR exactly one slab (disjoint + covering).
+  for (double x = -9.5; x < 10; x += 1.0)
+    for (double y = -9.5; y < 10; y += 1.0)
+      for (double z = -9.5; z < 10; z += 1.0) {
+        const Eigen::Vector3d p(x, y, z);
+        int hits = 0;
+        for (const auto& s : slabs) hits += contains(s, p);
+        if (contains(inner, p)) {
+          EXPECT_EQ(hits, 0) << p.transpose();
+        } else {
+          EXPECT_EQ(hits, 1) << p.transpose();
+        }
+      }
+}
+
+TEST(SubtractBox, InnerCoveringOuterGivesNothing) {
+  const AabBox outer = makeBox(-1, -1, -1, 1, 1, 1);
+  const AabBox inner = makeBox(-2, -2, -2, 2, 2, 2);
+  EXPECT_TRUE(subtractBox(outer, inner).empty());
+  // Exactly equal boxes likewise leave nothing.
+  EXPECT_TRUE(subtractBox(outer, outer).empty());
+}
+
+TEST(SubtractBox, DisjointInnerReturnsOuterExactly) {
+  const AabBox outer = makeBox(0, 0, 0, 4, 4, 4);
+  const AabBox inner = makeBox(10, 10, 10, 12, 12, 12);
+  const auto slabs = subtractBox(outer, inner);
+  double vol = 0;
+  for (const auto& s : slabs) vol += boxVolume(s);
+  EXPECT_NEAR(vol, boxVolume(outer), 1e-9);
+}
+
+TEST(SubtractBox, PartialOverlapTilesTheDifference) {
+  const AabBox outer = makeBox(0, 0, 0, 10, 10, 10);
+  // Sticks out of `outer` on +x and -y; overlaps the rest.
+  const AabBox inner = makeBox(6, -5, 2, 15, 7, 9);
+  const auto slabs = subtractBox(outer, inner);
+  for (double x = 0.5; x < 10; x += 1.0)
+    for (double y = 0.5; y < 10; y += 1.0)
+      for (double z = 0.5; z < 10; z += 1.0) {
+        const Eigen::Vector3d p(x, y, z);
+        int hits = 0;
+        for (const auto& s : slabs) hits += contains(s, p);
+        EXPECT_EQ(hits, contains(inner, p) ? 0 : 1) << p.transpose();
+      }
+}

@@ -384,6 +384,7 @@ public:
         if_init_filter = false;
         if_init_map = false;
         localmap_initialized_ = false;
+        radius_prune_initialized_ = false;
         imu_first_logged_.store(false);
         imu_count_logged_.store(false);
         lidar_first_logged_.store(false);
@@ -1117,6 +1118,13 @@ private:
 
     std::vector<BoxPointType> cub_needrm;
     BoxPointType LocalMap_Points;
+    // HARDENING §3.4 radius pruning state (see pruneMapRadius). The double /
+    // Vector3d / bool members are only touched inside the async map-update
+    // task (single in flight); the op counter is atomic for updateDiagnostics.
+    double map_prune_radius_ = 0.0;  // 0 disables (cube-only legacy behaviour)
+    Eigen::Vector3d last_radius_prune_center_ = Eigen::Vector3d::Zero();
+    bool radius_prune_initialized_ = false;
+    std::atomic<uint64_t> radius_prune_ops_{0};
     std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> accum_nearest_points;
     // Per-frame parallel buffer for k-NN results (used to live in PointData::nearest_points).
     // Sized to pt_meas.size() before each IEKF call; results moved into accum_nearest_points after.
@@ -1430,6 +1438,16 @@ private:
         param.coeff_cov = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "coeff_cov", 10);
 
         cube_len = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "cube_len", 1000.0);
+        // HARDENING §3.4: keep only map points within this distance of the
+        // current pose (0 = disabled, legacy cube-only behaviour). Floored at
+        // 2x det_range in pruneMapRadius; warn here so the operator sees the
+        // effective value.
+        map_prune_radius_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "map_prune_radius", 0.0);
+        if (map_prune_radius_ > 0.0 && map_prune_radius_ < 2.0 * double(det_range)) {
+            RCLCPP_WARN(this->get_logger(),
+                "map_prune_radius=%.1f is below 2x det_range (%.1f); the effective radius will be %.1f",
+                map_prune_radius_, 2.0 * double(det_range), 2.0 * double(det_range));
+        }
         point_filter_num = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "point_filter_num", 1);
         num_points_upd = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "num_points_upd", 100);
         if (if_lidar_only) {
@@ -1796,6 +1814,11 @@ private:
             last_corresp_passed_plane_ = plane;
             last_corresp_used_         = used;
         }
+
+        // HARDENING §3.4: how many radius-prune deletions have run (0 when
+        // map_prune_radius is disabled or the pose hasn't moved enough).
+        stat.add("Map Radius Prunes (cumulative)",
+                 static_cast<int>(radius_prune_ops_.load(std::memory_order_relaxed)));
 
         // Out-of-spline-range query counter from Association::pointBodyToWorld.
         // Signals that the deskew loop saw a scan timestamp outside the current
@@ -2790,6 +2813,12 @@ private:
             localmap_initialized_ = true;
             return;
         }
+        // HARDENING §3.4: radius-based pruning runs every tick (it has its
+        // own movement hysteresis), independent of the cube's edge trigger
+        // below — the cube only deletes when the pose nears its edge, so
+        // wandering inside a large cube otherwise keeps stale far geometry
+        // alive for the whole run.
+        pruneMapRadius(0.5 * (pos_lidar_min + pos_lidar_max));
         float dist_to_map_edge[3][2];
         bool need_move = false;
         for (int i = 0; i < 3; i++){
@@ -2822,6 +2851,58 @@ private:
         if(cub_needrm.size() > 0) {
             ikdtree.Delete_Point_Boxes(cub_needrm);
         }
+    }
+
+    // HARDENING §3.4: radius-based map pruning (supplement to the FOV cube).
+    // When map_prune_radius > 0, keep only the axis-aligned box of half-extent
+    // R centered on the current lidar pose: on first activation, and whenever
+    // the pose has moved more than 10% of R since the last prune, delete the
+    // slabs of the local-map cube that lie outside that box. R is floored at
+    // 2x det_range so pruning can never bite into the sensor's live
+    // measurement sphere (matches in findCorresp are all within det_range).
+    //
+    // Threading: called only from lasermapFovSegment, i.e. inside the async
+    // map-update task under mtx_map_ unique; successive tasks are serialized
+    // by the worker's future wait, so the plain (non-atomic) prune-state
+    // members are single-threaded.
+    void pruneMapRadius(const Eigen::Vector3d& center)
+    {
+        if (map_prune_radius_ <= 0.0) {
+            return;
+        }
+        const double R = std::max(map_prune_radius_, 2.0 * double(det_range));
+        if (radius_prune_initialized_ &&
+            (center - last_radius_prune_center_).norm() < 0.1 * R) {
+            return;
+        }
+        // Every live map point lies inside LocalMap_Points (mapIncremental
+        // only adds within the FOV cube), so carving cube \ keep into at most
+        // 6 disjoint slabs covers everything outside the retention box. The
+        // decomposition lives in the unit-tested geometry core.
+        resple::geom::AabBox outer, keep;
+        for (int i = 0; i < 3; i++) {
+            outer.min(i) = LocalMap_Points.vertex_min[i];
+            outer.max(i) = LocalMap_Points.vertex_max[i];
+            keep.min(i) = center(i) - R;
+            keep.max(i) = center(i) + R;
+        }
+        const std::vector<resple::geom::AabBox> slabs = resple::geom::subtractBox(outer, keep);
+        if (!slabs.empty()) {
+            std::vector<BoxPointType> rm;
+            rm.reserve(slabs.size());
+            for (const auto& s : slabs) {
+                BoxPointType b;
+                for (int i = 0; i < 3; i++) {
+                    b.vertex_min[i] = static_cast<float>(s.min(i));
+                    b.vertex_max[i] = static_cast<float>(s.max(i));
+                }
+                rm.push_back(b);
+            }
+            ikdtree.Delete_Point_Boxes(rm);
+            radius_prune_ops_.fetch_add(1, std::memory_order_relaxed);
+        }
+        last_radius_prune_center_ = center;
+        radius_prune_initialized_ = true;
     }
 
     void mapIncremental(pcl::PointCloud<pcl::PointXYZINormal>& pc,
