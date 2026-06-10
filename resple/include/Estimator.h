@@ -38,6 +38,13 @@ class Estimator
     double lastNis() const { return last_nis_; }
     int lastNisDof() const { return last_nis_dof_; }
 
+    // HARDENING SS3.3 'reset' recovery: reinflate the IEKF covariance to the
+    // configure-time prior while keeping the state (spline + biases). NIS
+    // divergence signals an over-confident covariance; reinflation lets
+    // subsequent measurements re-correct the state instead of being
+    // near-ignored. Worker-thread only (same thread as updateIEKF*).
+    void resetCovarianceToPrior() { cov_rcp = cov_prior_; }
+
     Estimator() {};
 
     void setState(int64_t dt_ns, int64_t start_t_ns, const Eigen::Vector3d& t0, const Eigen::Quaterniond& q0, 
@@ -49,6 +56,7 @@ class Estimator
         }        
         cov_sys = Q;
         cov_rcp = P;
+        cov_prior_ = P;
         a_mat = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
         Eigen::Matrix<double, 6, 6> matblock = Eigen::Matrix<double, 6, 6>::Zero();
         matblock.topLeftCorner<3, 3>().setIdentity();
@@ -408,6 +416,9 @@ class Estimator
     // read before that first write would have been UB. setState() now runs
     // on valid zeros.
     Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp  = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
+    // Initial covariance from setState(), kept for the HARDENING SS3.3
+    // 'reset' recovery mode (resetCovarianceToPrior).
+    Eigen::Matrix<double, XSIZE, XSIZE> cov_prior_ = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Matrix<double, XSIZE, XSIZE> cov_sys  = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Matrix<double, XSIZE, XSIZE> a_mat    = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Vector3d bg = Eigen::Vector3d::Zero();

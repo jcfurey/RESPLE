@@ -385,6 +385,7 @@ public:
         if_init_map = false;
         localmap_initialized_ = false;
         radius_prune_initialized_ = false;
+        nis_hold_active_.store(false);
         imu_first_logged_.store(false);
         imu_count_logged_.store(false);
         lidar_first_logged_.store(false);
@@ -765,6 +766,50 @@ public:
                             "or correspondences are inconsistent — pose covariance is no "
                             "longer trustworthy.", nis_detector_.lastWindowMean());
                     }
+                    // HARDENING §3.3 recovery policy (nis_recovery_mode param).
+                    switch (nis_recovery_mode_) {
+                    case NisRecoveryMode::OFF:
+                        break;
+                    case NisRecoveryMode::HOLD:
+                        // Latch the hold on DIVERGED; release only on a full
+                        // OK verdict (the detector's hysteresis), so WARN
+                        // during recovery keeps the gate closed.
+                        if (fh_state == resple::health::FilterState::DIVERGED) {
+                            if (!nis_hold_active_) {
+                                RCLCPP_ERROR(this->get_logger(),
+                                    "[RESPLE] nis_recovery_mode=hold: suspending odometry/TF "
+                                    "publication until the NIS window recovers.");
+                            }
+                            nis_hold_active_ = true;
+                        } else if (fh_state == resple::health::FilterState::OK && nis_hold_active_) {
+                            nis_hold_active_ = false;
+                            RCLCPP_WARN(this->get_logger(),
+                                "[RESPLE] NIS window recovered; resuming odometry/TF publication.");
+                        }
+                        break;
+                    case NisRecoveryMode::RESET:
+                        if (fh_state == resple::health::FilterState::DIVERGED) {
+                            // Reinflate the IEKF covariance to the configure-
+                            // time prior, keeping the state (spline + biases):
+                            // an over-confident covariance is exactly what the
+                            // NIS verdict detects, and reinflation lets new
+                            // measurements re-correct the state. Restart the
+                            // detector window so the next verdict reflects the
+                            // post-reset filter.
+                            if (if_lidar_only) {
+                                estimator_lo.resetCovarianceToPrior();
+                            } else {
+                                estimator_lio.resetCovarianceToPrior();
+                            }
+                            nis_detector_.reset();
+                            nis_resets_.fetch_add(1, std::memory_order_relaxed);
+                            RCLCPP_ERROR(this->get_logger(),
+                                "[RESPLE] nis_recovery_mode=reset: IEKF covariance reinflated "
+                                "to the configure-time prior (reset #%lu).",
+                                static_cast<unsigned long>(nis_resets_.load(std::memory_order_relaxed)));
+                        }
+                        break;
+                    }
                 }
                 {
                     // pointBodyToWorld reads spline; keep serialized with
@@ -819,13 +864,26 @@ public:
                     std::lock_guard<std::mutex> spline_lock(spline_mutex_);
                     spline->pruneFrontKnots(spline_prune_keep_knots_);
                 }
-                // Pose/odom/TF publish is INLINE and unconditional. Keeping
-                // it out of the async-map-update lambda means the odom frame
-                // keeps flowing even if the background map mutation is
+                // Pose/odom/TF publish is INLINE and (normally) unconditional.
+                // Keeping it out of the async-map-update lambda means the odom
+                // frame keeps flowing even if the background map mutation is
                 // wedged inside ikd-Tree (rebuild can stall on big trees,
                 // and previously this also stalled processData itself
                 // because the loop blocked on map_update_future_.wait()).
-                publishPoseAndTf();
+                //
+                // HARDENING §3.3 'hold' recovery: while the NIS hold is
+                // latched, the last published pose IS the held estimate —
+                // downstream (the odom EKF) coasts on its other sources
+                // instead of fusing an untrustworthy pose. est_window /
+                // map updates continue (internal estimation keeps running so
+                // the detector can observe recovery).
+                if (nis_hold_active_) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "[RESPLE] odometry/TF publication held (NIS divergence, "
+                        "nis_recovery_mode=hold).");
+                } else {
+                    publishPoseAndTf();
+                }
 
                 if (max_time_ns >= t_last_map_upd + 100000000LL) {
                     // Wait for any prior async map update before swapping buffers.
@@ -1047,6 +1105,15 @@ private:
     // The atomics export their verdicts to updateDiagnostics on the executor
     // thread, same pattern as the cached_* metrics above.
     resple::health::NisDivergenceDetector nis_detector_;
+    // HARDENING §3.3 recovery policy. OFF = detection-only (log +
+    // diagnostics, legacy); HOLD = gate odometry/TF publication while
+    // DIVERGED (released on full OK); RESET = reinflate the IEKF covariance
+    // to the configure-time prior on DIVERGED. nis_hold_active_ is
+    // worker-thread-only; the reset counter is atomic for diagnostics.
+    enum class NisRecoveryMode { OFF, HOLD, RESET };
+    NisRecoveryMode nis_recovery_mode_ = NisRecoveryMode::OFF;
+    std::atomic<bool> nis_hold_active_{false};  // worker writes, diagnostics reads
+    std::atomic<uint64_t> nis_resets_{0};
     resple::health::ImuHealthMonitor imu_health_;
     std::atomic<int> filter_health_state_{0};        // FilterState as int
     std::atomic<double> nis_window_mean_{0.0};
@@ -1395,6 +1462,25 @@ private:
                 "spline_prune_keep_knots=%d is below the safe minimum; using 100",
                 spline_prune_keep_knots_);
             spline_prune_keep_knots_ = 100;
+        }
+        // HARDENING §3.3 divergence recovery policy: off (detection-only,
+        // legacy) | hold (gate odometry/TF while DIVERGED) | reset
+        // (reinflate IEKF covariance to the prior on DIVERGED).
+        {
+            const std::string mode = CommonUtils::readParam<std::string>(
+                this->get_node_parameters_interface(), "nis_recovery_mode", std::string("off"));
+            if (mode == "hold") {
+                nis_recovery_mode_ = NisRecoveryMode::HOLD;
+            } else if (mode == "reset") {
+                nis_recovery_mode_ = NisRecoveryMode::RESET;
+            } else {
+                if (mode != "off") {
+                    RCLCPP_WARN(this->get_logger(),
+                        "nis_recovery_mode='%s' not recognized (off|hold|reset); using 'off'",
+                        mode.c_str());
+                }
+                nis_recovery_mode_ = NisRecoveryMode::OFF;
+            }
         }
         if_lidar_only = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "if_lidar_only", false);
         if (!if_lidar_only) {
@@ -1819,6 +1905,13 @@ private:
         // map_prune_radius is disabled or the pose hasn't moved enough).
         stat.add("Map Radius Prunes (cumulative)",
                  static_cast<int>(radius_prune_ops_.load(std::memory_order_relaxed)));
+
+        // HARDENING §3.3 recovery-policy observability: whether odometry/TF
+        // publication is currently held, and how many covariance resets the
+        // 'reset' mode has performed.
+        stat.add("NIS Recovery Hold Active", nis_hold_active_.load(std::memory_order_relaxed));
+        stat.add("NIS Recovery Resets (cumulative)",
+                 static_cast<int>(nis_resets_.load(std::memory_order_relaxed)));
 
         // Out-of-spline-range query counter from Association::pointBodyToWorld.
         // Signals that the deskew loop saw a scan timestamp outside the current

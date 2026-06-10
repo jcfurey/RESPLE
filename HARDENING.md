@@ -858,14 +858,35 @@ and downstream consumers without any warning.
   fault bits + stationary gyro-bias norm exported to diagnostics, throttled
   WARN on faults.
 
-**Remaining (recovery policy):**
-- Action on trip: either (a) hold last estimate + skip publish until a stable
-  scan recovers it, or (b) reset filter with the last good pose. This is a
-  policy decision — (a) is safer operationally, (b) recovers faster from a
-  real divergence. Detection currently logs + escalates diagnostics to ERROR
-  so downstream consumers can gate on `/diagnostics`; no automatic reset yet.
-- Optional: covariance trace / `λ_min` metrics on a dedicated status topic
+**Recovery policy — IMPLEMENTED (parameter-selected, default off):**
+
+Per the operator decision (2026-06-10), both policies are implemented behind
+`nis_recovery_mode` (default `off` = detection-only legacy behaviour):
+
+- **`hold`** — on DIVERGED, suspend odometry/TF publication (the last
+  published pose is the held estimate; the downstream odom EKF coasts on its
+  other sources instead of fusing an untrustworthy pose). The hold latches
+  and releases only on a full OK verdict, so WARN during the detector's
+  hysteresis recovery keeps the gate closed. est_window / map updates
+  continue so internal estimation keeps running and the detector can observe
+  recovery. Logged on entry/exit; `NIS Recovery Hold Active` in diagnostics.
+- **`reset`** — on DIVERGED, reinflate the IEKF covariance to the
+  configure-time prior (`Estimator::resetCovarianceToPrior`), keeping the
+  state (spline + biases): an over-confident covariance is exactly what the
+  NIS verdict detects, and reinflation lets new measurements re-correct the
+  state. The detector window restarts so the next verdict reflects the
+  post-reset filter. `NIS Recovery Resets (cumulative)` in diagnostics.
+
+Note: `reset` deliberately reinflates covariance rather than rewinding the
+state to a stored "last good pose" — a state rewind would need pose history
+plus a spline/Mapping window restart (respawn-equivalent), and the
+covariance reinflation addresses the failure mode NIS actually measures.
+
+**Remaining (optional):**
+- Covariance trace / `λ_min` metrics on a dedicated status topic
   (the NIS verdict largely subsumes them for divergence purposes).
+- Policy validation on a bag with a real divergence episode (hold-vs-reset
+  comparison is a tuning exercise, like the §3.2 thresholds).
 
 ### 3.4 Map pruning policy — **RADIUS PRUNING IMPLEMENTED (off by default)**
 
