@@ -1183,6 +1183,31 @@ to exploit — their only exposure was the missing try/catch (now closed in
 Mapping; RESPLE already had it + `isfinite` filtering). Validated TSan- and
 ASan-clean on the HelmDyn01 LIO replay.
 
+#### 6.1 RESULTS — rmw_zenoh re-validation, 2026-06-10 (deployment RMW)
+
+The production deployment uses **rmw_zenoh**, not the container/CI-default
+Fast-DDS. Re-ran the TSan HelmDyn01 LIO replay with
+`RMW=rmw_zenoh_cpp` (`scripts/sanitizer_replay.sh` now starts `rmw_zenohd` and
+sets `RMW_IMPLEMENTATION`). Finding:
+
+- **RESPLE code is race- and inversion-free under Zenoh too** — across both
+  nodes, **0** `#0` racing frames in `libresple`, and **0** RESPLE lock-order
+  inversions (all 96 inversions are in `librmw_zenoh_cpp`). Every racing access
+  is a libsanitizer interceptor (`pthread_mutex_lock`/`pthread_create`/`memcpy`/
+  `malloc`/`send`/`recv`) on a Zenoh runtime thread. Node healthy (LIO init,
+  knot plateau 600).
+- **But Zenoh's runtime is far noisier under TSan than Fast-DDS** — ~218 data
+  races + 96 lock-order inversions, ALL inside `librmw_zenoh_cpp` / the
+  uninstrumented zenoh-c async runtime. Not a RESPLE bug, not fixable from
+  RESPLE, and too broad to suppress cleanly.
+
+**Conclusion:** the meaningful gate (zero RESPLE-code races) passes under BOTH
+RMWs. A literal zero-report TSan run is practical only on Fast-DDS (2 documented
+suppressions); Zenoh's middleware noise would need a large brittle suppression
+set. **Recommendation: gate TSan on Fast-DDS; treat Zenoh as validated for
+RESPLE-code cleanliness as the deployment RMW.** ASan was not re-run under Zenoh
+(the TSan racing-access analysis is the relevant evidence here).
+
 ### 6.2 Bag-replay CI smoke (last open Phase 5 row)
 
 Goal: a CI job that replays a SHORT bag (30–60 s is enough) and fails on
