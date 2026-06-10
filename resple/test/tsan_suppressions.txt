@@ -1,10 +1,12 @@
 # ThreadSanitizer suppressions for the ikd-Tree concurrency tests
-# (resple/test/test_ikdtree_concurrency.cpp).
+# (resple/test/test_ikdtree_concurrency.cpp) AND the Phase 6.1 sanitizer bag
+# replay (scripts/sanitizer_replay.sh).
 #
 # Usage:
 #   TSAN_OPTIONS="suppressions=$PWD/resple/test/tsan_suppressions.txt" <test-binary>
 #
-# INTENTIONALLY EMPTY of active entries.
+# Contains NO RESPLE-code suppressions — the gate must fail on any race in our
+# own code. The only entries are third-party middleware races (see below).
 #
 # History:
 # - Phase 2.5 #2 (working_flag_mutex <-> search_rw_mutex_ lock-order
@@ -24,3 +26,15 @@
 # are exactly what the tests guard (Phase 2.4 reader-vs-reader and Phase
 # 2.5 rebuild-path races). New suppressions need a HARDENING.md entry
 # explaining why the underlying race is acceptable.
+
+# --- External middleware (NOT RESPLE code) --------------------------------
+# Fast-DDS (rmw_fastrtps_cpp — the osrf/ros image + CI default RMW) races its
+# OWN payload pool between the publish-time serialize and a receive/statistics
+# thread's deserialize: eprosima::fastcdr::Cdr::(de)serialize_array over a
+# fastrtps TopicPayloadPool / StatisticsListenersImpl buffer. Surfaced by the
+# Phase 6.1 LIO bag replay (HelmDyn01); reproduces with ZERO RESPLE
+# involvement (publish() -> DDS internals). The production deployment uses
+# rmw_zenoh, where this Fast-DDS path does not exist. Suppressed so the gate
+# measures RESPLE code, not the DDS vendor. See HARDENING.md §6.1.
+race:eprosima::fastcdr::Cdr::serialize_array
+race:eprosima::fastcdr::Cdr::deserialize_array

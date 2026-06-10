@@ -22,7 +22,7 @@ Companion docs:
 | 3   | Spline / mapping accuracy | **Complete** — 3.1 pruning; 3.2 parameterized + instrumented; 3.3 detection + recovery modes; 3.4 radius pruning (opt-in). Tuning passes → §6.3/§6.4 | — |
 | 4   | Diagnostics publisher | **Complete** — `estimate_msgs/Diagnostics` on `resple_diagnostics`, ~20 Hz typed | — |
 | 5   | Regression tests | **Complete except §6.2** — ROS-free + ASan/UBSan + ikd-Tree TSan CI gates | — |
-| 6   | Bag-gated validation & tuning | **Designed, awaiting a bag** — §6.1 sanitizer replay, §6.2 CI smoke, §6.3 plane-fit tuning, §6.4 recovery policy | — |
+| 6   | Bag-gated validation & tuning | **In progress (bag available 2026-06-10)** — §6.1 TSan leg DONE: 4 real concurrency bugs found+fixed on the HelmDyn01 LIO replay (see §6.1 results); §6.1 ASan leg, §6.2 CI smoke, §6.3 plane-fit tuning, §6.4 recovery policy still open | — |
 
 Commits are in the `resple` submodule on `develop`, relative to `fced6a1`.
 
@@ -1106,6 +1106,55 @@ Steps:
    `deskew_out_of_range == 0`, `iekf_numerical_failures == 0`.
 4. Deliverable: paste the run summary into this file under a dated note;
    if anything fires, the stack IS the bug — file it as a new hazard row.
+
+#### 6.1 RESULTS — TSan leg, 2026-06-10 (HelmDyn01, LIO)
+
+**Environment.** `resple_ws` docker image (`osrf/ros:jazzy-desktop`, default
+`rmw_fastrtps_cpp`); RESPLE + Mapping driven headless (no rviz) by the new
+`scripts/sanitizer_replay.sh tsan`; full HelmDyn01 bag (205 s, Livox Mid360,
+`/livox/lidar`+`/livox/imu`) replayed at rate 1.0; config forced to LIO
+(`if_lidar_only:false`) + `num_threads:1` (+`OMP_NUM_THREADS=1`) so libgomp
+parallel-for barriers don't masquerade as races. Empty RESPLE-code suppressions.
+
+**This was the first time LIO + the Mapping node ran under TSan on a real bag**
+(prior TSan work used the synthetic injector + unit tests, which drive the
+RESPLE node's data path only). It immediately surfaced **~33 data races + 1
+lock-order inversion**, all genuine (num_threads=1). Iterative fix+re-run cycles
+took the RESPLE-code race count to **zero** — the final run is fully CLEAN (no
+TSan reports at all, with only the justified Fast-DDS suppression active). Note
+the scheduler-dependence: bug 43 (`getEstCallback`) only surfaced *after* the
+Fast-DDS noise was suppressed, on a later run — a reminder that a quiet TSan run
+is necessary but not sufficient (see the §2.5 detection-power caveat). Fixes
+(all in the `resple` submodule):
+
+| # | Bug (TSan) | Root cause | Fix | File |
+| --- | --- | --- | --- | --- |
+| 39 | Mapping lidar callback re-entrant on shared scratch (~25 reports: `livoxLidarCallback`/`pcl::Filter::filter`/`transformPointCloud`) | The 7 sensor callbacks mutate inherited member scratch (`pc_last`/`pc_last_ds`/`ds_filter_each_scan`/transform state) assuming single-threaded dispatch; under the MultiThreadedExecutor TSan sees no happens-before between consecutive dispatches of the MutuallyExclusive group | Added `MappingBase::cb_mtx_`, locked at the top of every sensor callback — makes the serialization explicit and TSan-visible | `Mapping.cpp` |
+| 40 | `Mapping::process()` lock-order inversion (potential deadlock) | Swap branch took `m_spline`→`maps`; publish/prune branch took `maps` (`ScopedMappingsLock`)→`m_spline` — cyclic order | Hoisted `m_spline` before `ScopedMappingsLock` in the publish branch → always `m_spline`→`maps` | `Mapping.cpp` |
+| 41 | `MappingBase::processScan` reads `pc_L_buff.size()` outside `mtx` (worker vs callback `push_back`) | The throttled diagnostic log read the deque depth after the locked pull scope closed | Read the size under `mtx` | `Mapping.cpp` |
+| 42 | `KD_TREE::size()` lock-free read of non-atomic `Root_Node` vs rebuild swap | `size()` kept the old `Rebuild_Ptr`-check fast-path that K1/§2.5 removed from the *search* functions but never applied to this *reader*; called from the worker's diagnostics (`RESPLE.cpp:1085 dmsg.map_size`) without `mtx_map_` | Take `search_rw_mutex_` shared (the K1 idiom); `TreeSize` is already atomic | `ikd-Tree/ikd_Tree.cpp` |
+| 43 | `Mapping::getEstCallback` re-entrant on `getEstCallback_logged_` + `spline_pending_` staging | The `/est_window` `Estimate` subscription is on the node default group; same MutuallyExclusive-but-TSan-invisible-HB issue as the lidar callbacks. Surfaced only after the Fast-DDS noise was suppressed (scheduler-dependent) | Added `est_cb_mtx_`, locked across `getEstCallback` | `Mapping.cpp` |
+
+**Residual (NOT RESPLE code): 4 Fast-DDS races.** The only reports left (2 per
+node) are inside eProsima Fast-DDS — `fastcdr::Cdr::serialize_array` (publish)
+vs `deserialize_array` (receive/statistics) over a `fastrtps TopicPayloadPool` /
+`StatisticsListenersImpl` buffer, i.e. the middleware racing its own payload
+pool with zero RESPLE involvement. **The deployment uses `rmw_zenoh`, not
+Fast-DDS**, so this path does not exist in production; it is a property of the
+container/CI default RMW. Suppressed with justification in
+`resple/test/tsan_suppressions.txt` (`race:…Cdr::serialize_array` /
+`deserialize_array`) so the gate measures RESPLE code, not the DDS vendor.
+
+**Caveats / still open.**
+- Under TSan at rate 1.0 the instrumented worker backlogs (`pc_buff`~2.4–2.7k).
+  This maximizes callback-vs-worker detection but isn't normal timing; the four
+  fixes are structural (a missing lock, an inconsistent lock order, a lock-free
+  reader) so they hold regardless. A reduced-rate confirming run is worthwhile.
+- **Deployment-faithful re-validation under `rmw_zenoh`** is the proper close
+  (would also confirm the Fast-DDS residual vanishes). Pending
+  `ros-jazzy-rmw-zenoh-cpp` in the image + a `rmw_zenohd` router.
+- §6.1 **ASan/UBSan leg** not yet run.
+- CLAUDE.md's hazard table should gain rows 39–42 (mirrors the above).
 
 ### 6.2 Bag-replay CI smoke (last open Phase 5 row)
 

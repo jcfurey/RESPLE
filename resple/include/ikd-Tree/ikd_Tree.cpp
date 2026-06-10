@@ -96,31 +96,16 @@ void KD_TREE<PointType>::InitTreeNode(KD_TREE_NODE *root)
 template <typename PointType>
 int KD_TREE<PointType>::size()
 {
-    int s = 0;
-    if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
-    {
-        if (Root_Node != nullptr)
-        {
-            return Root_Node->TreeSize;
-        }
-        else
-        {
-            return 0;
-        }
-    }
-    else
-    {
-        if (!pthread_mutex_trylock(&working_flag_mutex))
-        {
-            s = Root_Node->TreeSize;
-            pthread_mutex_unlock(&working_flag_mutex);
-            return s;
-        }
-        else
-        {
-            return Treesize_tmp;
-        }
-    }
+    // HARDENING Phase 6.1: take search_rw_mutex_ shared, exactly like the search
+    // functions (K1 / Phase 1.5). The old lock-free fast-path read the
+    // non-atomic Root_Node pointer while the background rebuild thread swapped it
+    // (multi_thread_rebuild → search_rw_mutex_ unique at ~259/293), and the
+    // trylock branch read Root_Node->TreeSize without excluding that swap → TSan
+    // data race on the global ikdtree (size() vs Rebuild / multi_thread_rebuild,
+    // surfaced by the §6.1 LIO bag replay). The shared lock is uncontended
+    // except during the rebuild's brief unique-locked swap. TreeSize is atomic.
+    std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+    return Root_Node != nullptr ? Root_Node->TreeSize.load() : 0;
 }
 
 template <typename PointType>

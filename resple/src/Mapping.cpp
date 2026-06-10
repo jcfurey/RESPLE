@@ -72,7 +72,14 @@ class MappingBase
 {
   public:
 
-    std::mutex mtx;
+    std::mutex mtx;       // protects pc_L_buff (shared with the worker thread)
+    // Serializes the sensor callback body. The lidar subs share a
+    // MutuallyExclusive callback group, but under the MultiThreadedExecutor TSan
+    // observes no happens-before between consecutive callback dispatches, so the
+    // shared scratch members (pc_last / pc_last_ds / ds_filter_each_scan /
+    // transform state) raced callback-vs-callback (HARDENING Phase 6.1). This
+    // lock makes the serialization explicit and TSan-visible.
+    std::mutex cb_mtx_;
     LidarConfig lidar;
     MappingBase(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config,
                 rclcpp::CallbackGroup::SharedPtr sensor_cb = nullptr)
@@ -181,11 +188,15 @@ class MappingBase
         if ((now_clk - last_processScan_log_).seconds() >= 2.0) {
             last_processScan_log_ = now_clk;
             int64_t s_min = spl->minTimeNs(), s_max = spl->maxTimeNs();
+            // Read the buffer depth under the lock — the callback mutates the
+            // deque concurrently, so an unlocked size() raced it (Phase 6.1).
+            size_t buf_remaining;
+            { std::lock_guard<std::mutex> lock(mtx); buf_remaining = pc_L_buff.size(); }
             RCLCPP_INFO(node_handle_->get_logger(),
                 "[Mapping] processScan: pc_L_buff=%zu spline_knots=%ld "
                 "spline=[%ld..%ld] last_t_end=%ld "
                 "totals: published=%zu dropped_old=%zu pending_new=%zu",
-                pc_L_buff.size(), spl->numKnots(), s_min, s_max, last_t_end_ns,
+                buf_remaining, spl->numKnots(), s_min, s_max, last_t_end_ns,
                 total_published_, total_dropped_old_, total_pending_new_);
         }
     }
@@ -346,6 +357,7 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
 
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
     {
+        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
         // Guard against negative timestamps (sim-time messages)
         int64_t stamp_ns = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds();
         if (stamp_ns < time_offset) return;
@@ -418,6 +430,7 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
 
     void genericLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg_in)
     {
+        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
         // Guard against negative timestamps (sim-time messages)
         int64_t stamp_ns = rclcpp::Time(msg_in->header.stamp).nanoseconds();
         if (stamp_ns < time_offset) return;
@@ -479,6 +492,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
 
     void livoxLidarCallback(const livox_ros_driver::msg::CustomMsg::SharedPtr livox_msg_in)
     {
+        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -536,6 +550,7 @@ public:
 
     void livoxLidarCallback(livox_ros_driver2::msg::CustomMsg::SharedPtr livox_msg_in)
     {
+        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -593,6 +608,7 @@ public:
 
     void livoxLidarCallback(livox_interfaces::msg::CustomMsg::SharedPtr livox_msg_in)
     {
+        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
                 
@@ -650,6 +666,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
 
     void hesaiLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr hesai_msg_in)
     {
+        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(hesai_msg_in->header.frame_id)) return;
                 
@@ -715,6 +732,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
 
     void mid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
     {
+        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -1039,6 +1057,12 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             // genuinely single-threaded with respect to spline_active_ — no
             // m_spline coverage needed here.
             if (if_init_succeed.load(std::memory_order_acquire) && spline_active_.totalKnots() > num_knot) {
+                // Lock order MUST match the swap branch above (m_spline -> maps).
+                // This branch previously took maps (ScopedMappingsLock) first and
+                // m_spline only for the prune, giving maps -> m_spline — a
+                // lock-order inversion / potential deadlock with the swap branch
+                // (TSan, Phase 6.1). Acquire m_spline first, then the maps.
+                std::lock_guard<std::mutex> spline_lock(m_spline);
                 ScopedMappingsLock maps_lock(vis_maps);
                 publishPath();
                 displayControlPoints();
@@ -1049,11 +1073,10 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 // again and path/odom would silently freeze.
                 num_knot = spline_active_.totalKnots();
                 // Phase 3.1: prune after the publishes consumed this growth
-                // step. All spline_active_ mutation happens on this worker
-                // thread (Option B), so no extra locking is needed beyond
-                // m_spline, which serializes against the swap above.
+                // step. m_spline is already held above (serializes against the
+                // swap branch); all spline_active_ mutation is on this worker
+                // thread (Option B), so no additional locking is needed.
                 if (spline_prune_keep_knots_ > 0) {
-                    std::lock_guard<std::mutex> lock(m_spline);
                     spline_active_.pruneFrontKnots(spline_prune_keep_knots_);
                 }
             }
@@ -1132,6 +1155,12 @@ private:
     std::atomic<bool> start_pending_{false};
     std::atomic<int64_t> start_bag_time_pending_{0};
     std::mutex m_spline;
+    // Serializes getEstCallback. sub_est is on the node's default
+    // (MutuallyExclusive) group, but under the MultiThreadedExecutor TSan sees
+    // no happens-before between consecutive est_window deliveries, so the
+    // unguarded getEstCallback_logged_ flag (and the spline_pending_ staging)
+    // raced callback-vs-callback (HARDENING Phase 6.1, est-window data path).
+    std::mutex est_cb_mtx_;
     // Phase 3.1: knots retained by the sliding-window prune (0 disables).
     int spline_prune_keep_knots_ = 600;
 
@@ -1150,6 +1179,7 @@ private:
 
     void getEstCallback(const estimate_msgs::msg::Estimate::SharedPtr est_msg)
     {
+        std::lock_guard<std::mutex> est_lock(est_cb_mtx_);  // Phase 6.1: serialize est-window handler
         if (!getEstCallback_logged_) {
             getEstCallback_logged_ = true;
             RCLCPP_INFO(this->get_logger(),
