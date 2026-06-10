@@ -334,7 +334,7 @@ if(BUILD_TESTING)
     ament_add_gtest(test_ikdtree_concurrency
       test/test_ikdtree_concurrency.cpp
       include/ikd-Tree/ikd_Tree.cpp
-      TIMEOUT 120)
+      TIMEOUT 300)
     target_include_directories(test_ikdtree_concurrency PRIVATE
       include ${PCL_INCLUDE_DIRS})
     target_compile_definitions(test_ikdtree_concurrency PRIVATE ${PCL_DEFINITIONS})

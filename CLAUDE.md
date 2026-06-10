@@ -322,7 +322,7 @@ directory). Summary:
 | 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 capability landed (default-off scan cap); 2.5 #1 fixed |
 | 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.2 instrumented/parameterized (tuning pending bags); 3.3 detection + recovery (off/hold/reset) done; 3.4 radius pruning done (off by default) |
 | 4   | Diagnostics publisher              | done (`estimate_msgs/Diagnostics` on `resple_diagnostics`, ~20 Hz typed; see HARDENING §4) |
-| 5   | Regression tests                   | last |
+| 5   | Regression tests                   | done except bag-gated smoke (CI: ROS-free + ASan/UBSan + ikd-Tree TSan jobs; Eigen-pin + STATIC_ROOT_NODE leak fixed via the ASan gate) |
 
 ### Known hazards (compact view)
 

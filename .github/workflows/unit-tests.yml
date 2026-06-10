@@ -1,8 +1,16 @@
 name: unit-tests
 
-# Fast, ROS-free gate: the estimator math and PointCloud2 parsing cores compile
-# with just Eigen + GoogleTest, so they run on every push/PR in seconds and
-# guard the numerics independently of the heavier colcon build.
+# Fast, ROS-free gates (HARDENING Phase 5):
+#  - estimator-core: the math / parsing / spline cores with Eigen + GoogleTest,
+#    runs in seconds on every push/PR.
+#  - estimator-core-asan: the same suite under AddressSanitizer + UBSan.
+#  - ikdtree-tsan: the ikd-Tree concurrency regressions (Phase 2.4 Push_Down,
+#    Phase 2.5 rebuild-vs-mutator + lock-order gates) under ThreadSanitizer.
+#    Needs PCL point types (plain libpcl-dev, still no ROS). TSan slows the
+#    stress ~30x, so this is a separate job with its own generous timeout.
+#
+# Still pending from the Phase 5 table: a bag-replay smoke test — blocked on a
+# representative bag being available to CI.
 on:
   push:
     branches: ["**"]
@@ -17,6 +25,49 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake g++ libeigen3-dev libgtest-dev
+            cmake g++ libeigen3-dev libgtest-dev libboost-math-dev
       - name: Build and run unit tests
         run: ./scripts/run_unit_tests.sh
+
+  estimator-core-asan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ libeigen3-dev libgtest-dev libboost-math-dev
+      - name: Build (ASan + UBSan)
+        run: |
+          cmake -S resple/test -B build/asan \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -g -O1 -fno-omit-frame-pointer"
+          cmake --build build/asan -j"$(nproc)"
+      - name: Run under ASan + UBSan
+        run: |
+          ASAN_OPTIONS="detect_leaks=1" UBSAN_OPTIONS="print_stacktrace=1" \
+            ctest --test-dir build/asan --output-on-failure
+
+  ikdtree-tsan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (incl. PCL, no ROS)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ libeigen3-dev libgtest-dev libboost-math-dev libpcl-dev
+      - name: Build concurrency tests (TSan)
+        run: |
+          cmake -S resple/test -B build/tsan \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1 -fno-omit-frame-pointer"
+          cmake --build build/tsan -j"$(nproc)" --target test_ikdtree_concurrency
+      - name: Run under ThreadSanitizer
+        # The suppressions file is intentionally empty of active entries
+        # (Phase 2.5 #1 fixed); passing it keeps the invocation canonical and
+        # makes any future (justified) suppression take effect here too.
+        # halt_on_error=1: any data race / lock-order report fails the job.
+        run: |
+          TSAN_OPTIONS="halt_on_error=1:suppressions=$PWD/resple/test/tsan_suppressions.txt" \
+            ./build/tsan/test_ikdtree_concurrency

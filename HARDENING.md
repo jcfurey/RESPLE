@@ -677,13 +677,27 @@ links as well as `father_ptr`, so field-level atomics could not cover it.
   touching ops blocked). Production has one map mutator (the async map task)
   and the live sweep shows an unchanged IEKF rate.
 
-**Verification:** pre-fix the new stress reports ~200 TSan races
-(`multi_thread_rebuild`/`Update`/memcpy on node fields); post-fix BOTH
-concurrency tests run TSan-clean **with the suppressions file emptied** (the
-`race:multi_thread_rebuild` / `race:multi_thread_ptr` entries are deleted, so
-any regression now fails the gate). Live data-path TSan sweep: clean, IEKF
-rate unchanged, clean shutdown. Bag replay remains worthwhile as an
-end-to-end confidence pass when a bag is available.
+**Verification:** measured during the fix session with back-to-back runs of
+identical binaries differing only in `ikd_Tree.cpp`: pre-fix the new stress
+reported ~200 TSan races (`multi_thread_rebuild`/`Update`/memcpy on node
+fields), post-fix 0; BOTH concurrency tests run TSan-clean **with the
+suppressions file emptied** (the `race:multi_thread_rebuild` /
+`race:multi_thread_ptr` entries are deleted, so any regression now fails the
+gate). Live data-path TSan sweep: clean, IEKF rate unchanged, clean shutdown.
+
+**Detection-power caveat (be honest with yourself when re-running):** the
+pre-fix window is deep in scheduler territory — it fired reliably only on a
+heavily loaded host (CPU oversubscription stretches the rebuild thread's
+flatten/swap windows into the mutator's bursts); several pre-fix runs on a
+lightly loaded box reported nothing. The committed stress is therefore a
+CANARY: any TSan report is a real regression and fails CI
+(`halt_on_error=1`), but a quiet run is necessary, not sufficient. The
+4-vCPU CI runner (4 spin readers + mutator + rebuild thread = oversubscribed)
+is exactly where detection chances are best. See the tuning note in the test
+itself before "optimizing" its configuration — throttled readers and
+full-extent mutation were each measured to make it fast but blind. Bag
+replay remains worthwhile as an end-to-end confidence pass when a bag is
+available.
 
 ---
 
@@ -1008,24 +1022,43 @@ New topic `/localization/resple/diagnostics` (custom msg or
 
 ## Phase 5 — Regression tests
 
-**Status: last.**
+**Status: DONE except the bag-gated smoke test.**
 
-The package ships no tests today. Each earlier phase should contribute tests;
-Phase 5 is about filling gaps and wiring them into CI.
+| Test | Scope | Status |
+| --- | --- | --- |
+| `SplineState` unit | Bounds, bootstrap, pruning | **done** (Phase 3.1: `test_spline_state.cpp`, 10 tests incl. exact prune-equivalence + est_window protocol) |
+| `Association::findCorresp` stress | Multi-threaded `Nearest_Search` under concurrent mutation | **done** (`test_ikdtree_concurrency.cpp`: phased Push_Down test + `RebuildVsMutatorRace` canary) |
+| `Estimator<>` unit | Joseph-form PSD property | **done** (geometry core: `JosephUpdate.ResultIsSymmetricAndPSD` — the in-Estimator update delegates to it) |
+| Bag-replay CI smoke | Replay short bag, pose tolerance, divergence flag | **pending a representative bag** |
+| Sanitizer CI | TSan + ASan gates on every push/PR | **done (this commit)** — see below |
 
-### Targets
+### What landed (this commit)
 
-| Test | Scope |
-| --- | --- |
-| `SplineState` unit | Bounds, bootstrap, (future) pruning |
-| `Association::findCorresp` stress | Multi-threaded `Nearest_Search` under concurrent mutation (validates Phase 2.1) |
-| `Estimator<>` unit | Joseph-form PSD property preserved across iterations |
-| Bag-replay CI smoke | Replay short sim bag, compare final pose to tolerance, fail on divergence flag |
-| Sanitizer CI | Nightly build + smoke test with `ENABLE_TSAN=ON` and `ENABLE_ASAN=ON` |
+- **`.github/workflows/unit-tests.yml`** now has three jobs:
+  - `estimator-core` — the ROS-free suite (also gained the previously missing
+    `libboost-math-dev`, which `test_spline_state` → `math_tools.h` needs —
+    CI would have broken on the Phase 3.1 commit otherwise);
+  - `estimator-core-asan` — the same suite under ASan+UBSan with
+    `detect_leaks=1` (no PCL installed, so the long ikd-Tree stress is
+    excluded there by the existing PCL gate);
+  - `ikdtree-tsan` — both ikd-Tree concurrency tests under ThreadSanitizer,
+    run directly (no ctest timeout) with `halt_on_error=1` and the (empty)
+    suppressions file, generous job timeout.
+- **The new ASan job immediately paid for itself**, catching two real issues
+  in the standalone test build:
+  1. the **Phase 1.6 Eigen allocator mismatch** (heap-buffer-overflow in
+     `handmade_aligned_free`) — the package build pins
+     `_GNU_SOURCE`/`EIGEN_MALLOC_ALREADY_ALIGNED=1`/`EIGEN_DEFAULT_ALIGN_BYTES=16`
+     but the standalone test build never did; it now applies the same pinning;
+  2. a **1-node leak per `KD_TREE::Build()`** — upstream allocates
+     `STATIC_ROOT_NODE` and never frees it; the destructor (and a re-`Build`)
+     now release it.
+- ctest timeouts for the concurrency binary raised 120 → 300 s (native
+  runtime of the stress is ~10 s on a many-core box but ~70 s on 4 cores).
 
-### Wire-up
-Flip `BUILD_TESTING` to `ON` for this package in `colcon_defaults.yaml`
-(currently OFF workspace-wide). Add the gtest binaries to `ament_add_gtest`.
+The old wire-up note (flip `BUILD_TESTING` in `colcon_defaults.yaml`) is
+overtaken: the package's colcon `BUILD_TESTING` path has been live since the
+Phase 3.1 commit (all unit tests run under `colcon test`).
 
 ---
 

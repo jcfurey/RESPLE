@@ -41,6 +41,15 @@ KD_TREE<PointType>::~KD_TREE()
     stop_thread();
     Delete_Storage_Disabled = true;
     delete_tree_nodes(&Root_Node);
+    // Build() allocates STATIC_ROOT_NODE separately (Root_Node is its left
+    // son, freed above) but upstream never released it — a 1-node leak per
+    // Build()/instance, flagged by the Phase 5 LeakSanitizer CI job.
+    if (STATIC_ROOT_NODE != nullptr)
+    {
+        pthread_mutex_destroy(&(STATIC_ROOT_NODE->push_down_mutex_lock));
+        delete STATIC_ROOT_NODE;
+        STATIC_ROOT_NODE = nullptr;
+    }
     PointVector().swap(PCL_Storage);
     Rebuild_Logger.clear();
 }
@@ -422,6 +431,14 @@ void KD_TREE<PointType>::Build(PointVector point_cloud)
     if (Root_Node != nullptr)
     {
         delete_tree_nodes(&Root_Node);
+    }
+    // Same leak shape as the destructor fix: a re-Build() would otherwise
+    // orphan the previous STATIC_ROOT_NODE (Root_Node above is its left son).
+    if (STATIC_ROOT_NODE != nullptr)
+    {
+        pthread_mutex_destroy(&(STATIC_ROOT_NODE->push_down_mutex_lock));
+        delete STATIC_ROOT_NODE;
+        STATIC_ROOT_NODE = nullptr;
     }
     if (point_cloud.size() == 0)
         return;

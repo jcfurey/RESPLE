@@ -135,7 +135,7 @@ TEST(IkdTreeConcurrency, ParallelSearchPushDownRace)
     // Kept modest so the test finishes quickly even under ThreadSanitizer's
     // ~30x slowdown. The Push_Down race fires within the first couple of cycles
     // (pre-fix TSan flags it almost immediately), so this is ample to guard it
-    // without inviting long runtimes or the pre-existing rebuild-path deadlock
+    // without inviting long runtimes or the historical rebuild-path hazards
     // (see resple/test/tsan_suppressions.txt) to surface as a hang.
     constexpr int kReaders = 10;
     constexpr int kCycles = 8;
@@ -240,6 +240,24 @@ TEST(IkdTreeConcurrency, RebuildVsMutatorRace)
     ASSERT_GT(tree.size(), 0);
 
     constexpr int kReaders = 4;
+    // HONEST NOTE on detection power (measured during the Phase 2.5 #1 fix
+    // session): the pre-fix rebuild-vs-mutator races are deep in scheduler
+    // territory. With this configuration TSan reported ~200 races against
+    // the pre-fix tree on a heavily loaded host, and 0 against the fixed
+    // tree on identical back-to-back runs — but on a lightly loaded
+    // many-core machine the pre-fix window may not be hit at all (several
+    // 0-report pre-fix runs were also observed). Treat this test as a
+    // CANARY, not a proof of absence: any TSan report here is a real
+    // regression and fails the CI gate (halt_on_error=1); a quiet run is
+    // necessary, not sufficient. Detection chances are best exactly where
+    // the CI job runs it (4-vCPU runner: the 4 spin readers + mutator +
+    // rebuild thread oversubscribe the machine, stretching the rebuild
+    // thread's flatten/swap windows into the mutator's bursts). Keep the
+    // spin readers and hot-region bursts — throttled readers or
+    // full-extent spread were measured to make the test fast but blind.
+    // Native runtime ~9 s; under TSan expect minutes; under ASan it can
+    // exceed the 120 s ctest timeout (run the phased test above for the
+    // ASan/UAF angle instead).
     constexpr int kMutCycles = 6;
 
     std::shared_mutex map_mtx;  // stands in for RESPLE's mtx_map_
@@ -252,17 +270,21 @@ TEST(IkdTreeConcurrency, RebuildVsMutatorRace)
         long n = 0;
         while (!stop.load(std::memory_order_relaxed))
         {
-            std::shared_lock<std::shared_mutex> lk(map_mtx);
-            const Point q = makePoint(rng, 0.0f, kHotExtent);
-            PointVector found;
-            std::vector<float> dist;
-            tree.Nearest_Search(q, 5, found, dist, 50.0f);
-            if (found.size() != dist.size())
-                error_flag.store(1, std::memory_order_relaxed);
-            for (float dd : dist)
-                if (!std::isfinite(dd) || dd < 0.0f)
-                    error_flag.store(2, std::memory_order_relaxed);
-            ++n;
+            {
+                std::shared_lock<std::shared_mutex> lk(map_mtx);
+                const Point q = makePoint(rng, 0.0f, kHotExtent);
+                PointVector found;
+                std::vector<float> dist;
+                tree.Nearest_Search(q, 5, found, dist, 50.0f);
+                if (found.size() != dist.size())
+                    error_flag.store(1, std::memory_order_relaxed);
+                for (float dd : dist)
+                    if (!std::isfinite(dd) || dd < 0.0f)
+                        error_flag.store(2, std::memory_order_relaxed);
+                ++n;
+            }
+            // PURE spin — the reader pressure is load-bearing for detection
+            // (see the tuning note above).
         }
         total_searches.fetch_add(n, std::memory_order_relaxed);
     };
@@ -283,12 +305,19 @@ TEST(IkdTreeConcurrency, RebuildVsMutatorRace)
         {
             std::unique_lock<std::shared_mutex> lk(map_mtx);
             std::vector<BoxPointType> boxes;
+            // HOT-REGION bursts (not full-extent): repeatedly deleting and
+            // re-adding inside the same subtrees drives their deletion /
+            // balance ratios past the rebuild criterion, so the multi-thread
+            // rebuild keeps firing — full-extent spread leaves the tree
+            // balanced and the rebuild thread idle (nothing to race).
             for (int b = 0; b < 5; ++b)
                 boxes.push_back(makeBox(mut_rng, 16.0f));
             tree.Delete_Point_Boxes(boxes);
             PointVector add = makeCloud(mut_rng, 2500, 0.0f, kHotExtent);
             tree.Add_Points(add, false);
         }
+        // Brief gap so the rebuild thread can pick up the queued rebuild —
+        // the NEXT burst then lands while it is mid-rebuild.
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     stop.store(true, std::memory_order_relaxed);
