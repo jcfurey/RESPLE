@@ -224,6 +224,53 @@ docker attach resple
 docker stop resple
 ```
 
+## Robustness, diagnostics & tuning
+
+This fork carries a substantial hardening series on top of upstream RESPLE —
+concurrency fixes (ikd-Tree search/rebuild races, lifecycle teardown),
+bounded memory (sliding-window B-spline knot pruning, optional map radius
+pruning, optional input-buffer caps), filter-health monitoring (windowed NIS
+divergence detection with selectable recovery policy), and a typed
+diagnostics stream. The full engineering log lives in
+[`HARDENING.md`](HARDENING.md); the architecture notes are in
+[`CLAUDE.md`](CLAUDE.md).
+
+Operational highlights:
+
+* **Typed diagnostics** — the estimator publishes `estimate_msgs/Diagnostics`
+  on `resple_diagnostics` (~20 Hz): spline/buffer state, NIS + filter
+  verdict, pose-covariance health, the correspondence funnel, and per-stage
+  frame timings. Plottable directly in Foxglove or PlotJuggler; standard
+  string-keyed status remains on `/diagnostics`.
+* **Divergence recovery** — `nis_recovery_mode` selects what happens when the
+  filter becomes inconsistent: `"off"` (default, log only), `"hold"` (suspend
+  odometry/TF until the consistency window recovers), or `"reset"` (reinflate
+  the filter covariance to its prior).
+* **Bounded memory** — knot pruning is on by default
+  (`spline_prune_keep_knots: 600`) and is exact over the retained window;
+  map radius pruning and input-buffer caps are available as opt-in knobs.
+* **All defaults are behaviour-preserving** — an existing config keeps
+  producing the same estimates.
+
+The complete parameter and topic reference is
+[`doc/PARAMETERS.md`](doc/PARAMETERS.md). The live-sensor launch files accept
+`config_file:=/path/to/your.yaml`, so a copied config can be used without
+editing the installed one. The commented blocks at the bottom
+of [`config_pointcloud2.yaml`](resple/config/config_pointcloud2.yaml),
+[`config_ouster.yaml`](resple/config/config_ouster.yaml) and
+[`config_demonstrator.yaml`](resple/config/config_demonstrator.yaml) show
+every knob in place.
+
+### Tests & CI
+
+The estimator math, spline pruning, plane fit, filter-health and box-geometry
+cores are unit-tested without ROS (`./scripts/run_unit_tests.sh` — Eigen +
+GoogleTest only). CI runs that suite plain and under AddressSanitizer/UBSan
+(leak-checked), plus the ikd-Tree concurrency regressions under
+ThreadSanitizer with an empty suppressions list. A live synthetic-injection
+sanitizer sweep for the full node pipeline is available via
+`./scripts/run_data_sweep.sh`.
+
 ## Contributors
 Ziyu Cao (Email: ziyu.cao@liu.se)
 

@@ -8,10 +8,13 @@ from launch.substitutions import LaunchConfiguration, PythonExpression
 
 
 def generate_launch_description():
-    config_yaml_fusion = os.path.join(
-        get_package_share_directory('resple'),
-        'config',
-        'config_demonstrator.yaml')
+    config_file_arg = DeclareLaunchArgument(
+        'config_file',
+        default_value=os.path.join(
+            get_package_share_directory('resple'), 'config', 'config_demonstrator.yaml'),
+        description='Parameter YAML for both nodes — pass a copied/adapted '
+                    'config without editing the installed one.')
+    config_yaml_fusion = LaunchConfiguration('config_file')
     viz_launch = os.path.join(
         get_package_share_directory('resple'),
         'launch',
@@ -65,6 +68,7 @@ def generate_launch_description():
         actions=[mapping_node])
 
     return launch.LaunchDescription([
+        config_file_arg,
         start_delay_arg,
         mapping_delay_arg,
         launch_ros.actions.Node(

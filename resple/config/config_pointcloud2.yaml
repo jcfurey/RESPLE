@@ -73,3 +73,34 @@
 
     imu_init_num_samples: 50     # IMU samples averaged during stationary init
     imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+
+    # ------------------------------------------------------------------
+    # Robustness & diagnostics (see doc/PARAMETERS.md and HARDENING.md).
+    # Everything below is optional; the values shown are the built-in
+    # defaults, which preserve the estimator's historical behaviour.
+    # Typed runtime health is published on `resple_diagnostics`
+    # (estimate_msgs/Diagnostics, ~20 Hz, plottable in Foxglove/PlotJuggler).
+    # ------------------------------------------------------------------
+    spline_prune_keep_knots: 600   # knots kept in memory (~6 s @ knot_hz 100);
+                                   # retained-window interpolation is identical
+                                   # to the unpruned spline. 0 = unbounded.
+    nn_max_sq_dist: 5.0            # k-th-neighbor max squared distance (m^2);
+                                   # k-NN search radius = sqrt of this
+    plane_fit_thresh: 0.1          # plane-fit residual threshold (m)
+    plane_min_cond_ratio: 0.0      # plane degeneracy guard (QR pivot ratio);
+                                   # 0 = off. Benchmark before enabling — it
+                                   # changes which matches feed the filter.
+    nis_window: 32                 # filter-consistency (NIS) window, IEKF cycles
+    nis_warn_ratio: 2.0            # WARN when NIS mean > ratio x dof
+    nis_diverged_ratio: 4.0        # DIVERGED threshold
+    nis_breach_limit: 3            # consecutive breaches before DIVERGED
+    nis_recovery_mode: "off"       # "off" = log+diagnostics only
+                                   # "hold" = suspend odom/TF while DIVERGED
+                                   # "reset" = reinflate filter covariance
+                                   # (keep quotes: bare off is YAML false)
+    map_prune_radius: 0.0          # keep only map points within this radius (m)
+                                   # of the pose (floored at 2x det range);
+                                   # 0 = cube-only (cube_len)
+    max_scan_buffer: 0             # per-LiDAR raw-scan cap (scans, drop-oldest);
+                                   # 0 = unbounded
+    max_imu_staging: 2000          # IMU staging cap (samples, drop-oldest)
