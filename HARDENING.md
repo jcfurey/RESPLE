@@ -14,14 +14,15 @@ Companion docs:
 
 | Phase | Title | Status | Commit |
 | --- | --- | --- | --- |
-| 0   | Instrument before changing code | **Complete (code); user bag-replay pending** | `74f9078` |
+| 0   | Instrument before changing code | **Complete (code)**; bag replay folded into §6.1 | `74f9078` |
 | 1   | Safety fixes (initial) | **Complete** | `512da1d` |
 | 1.5 | Defensive crash-hardening (3-pass) | **Complete** | `14e9be8` |
-| 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete (this commit)** — see "Phase 1.6" below | this commit |
-| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 + 2.5 #1 + 2.5 #2 + 2.6 + 2.7 FIXED + TSan-verified; 2.3 pending data** — see below | this commit |
-| 3   | Spline / mapping accuracy | **3.1 knot pruning IMPLEMENTED (this commit)** — gate satisfied by the 2.6 live measurement; 3.3 detection done (recovery policy pending); 3.2 / 3.4 pending | this commit |
-| 4   | Diagnostics publisher | Can start after Phase 3 begins | — |
-| 5   | Regression tests | Last | — |
+| 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete** — diagnosis later independently confirmed by the Phase 5 ASan gate; see the updated "What's still open" | — |
+| 2   | Concurrency hardening | **Complete** — 2.1/2.2 via 1.5; 2.4 + 2.5 #1 + 2.5 #2 + 2.6 + 2.7 fixed + TSan-verified; 2.3 capability landed (default-off per gate) | — |
+| 3   | Spline / mapping accuracy | **Complete** — 3.1 pruning; 3.2 parameterized + instrumented; 3.3 detection + recovery modes; 3.4 radius pruning (opt-in). Tuning passes → §6.3/§6.4 | — |
+| 4   | Diagnostics publisher | **Complete** — `estimate_msgs/Diagnostics` on `resple_diagnostics`, ~20 Hz typed | — |
+| 5   | Regression tests | **Complete except §6.2** — ROS-free + ASan/UBSan + ikd-Tree TSan CI gates | — |
+| 6   | Bag-gated validation & tuning | **Designed, awaiting a bag** — §6.1 sanitizer replay, §6.2 CI smoke, §6.3 plane-fit tuning, §6.4 recovery policy | — |
 
 Commits are in the `resple` submodule on `develop`, relative to `fced6a1`.
 
@@ -890,8 +891,8 @@ live TSan data-path sweep clean with the counters active in the OpenMP
 parallel region (thread-local tallies, one atomic merge per thread).
 
 **Remaining (tuning, needs bags):** choose a production `plane_min_cond_ratio`
-(and revisit `nn_max_sq_dist` per sensor) by benchmarking trajectory error on
-a known-good bag, watching the new funnel counters.
+(and revisit `nn_max_sq_dist` per sensor) — full procedure and decision gate
+in §6.3.
 
 ### 3.3 Divergence detection and recovery — **DETECTION DONE**
 
@@ -1037,7 +1038,7 @@ New topic `/localization/resple/diagnostics` (custom msg or
 | `SplineState` unit | Bounds, bootstrap, pruning | **done** (Phase 3.1: `test_spline_state.cpp`, 10 tests incl. exact prune-equivalence + est_window protocol) |
 | `Association::findCorresp` stress | Multi-threaded `Nearest_Search` under concurrent mutation | **done** (`test_ikdtree_concurrency.cpp`: phased Push_Down test + `RebuildVsMutatorRace` canary) |
 | `Estimator<>` unit | Joseph-form PSD property | **done** (geometry core: `JosephUpdate.ResultIsSymmetricAndPSD` — the in-Estimator update delegates to it) |
-| Bag-replay CI smoke | Replay short bag, pose tolerance, divergence flag | **pending a representative bag** |
+| Bag-replay CI smoke | Replay short bag, pose tolerance, divergence flag | **pending a representative bag — design ready in §6.2** |
 | Sanitizer CI | TSan + ASan gates on every push/PR | **done (this commit)** — see below |
 
 ### What landed (this commit)
@@ -1067,6 +1068,121 @@ New topic `/localization/resple/diagnostics` (custom msg or
 The old wire-up note (flip `BUILD_TESTING` in `colcon_defaults.yaml`) is
 overtaken: the package's colcon `BUILD_TESTING` path has been live since the
 Phase 3.1 commit (all unit tests run under `colcon test`).
+
+---
+
+## Phase 6 — Bag-gated work: implementation-ready designs
+
+**Status: DESIGNED, blocked only on a representative recorded dataset.**
+Everything else in this plan is implemented. The four items below are the
+remaining work; each is written so a future session can execute it without
+re-deriving the approach (same convention as the §2.4 design that preceded
+its implementation). Items 6.1–6.2 are validation passes; 6.3–6.4 produce
+parameter/policy decisions.
+
+**Shared prerequisite:** one or more representative bags. Minimum viable:
+a 3–10 min sequence with the production sensor (Ouster OS1-16 + built-in
+IMU) covering normal motion. Ideal additions: a geometrically degenerate
+stretch (long corridor/tunnel) for 6.3/6.4, and ground truth (or a trusted
+reference trajectory) for 6.3. The upstream dataset configs
+(`config_eee02.yaml` etc.) are usable stand-ins for everything except
+production-faithful tuning.
+
+### 6.1 Sanitizer bag replay (closes the original Phase 0 task)
+
+Goal: end-to-end memory/thread-safety confidence on REAL data — the live
+synthetic sweep (`run_data_sweep.sh`) covers the pipeline shape but not real
+timing, dropout, or point-distribution patterns.
+
+Steps:
+1. `./scripts/run_sanitizer_replay.sh tsan <bag>` with `num_threads: 1` in
+   the config (libgomp barriers are TSan false positives; the data-sweep
+   script's sed trick shows how). Save stderr.
+2. Same with `asan`. ASan needs no thread cap.
+3. Pass criteria: zero TSan reports (suppressions file is empty and must
+   stay so), zero ASan/LSan reports, clean SIGINT shutdown, and the
+   `resple_diagnostics` stream showing: knot plateau at
+   `spline_prune_keep_knots`, `dropped_* == 0` (caps default-off),
+   `deskew_out_of_range == 0`, `iekf_numerical_failures == 0`.
+4. Deliverable: paste the run summary into this file under a dated note;
+   if anything fires, the stack IS the bug — file it as a new hazard row.
+
+### 6.2 Bag-replay CI smoke (last open Phase 5 row)
+
+Goal: a CI job that replays a SHORT bag (30–60 s is enough) and fails on
+regression — the missing end-to-end gate above the unit/concurrency tiers.
+
+Design:
+- New `scripts/run_bag_smoke.sh <bag_dir> <expected_pose_file>`:
+  1. Build workspace (reuse `scripts/build_workspace.sh`).
+  2. Launch `resple_pointcloud2.launch.py config_file:=<smoke config>`
+     (or the sensor-specific launch matching the bag).
+  3. `ros2 bag play` to completion + grace period; SIGINT the nodes.
+  4. Assertions, all from a recorded `resple_diagnostics` + `odom` capture:
+     - final pose within tolerance of `<expected_pose_file>` (golden pose
+       from a verified run; position ‖Δp‖ < 0.5 m, yaw < 5° for a short
+       indoor bag — tighten once measured variance is known);
+     - `filter_state` never DIVERGED; `iekf_numerical_failures == 0`;
+     - node exit codes 0 (shutdown hardening regression check).
+  5. Subscriber tooling: a small C++ capture node compiled ad-hoc (the
+     `rclpy` CLI may be unusable in minimal sandboxes — see the diagprobe
+     pattern from the Phase 4 verification; consider committing it under
+     `resple/test/tools/diag_capture/`).
+- Bag hosting: CI runners can't assume a large artifact. Options, in order
+  of preference: (a) trim a 30 s bag to < 100 MB and store with Git LFS;
+  (b) a release-asset download step with checksum; (c) keep the job
+  `workflow_dispatch`-only on a self-hosted runner with local data.
+- CI wiring: separate job in `unit-tests.yml`, `if:` gated on the bag
+  being retrievable so its absence skips rather than fails.
+
+### 6.3 §3.2 plane-fit threshold tuning
+
+Goal: decide the production `plane_min_cond_ratio` (degeneracy guard,
+currently 0 = off) and sanity-check `nn_max_sq_dist` / `plane_fit_thresh`
+per sensor.
+
+Procedure (per candidate bag, ideally one normal + one degenerate):
+1. Baseline run with defaults; record `resple_diagnostics` and the
+   trajectory (`odom`).
+2. Sweep `plane_min_cond_ratio` over {1e-4, 1e-3, 1e-2, 5e-2} (QR pivot
+   ratio is scale-invariant; expect the interesting region between 1e-3
+   and 1e-2). One run each.
+3. Compare per run:
+   - trajectory error vs reference (e.g. `evo_ape` against ground truth,
+     or against the baseline when no GT exists);
+   - funnel deltas: `passed_plane/passed_knn` (how many patches the guard
+     rejects) and `used` (how much measurement support the IEKF retains —
+     a guard that costs >10–20 % of `used` on NORMAL geometry is too hot);
+   - NIS window mean (consistency should improve or hold on degenerate
+     stretches if the guard is doing its job).
+4. Decision gate: enable (set a default in the example configs +
+   `readParameters`) only if degenerate-stretch error improves while
+   normal-geometry `used` and trajectory error are within noise.
+   Otherwise leave 0 and record the numbers here.
+
+### 6.4 §3.3 recovery-policy validation (hold vs reset)
+
+Goal: pick the production `nis_recovery_mode` default (currently "off").
+
+Needs a bag with a REAL divergence episode. If none exists, manufacture
+one deterministically from a good bag: e.g. corrupt the extrinsics
+(`q_lb` rotated by ~10°) for one run, or pre-filter the bag to drop all
+scans for a 2–3 s window mid-run (forces an IMU-only stretch and a
+correspondence shock on re-entry).
+
+Procedure: identical replay under `off` / `hold` / `reset`; compare:
+- detection latency (first DIVERGED verdict timestamp — same for all);
+- during the episode: `off` publishes the bad pose (downstream EKF would
+  ingest it), `hold` gates output (measure the outage duration via
+  `recovery_hold_active`), `reset` reinflates covariance
+  (`recovery_resets` count, watch for reset thrash — repeated resets in
+  one episode mean the threshold or the reinflation is wrong);
+- after the episode: time until NIS mean returns < `nis_warn_ratio`, and
+  end-of-run trajectory error per mode.
+Decision gate: `hold` is the expected production winner for the
+odom-EKF-fed deployment (a gap is recoverable downstream; a poisoned pose
+is not). `reset` wins only if it recovers materially faster without
+thrash. Record the choice in the workspace config and the params docs.
 
 ---
 
