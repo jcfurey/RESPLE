@@ -1238,6 +1238,29 @@ Design:
 
 ### 6.3 §3.2 plane-fit threshold tuning
 
+#### Accuracy baseline — HelmDyn01 LIO, 2026-06-10 (default config)
+
+Established before any tuning, as the reference to beat. RESPLE in LIO
+(`if_lidar_only:false`), clean Release build, full HelmDyn01 replay; estimator
+`/odom` captured to TUM (`scripts/record_tum.py`) and compared to the mocap GT
+(`scripts/traj_eval.py`, cross-checked with `evo`).
+
+- **APE (translation, SE3-aligned): RMSE 4.7 cm** (mean 4.2, median 3.8,
+  max 29 cm) over a **199.9 m** trajectory = **0.021 %** of path length.
+  evo agrees (rmse 4.74 cm). `/odom` is 100 Hz, monotonic.
+- LIO accuracy is excellent — the previously-observed global-map "smearing"
+  was an **LO-mode** artifact, not present in LIO.
+- **GT caveat:** the HelmDyn mocap GT *orientation* is unreliable (flips:
+  95th-pct consecutive step ~120°, max 180°), so RPE / rotation metrics against
+  it are meaningless — it is a **position-only** reference (matches the dataset
+  readme, which provides only a translation offset `t_L_gt`). Use ATE/APE
+  translation for HelmDyn accuracy.
+- **Tooling note:** replay scripts must launch the node *executables directly*,
+  not via `ros2 run` — killing the `ros2 run` wrapper leaves the node binary
+  alive, and leaked `/odom` publishers corrupt later runs (observed: a stray
+  identity-pose publisher polluted a first attempt). `scripts/*.sh` now direct-
+  exec + `pkill -x` on teardown.
+
 Goal: decide the production `plane_min_cond_ratio` (degeneracy guard,
 currently 0 = off) and sanity-check `nn_max_sq_dist` / `plane_fit_thresh`
 per sensor.
