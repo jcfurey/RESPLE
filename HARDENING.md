@@ -18,7 +18,7 @@ Companion docs:
 | 1   | Safety fixes (initial) | **Complete** | `512da1d` |
 | 1.5 | Defensive crash-hardening (3-pass) | **Complete** | `14e9be8` |
 | 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete (this commit)** — see "Phase 1.6" below | this commit |
-| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 Push_Down race + 2.5 #2 deadlock + 2.6 two data-path races FIXED + TSan-verified; 2.3 pending data; 2.5 #1 rebuild-vs-mutator race deferred** — see below | this commit |
+| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 + 2.5 #1 + 2.5 #2 + 2.6 + 2.7 FIXED + TSan-verified; 2.3 pending data** — see below | this commit |
 | 3   | Spline / mapping accuracy | **3.1 knot pruning IMPLEMENTED (this commit)** — gate satisfied by the 2.6 live measurement; 3.3 detection done (recovery policy pending); 3.2 / 3.4 pending | this commit |
 | 4   | Diagnostics publisher | Can start after Phase 3 begins | — |
 | 5   | Regression tests | Last | — |
@@ -396,7 +396,8 @@ standalone justification.
 **Status: 2.1 fixed (Phase 1.5 K1); 2.2 partially fixed (Phase 1.5 Fix C);
 2.3 still pending Phase 0 data; 2.4 (Push_Down race) IMPLEMENTED + TSan-verified;
 2.5 #2 (rebuild lock-order deadlock) FIXED + TSan-verified; 2.5 #1
-(rebuild-vs-mutator data race) deferred.**
+(rebuild-vs-mutator data race) FIXED + TSan-verified (recursive whole-op
+working_flag_mutex — see 2.5 below).**
 
 Three independent items. 2.1 was preempted by Phase 1.5 (defensive shared
 lock); 2.2's immediate race was closed by Phase 1.5 Fix C, full state-enum
@@ -577,7 +578,7 @@ node visited only when `need_push_down_to_*` is set (the pre-check skips the
 lock otherwise) — deletions are bursty (FOV segment + downsample), so the
 common search path stays lock-free.
 
-### 2.5 Rebuild-path hazards surfaced by the 2.4 stress test — **#1 DEFERRED, #2 FIXED**
+### 2.5 Rebuild-path hazards surfaced by the 2.4 stress test — **#1 FIXED, #2 FIXED**
 
 **Status: found while TSan-verifying 2.4; both pre-existing (present with AND
 without the 2.4 change) and inherited from upstream HKU-MARS. #1 (rebuild-vs-
@@ -585,7 +586,7 @@ mutator data race) remains deferred and suppressed in
 `resple/test/tsan_suppressions.txt`. #2 (the lock-order inversion / deadlock)
 is FIXED this commit.**
 
-1. **(DEFERRED) Rebuild-thread vs. mutator data race on `KD_TREE_NODE` fields.**
+1. **(FIXED — recursive whole-op `working_flag_mutex`, see below) Rebuild-thread vs. mutator data race on `KD_TREE_NODE` fields.**
    `multi_thread_rebuild` reads `(*Rebuild_Ptr)->father_ptr` (`ikd_Tree.cpp`
    ~255) while a concurrent mutator's `Update` writes `father_ptr`/aggregate
    fields (~1564), and the rebuild swap's ancestor `Update`-walk touches nodes
@@ -638,13 +639,38 @@ is FIXED this commit.**
    testing), and #1 was already the deferred upstream behavior. Fully suppressing
    #1 as well would need the larger redesign below.
 
-**Remaining work on #1 (deferred):** a complete fix needs consistent lock
-ordering between the mutators and the rebuild thread — e.g. a recursive
-`working_flag_mutex` so a mutator can hold it across its whole op (excluding the
-rebuild thread's critical sections) without self-deadlocking on the internal
-boundary acquisition; or routing all rebuilds through the single background
-thread; or making the few raced `KD_TREE_NODE` pointer/aggregate fields atomic.
-Each needs bag-replay validation (no bag available yet) before landing.
+**#1 FIX (landed):** the recursive-`working_flag_mutex` option, chosen after a
+new aggressive stress (`IkdTreeConcurrency.RebuildVsMutatorRace`, production
+`mtx_map_` discipline + bursty deletes hammering multi-thread rebuilds) showed
+the raced field set is wider than first diagnosed — the mutator pull-up
+`Update()` rewrites the node range float-arrays (memcpy), `alpha_*` and child
+links as well as `father_ptr`, so field-level atomics could not cover it.
+
+- `working_flag_mutex` is now initialized `PTHREAD_MUTEX_RECURSIVE`
+  (`start_thread`), and the four public mutators (`Add_Points`,
+  `Add_Point_Boxes`, `Delete_Points`, `Delete_Point_Boxes`) hold it across
+  their WHOLE operation (`ScopedPthreadLock` RAII); their internal rebuild-
+  boundary acquisitions nest on the recursive mutex.
+- This gives the mutator and the rebuild thread mutual exclusion over the
+  shared ancestor region (pull-up writes vs the rebuild's `father_ptr` read +
+  swap ancestor `Update`-walk) that previously raced with no common lock.
+- Lock-order safety: order stays `working_flag → {search_rw, rebuild_logger,
+  per-node push_down}` on both sides; `Rebuild()` only TRYlocks
+  `rebuild_ptr_mutex_lock`, so the opposite-order pairing with
+  `multi_thread_rebuild` cannot deadlock — a contended trylock defers the
+  rebuild request to a later mutation.
+- Cost: a mutator can now also block on the rebuild thread's flatten/swap
+  sections when operating on a DISJOINT subtree (previously only boundary-
+  touching ops blocked). Production has one map mutator (the async map task)
+  and the live sweep shows an unchanged IEKF rate.
+
+**Verification:** pre-fix the new stress reports ~200 TSan races
+(`multi_thread_rebuild`/`Update`/memcpy on node fields); post-fix BOTH
+concurrency tests run TSan-clean **with the suppressions file emptied** (the
+`race:multi_thread_rebuild` / `race:multi_thread_ptr` entries are deleted, so
+any regression now fails the gate). Live data-path TSan sweep: clean, IEKF
+rate unchanged, clean shutdown. Bag replay remains worthwhile as an
+end-to-end confidence pass when a bag is available.
 
 ---
 

@@ -6,6 +6,24 @@ Author: Yixi Cai
 email: yixicai@connect.hku.hk
 */
 
+// HARDENING Phase 2.5 #1: RAII whole-operation lock for the public mutators.
+// working_flag_mutex is recursive (see start_thread), so the internal
+// boundary acquisitions nest safely. Lock order stays consistent with the
+// rebuild thread (working_flag -> search_rw / rebuild_logger / per-node
+// push_down locks); Rebuild() only TRYlocks rebuild_ptr_mutex_lock, so the
+// opposite-order pairing with multi_thread_rebuild cannot deadlock — a
+// contended trylock just defers the rebuild request to a later mutation.
+namespace {
+struct ScopedPthreadLock
+{
+    pthread_mutex_t* m_;
+    explicit ScopedPthreadLock(pthread_mutex_t* m) : m_(m) { pthread_mutex_lock(m_); }
+    ~ScopedPthreadLock() { pthread_mutex_unlock(m_); }
+    ScopedPthreadLock(const ScopedPthreadLock&) = delete;
+    ScopedPthreadLock& operator=(const ScopedPthreadLock&) = delete;
+};
+}  // namespace
+
 template <typename PointType>
 KD_TREE<PointType>::KD_TREE(float delete_param, float balance_param, float box_length)
 {
@@ -196,7 +214,19 @@ void KD_TREE<PointType>::start_thread()
     pthread_mutex_init(&rebuild_ptr_mutex_lock, NULL);
     pthread_mutex_init(&rebuild_logger_mutex_lock, NULL);
     pthread_mutex_init(&points_deleted_rebuild_mutex_lock, NULL);
-    pthread_mutex_init(&working_flag_mutex, NULL);
+    // HARDENING Phase 2.5 #1: working_flag_mutex is RECURSIVE so the public
+    // mutators (Add_Points / Add_Point_Boxes / Delete_Points /
+    // Delete_Point_Boxes) can hold it across their WHOLE operation while
+    // their internals re-acquire it at rebuild boundaries (the upstream
+    // handshake). This gives the mutator and the rebuild thread mutual
+    // exclusion over the shared ancestor region (father_ptr / range / alpha
+    // pull-up writes vs the rebuild's father_ptr read + swap ancestor walk)
+    // that previously raced with no common lock.
+    pthread_mutexattr_t wf_attr;
+    pthread_mutexattr_init(&wf_attr);
+    pthread_mutexattr_settype(&wf_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&working_flag_mutex, &wf_attr);
+    pthread_mutexattr_destroy(&wf_attr);
     pthread_create(&rebuild_thread, NULL, multi_thread_ptr, (void *)this);
 }
 
@@ -457,6 +487,9 @@ void KD_TREE<PointType>::Radius_Search(PointType point, const float radius, Poin
 template <typename PointType>
 int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
 {
+    // Phase 2.5 #1: exclude the rebuild thread's ancestor reads/writes for
+    // the whole operation (see ScopedPthreadLock comment at the top of file).
+    ScopedPthreadLock whole_op_lock(&working_flag_mutex);
     // Lock discipline (Phase 1.5 K1, corrected in Phase 2.5).
     //
     // The rebuild thread holds working_flag_mutex while taking search_rw_mutex_
@@ -604,6 +637,9 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
 template <typename PointType>
 void KD_TREE<PointType>::Add_Point_Boxes(vector<BoxPointType> &BoxPoints)
 {
+    // Phase 2.5 #1: exclude the rebuild thread's ancestor reads/writes for
+    // the whole operation (see ScopedPthreadLock comment at the top of file).
+    ScopedPthreadLock whole_op_lock(&working_flag_mutex);
     // Same fast/slow split + Phase 2.5 deadlock fix as Add_Points: the mutating
     // call self-coordinates with the rebuild thread via working_flag_mutex, so
     // it must NOT be wrapped in search_rw_mutex_ (that inverts against the
@@ -638,6 +674,9 @@ void KD_TREE<PointType>::Add_Point_Boxes(vector<BoxPointType> &BoxPoints)
 template <typename PointType>
 void KD_TREE<PointType>::Delete_Points(PointVector &PointToDel)
 {
+    // Phase 2.5 #1: exclude the rebuild thread's ancestor reads/writes for
+    // the whole operation (see ScopedPthreadLock comment at the top of file).
+    ScopedPthreadLock whole_op_lock(&working_flag_mutex);
     // Same fast/slow split + Phase 2.5 deadlock fix as Add_Points: the mutating
     // call self-coordinates via working_flag_mutex; do NOT wrap it in
     // search_rw_mutex_ (inverts with the rebuild thread → deadlock).
@@ -671,6 +710,9 @@ void KD_TREE<PointType>::Delete_Points(PointVector &PointToDel)
 template <typename PointType>
 int KD_TREE<PointType>::Delete_Point_Boxes(vector<BoxPointType> &BoxPoints)
 {
+    // Phase 2.5 #1: exclude the rebuild thread's ancestor reads/writes for
+    // the whole operation (see ScopedPthreadLock comment at the top of file).
+    ScopedPthreadLock whole_op_lock(&working_flag_mutex);
     // Called from RESPLE.cpp's lasermapFovSegment in the async map-update lambda
     // — fires every time the LiDAR moves past the local-map edge. Same fast/slow
     // split + Phase 2.5 deadlock fix as Add_Points: the mutating Delete_by_range
