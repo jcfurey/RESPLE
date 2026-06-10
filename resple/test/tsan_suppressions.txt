@@ -1,29 +1,26 @@
-# ThreadSanitizer suppressions for the ikd-Tree concurrency test
+# ThreadSanitizer suppressions for the ikd-Tree concurrency tests
 # (resple/test/test_ikdtree_concurrency.cpp).
 #
 # Usage:
 #   TSAN_OPTIONS="suppressions=$PWD/resple/test/tsan_suppressions.txt" <test-binary>
 #
-# The production-faithful committed test is TSan-clean WITHOUT any suppressions.
-# This file exists for the more AGGRESSIVE focused stress (the before/after
-# harness with large bursty deletes hammering rebuilds), which still surfaces
-# ONE pre-existing, deferred hazard:
+# INTENTIONALLY EMPTY of active entries.
 #
-# --- Phase 2.5 #1: background rebuild thread vs. a concurrent mutator on
-#     KD_TREE_NODE fields (e.g. father_ptr: multi_thread_rebuild():~255 reads it
-#     while Update():~1564 writes it; plus the ancestor Update-walk during the
-#     subtree swap). Inherited from upstream HKU-MARS ikd-Tree — vanilla
-#     ikd-Tree has no search_rw_mutex_ at all and races here the same way.
-#     Functionally benign in testing (search results stay consistent, err=0),
-#     but a real data race; tracked as a HARDENING Phase 2.5 follow-up.
-race:KD_TREE<pcl::PointXYZINormal>::multi_thread_rebuild
-race:KD_TREE<pcl::PointXYZINormal>::multi_thread_ptr
+# History:
+# - Phase 2.5 #2 (working_flag_mutex <-> search_rw_mutex_ lock-order
+#   inversion): FIXED; its `deadlock:` suppressions were removed so a
+#   regression fails the gate.
+# - Phase 2.5 #1 (background rebuild thread vs concurrent mutator on
+#   KD_TREE_NODE fields — father_ptr / range arrays / alpha_* pull-up writes
+#   vs the rebuild's father_ptr read + swap ancestor Update-walk): FIXED.
+#   working_flag_mutex is now recursive and the public mutators hold it
+#   across their whole operation (see ikd_Tree.cpp start_thread /
+#   ScopedPthreadLock). The former `race:multi_thread_rebuild` /
+#   `race:multi_thread_ptr` suppressions were removed; the
+#   IkdTreeConcurrency.RebuildVsMutatorRace stress now runs TSan-clean with
+#   no suppressions (pre-fix it reports ~200 races), so any regression fails.
 #
-# NOTE: the Phase 2.5 #2 lock-order inversion (working_flag_mutex <->
-# search_rw_mutex_) was FIXED — see HARDENING.md Phase 2.5 and the Add_Points
-# lock-discipline comment. Its `deadlock:` suppressions were REMOVED so that any
-# regression re-introducing the inversion fails the gate.
-#
-# Do NOT add Search / Push_Down here: those are exactly what the test guards
-# (the Phase 2.4 reader-vs-reader race). If a future change reintroduces the
-# Push_Down race it MUST fail.
+# Do NOT add Search / Push_Down / multi_thread_rebuild entries here: those
+# are exactly what the tests guard (Phase 2.4 reader-vs-reader and Phase
+# 2.5 rebuild-path races). New suppressions need a HARDENING.md entry
+# explaining why the underlying race is acceptable.

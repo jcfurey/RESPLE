@@ -283,13 +283,15 @@ public:
     }    
 
     template<typename T>
-    static bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const Eigen::aligned_vector<pcl::PointXYZINormal> &point, const T &threshold)
+    static bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const Eigen::aligned_vector<pcl::PointXYZINormal> &point, const T &threshold,
+                           const T min_cond_ratio = static_cast<T>(0))
     {
         // Delegate to the Eigen-only, unit-tested core (resple::geom::fitPlane,
         // see utils/geometry_core.h + test/test_geometry_core.cpp). The
         // accessor reads the PCL points in place — no intermediate copy — and
-        // min_cond_ratio is left at its 0 default so behaviour is bit-for-bit
-        // identical to the previous inline normal-equation fit.
+        // min_cond_ratio defaults to 0 (HARDENING §3.2 degeneracy guard off)
+        // so behaviour is bit-for-bit identical to the previous inline
+        // normal-equation fit unless a caller opts in.
         return resple::geom::fitPlane<T>(
             static_cast<int>(point.size()),
             [&point](int j, T& x, T& y, T& z) {
@@ -297,7 +299,7 @@ public:
                 y = static_cast<T>(point[j].y);
                 z = static_cast<T>(point[j].z);
             },
-            threshold, pca_result);
+            threshold, pca_result, min_cond_ratio);
     }
 };
 

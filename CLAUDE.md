@@ -247,9 +247,9 @@ This makes multi-threaded k-NN safe by contract; the old `num_threads=1`
 mitigation is retired. Verified with `resple/test/test_ikdtree_concurrency.cpp`
 under ThreadSanitizer (reader-vs-reader `Push_Down` races 16→0). The
 `search_rw_mutex_`↔`working_flag_mutex` rebuild deadlock (hazard 34) was also
-fixed (Phase 2.5 #2); one pre-existing upstream rebuild-vs-mutator data race
-remains (hazard 35, Phase 2.5 #1), deferred and listed in
-`resple/test/tsan_suppressions.txt`.
+fixed (Phase 2.5 #2); the formerly-deferred upstream rebuild-vs-mutator data race
+(hazard 35, Phase 2.5 #1) is now also fixed via a recursive whole-op
+`working_flag_mutex`; `resple/test/tsan_suppressions.txt` is empty.
 
 ## Build configuration
 
@@ -319,10 +319,10 @@ directory). Summary:
 | 0   | Instrumentation + sanitizer builds | code complete (`74f9078`); bag replay pending |
 | 1   | Safety fixes (initial)             | complete (`512da1d`) |
 | 1.5 | Defensive crash-hardening          | complete (`14e9be8`) — 13 fixes across 3 passes |
-| 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 still pending Phase 0 data |
-| 3   | Spline / mapping accuracy          | pending Phase 0 data |
-| 4   | Diagnostics publisher              | after Phase 3 begins |
-| 5   | Regression tests                   | last |
+| 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 capability landed (default-off scan cap); 2.5 #1 fixed |
+| 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.2 instrumented/parameterized (tuning pending bags); 3.3 detection + recovery (off/hold/reset) done; 3.4 radius pruning done (off by default) |
+| 4   | Diagnostics publisher              | done (`estimate_msgs/Diagnostics` on `resple_diagnostics`, ~20 Hz typed; see HARDENING §4) |
+| 5   | Regression tests                   | done except bag-gated smoke (CI: ROS-free + ASan/UBSan + ikd-Tree TSan jobs; Eigen-pin + STATIC_ROOT_NODE leak fixed via the ASan gate) |
 
 ### Known hazards (compact view)
 
@@ -334,11 +334,11 @@ reference (status as of latest pass):
 | 1  | ikd-Tree `Nearest_Search` lock contract unverified | **fixed** (always-shared-lock) | 1.5 K1 |
 | 2  | Init state machine is a bool pair (fragile) | **race fixed** (atomic bools); enum refactor optional | 1.5 C / 2.2 |
 | 3  | `map_update_future_.valid()` racy read | **fixed** | 1 |
-| 4  | Unbounded knot growth | open, measuring | 3.1 |
-| 5  | Unbounded input buffers | open, measuring | 2.3 |
+| 4  | Unbounded knot growth | **fixed** (sliding-window prune in both nodes: `SplineState::pruneFrontKnots` slides the idle window so retained-range interpolation is bit-identical; absolute est_window indexing kept via `totalKnots()`; param `spline_prune_keep_knots`, default 600, 0 disables) | 3.1 |
+| 5  | Unbounded input buffers | **capability landed** (`max_scan_buffer` per-LiDAR drop-oldest, default 0=off; `max_imu_staging` default 2000 replaces the old hardcoded cap; drop counters in diagnostics + the Phase 4 msg) | 2.3 |
 | 6  | `assert()` in hot paths → silent UB under `-DNDEBUG` | **fixed** | 1 |
-| 7  | No divergence detection | partial (failure counter) | 0 → 3.3 |
-| 8  | Plane-fit outlier rejection incomplete | open | 3.2 |
+| 7  | No divergence detection | **fixed** (NIS detector + `nis_recovery_mode` off/hold/reset; hold gates odom/TF while DIVERGED, reset reinflates the IEKF covariance to the prior) | 0 → 3.3 |
+| 8  | Plane-fit outlier rejection incomplete | **instrumented + parameterized** (CorrespConfig: `nn_max_sq_dist`/`plane_fit_thresh`/`plane_min_cond_ratio` params, degeneracy guard off by default pending bag benchmark; per-window funnel counters in diagnostics) | 3.2 |
 | 9  | Deskew out-of-window extrapolation | **fixed (clamp + counter)** | 1 + 1.5 A/B |
 | 10 | `-ffast-math` on | **fixed** | 1 |
 | 11 | `pointBodyToWorld` OOB on out-of-range t_ns (logged but not clamped by Phase 1) | **fixed** | 1.5 A |
@@ -365,9 +365,10 @@ reference (status as of latest pass):
 | 32 | `mapIncremental` passed NaN/Inf points straight to ikd-Tree `Add_by_point`, where `calc_dist` returns NaN, `<` comparisons all false, recursion takes wrong branch, tree state corrupts silently | **fixed** (skip non-finite points; surface counter via WARN_THROTTLE) | post-1.5 |
 | 33 | `ikd-Tree::Push_Down` writes to children's flag fields holding only the parent's per-node lock → races on overlapping subtree paths (dominant caller: findCorresp's OpenMP parallel `Nearest_Search`) | **fixed** (Phase 2.4: `Push_Down` takes the parent's *and* the child's `push_down_mutex_lock`; mutator flag-SET sites take the node's lock; the racy node fields are `std::atomic`; `num_threads=1` mitigation retired). TSan-verified reader-vs-reader races 16→0 via `test_ikdtree_concurrency` | 2.4 |
 | 34 | `working_flag_mutex`↔`search_rw_mutex_` lock-order inversion (real deadlock): Phase 1.5 K1 wrapped the *mutating* fast-path calls in `Add_Points`/`Delete_Points`/etc. in `search_rw_mutex_` shared, but those take `working_flag_mutex` at a deeper rebuild boundary — opposite order to the rebuild thread (`working_flag`→`search_rw` unique). TSan-confirmed; observed to hang | **fixed** (Phase 2.5 #2: drop the shared lock from the 5 mutating fast paths — mutators self-coordinate via `working_flag_mutex`, the upstream mechanism; K1's lock kept on the *search* fns + the genuine `Search_by_range` read). Verified deadlock-free under TSan | 2.5 |
-| 35 | ikd-Tree background rebuild thread vs. concurrent mutator data race on `KD_TREE_NODE` fields (`father_ptr` at `multi_thread_rebuild` ~255 vs `Update` ~1564; ancestor Update-walk during swap) | **documented, deferred to Phase 2.5 #1** (pre-existing upstream HKU-MARS baseline — vanilla ikd-Tree races identically; benign in testing, `err=0`; only the aggressive focused stress triggers it, suppressed in `resple/test/tsan_suppressions.txt`) | 2.5 |
+| 35 | ikd-Tree background rebuild thread vs. concurrent mutator data race on `KD_TREE_NODE` fields (`father_ptr` at `multi_thread_rebuild` ~255 vs `Update` ~1564; ancestor Update-walk during swap) | **fixed** (recursive whole-op `working_flag_mutex`: the four public mutators hold it across their entire operation, excluding the rebuild thread's father_ptr read + swap ancestor Update-walk; `Rebuild()`'s rebuild_ptr trylock keeps it deadlock-free). TSan: pre-fix ~200 races on the new `RebuildVsMutatorRace` stress → 0, suppressions file emptied | 2.5 |
 | 36 | `processData` lidar-buffer drain checked `while (!lidar_data.t_buff.empty())` OUTSIDE `mtx_pc`, racing the sensor callback's locked `t_buff.push_back` on the deque internals | **fixed** (Phase 2.6: check emptiness under `mtx_pc` — `while(true){ lock; if(empty) break; … }`). TSan data-path sweep, real-race count 18→0 | 2.6 |
 | 37 | async map-update task read the spline (`lasermapFovSegment → getPositionLiDAR → itpPosition/itpQuaternion`) holding only `mtx_map_`, while the worker grows the spline (`collectMeasurements → addOneStateKnot`) under `spline_mutex_` ALONE (no `mtx_map_`) → race | **fixed** (Phase 2.6: take `spline_mutex_` in `lasermapFovSegment`; order `mtx_map_ → spline_mutex_` preserved). TSan-verified | 2.6 |
+| 38 | `joinProcessingThreadBounded` (both nodes) dispatched `join()` onto a `std::async` task and `detach()`ed from the lifecycle thread on timeout — two threads racing on the same `std::thread` object (UB when the worker exited at the deadline; TSan runtime CHECK-abort in `pthread_detach`), and the async future's dtor un-bounded the wait | **fixed** (worker lambda release-stores `processing_thread_exited_` as its last action; bounded join polls the flag, then join-or-detach single-threaded) | 2.7 |
 
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7
@@ -388,6 +389,14 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `nn_thresh` | point-to-plane distance threshold (m) | `0.5` |
 | `cube_len` | local map cube size (m) | `1000.0` |
 | `num_threads` | OpenMP threads | `4` |
+| `spline_prune_keep_knots` | knots retained by the Phase 3.1 sliding-window prune (both nodes; 0 disables, <100 clamps to 100) | `600` |
+| `nn_max_sq_dist` | §3.2 k-th-neighbor squared-distance gate (m²); search radius = sqrt of this | `5.0` |
+| `plane_fit_thresh` | §3.2 esti_plane residual threshold (m) | `0.1` |
+| `plane_min_cond_ratio` | §3.2 plane-fit degeneracy guard (QR pivot ratio; 0 = off, pending bag benchmark) | `0.0` |
+| `map_prune_radius` | §3.4 keep only map points within this distance (m) of the pose; floored at 2×det_range; 0 = off (cube-only) | `0.0` |
+| `nis_recovery_mode` | §3.3 divergence recovery: `off` (detect-only) / `hold` (gate odom+TF while DIVERGED) / `reset` (reinflate IEKF covariance to prior) | `off` |
+| `max_scan_buffer` | §2.3 per-LiDAR raw-scan cap (scans, drop-oldest; 0 = unbounded) | `0` |
+| `max_imu_staging` | §2.3 IMU staging cap (samples, drop-oldest; was hardcoded 2000) | `2000` |
 
 The `cube_len` hardcoded default in code (`RESPLE.cpp:580`, value 2000) is
 overridden by the param; check the logged value on startup rather than reading
@@ -429,7 +438,11 @@ the source.
   `declare_parameter` calls must be guarded with `if (!has_parameter(...))`
   to survive lifecycle re-cycles.
 - When adding a new spline reader (anything that calls `spline->itp*` or
-  reads knot data), take `spline_mutex_` first. If you only need the
+  reads knot data), take `spline_mutex_` first. Knot DEQUE indices are local:
+  with Phase 3.1 pruning active, absolute (protocol) index = local index +
+  `numKnotsPruned()`; times never need translation (`start_t_ns` advances with
+  the prune). Anything holding knot indices across cycles must use
+  `totalKnots()` space (see the est_window publish gate in both nodes). If you only need the
   current pose at `maxTimeNs()`, prefer `getPositionLiDAR(spline->maxTimeNs(), ...)`
   which is now pure-read (Phase 1.5 Pass 3).
 - When adding state to `Mapping.cpp`'s `process()` loop, hold all per-map

@@ -159,5 +159,49 @@ inline typename DerivedV::Scalar nis(const Eigen::MatrixBase<DerivedV>& innov,
   return innov.dot(x);
 }
 
+// ---------------------------------------------------------------------------
+// Axis-aligned box subtraction (HARDENING §3.4 radius map pruning).
+//
+// Carves `outer \ inner` into at most 6 axis-aligned slabs. The returned
+// boxes are clipped to `outer`, have positive extent on every axis, are
+// pairwise disjoint, and together with `outer ∩ inner` exactly tile `outer`
+// (boundaries are treated half-open, consistent with the ikd-Tree's
+// box-deletion semantics being applied to disjoint regions). Used to delete
+// every map point outside a retention box without touching the points
+// inside it.
+// ---------------------------------------------------------------------------
+struct AabBox {
+  Eigen::Vector3d min;
+  Eigen::Vector3d max;
+};
+
+inline std::vector<AabBox> subtractBox(const AabBox& outer,
+                                       const AabBox& inner) {
+  std::vector<AabBox> out;
+  AabBox rem = outer;  // remaining (not yet carved) region
+  for (int i = 0; i < 3; ++i) {
+    if (inner.min(i) > rem.min(i)) {
+      AabBox b = rem;
+      b.max(i) = std::min(inner.min(i), rem.max(i));
+      if ((b.max.array() > b.min.array()).all()) {
+        out.push_back(b);
+      }
+      rem.min(i) = b.max(i);
+    }
+    if (inner.max(i) < rem.max(i)) {
+      AabBox b = rem;
+      b.min(i) = std::max(inner.max(i), rem.min(i));
+      if ((b.max.array() > b.min.array()).all()) {
+        out.push_back(b);
+      }
+      rem.max(i) = b.min(i);
+    }
+    if ((rem.max.array() <= rem.min.array()).any()) {
+      break;  // nothing left of `outer` to carve
+    }
+  }
+  return out;
+}
+
 }  // namespace geom
 }  // namespace resple

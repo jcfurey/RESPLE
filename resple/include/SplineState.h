@@ -1,7 +1,7 @@
 #pragma once
 
 #include <iostream>
-#include "utils/common_utils.h"
+#include "utils/eigen_utils.hpp"
 #include "utils/math_tools.h"
 #include "estimate_msgs/msg/spline.hpp"
 #include "estimate_msgs/msg/knot.hpp"
@@ -56,6 +56,8 @@ class SplineState
         dt_ns = dt_ns_;
         start_t_ns = start_t_ns_;
         num_knot = num_knot_;
+        num_knots_pruned_ = 0;
+        last_start_idx_ = 0;
         inv_dt = 1e9 / dt_ns;
         start_i = start_i_;
         pow_inv_dt[0] = 1.0;
@@ -65,6 +67,13 @@ class SplineState
         t_idle = {t0, t0, t0};
         ort_delta_idle = {Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
         q_idle = {q0, q0, q0};
+        // A re-init (e.g. Mapping consuming a RESPLE respawn) must drop the
+        // previous run's knots: num_knot restarts at num_knot_ (all callers
+        // pass 0) while the deques would otherwise keep their old elements,
+        // so knot index i would silently read the PREVIOUS run's data.
+        t_knots.clear();
+        q_knots.clear();
+        ort_delta.clear();
     }
 
     void setTimeIntervalNs(int64_t t_ns)
@@ -184,23 +193,88 @@ class SplineState
     void updateKnots(SplineState* other)
     {
         int64_t num_knots_other = other->numKnots();
-        Eigen::Quaterniond ref_ort_old;
-        Eigen::Vector3d ref_trans_old;
-        Eigen::Quaterniond ref_ort_new;
-        Eigen::Vector3d ref_trans_new;
-        if (num_knot <= num_knots_other) {
+        // The incoming idles describe the spline ORIGIN (knots -3..-1 of
+        // absolute index 0); they are only valid here while our knot 0 is
+        // still the absolute origin. After pruning, our idle slots hold the
+        // slid pre-window knots and must not be clobbered.
+        if (num_knots_pruned_ == 0 && num_knot <= num_knots_other) {
             q_idle = other->q_idle;
             ort_delta_idle = other->ort_delta_idle;
             t_idle = other->t_idle;
-        }        
+        }
         for (int64_t i = 0; i < num_knots_other; i++) {
-            if (i + other->start_i < num_knot) {
-                setOneStateKnot(i + other->start_i, other->t_knots[i], other->ort_delta[i]);
+            // other->start_i carries the sender's ABSOLUTE knot index (the
+            // est_window protocol); translate to this spline's deque index,
+            // which is offset by any front-pruning done locally (Phase 3.1).
+            const int64_t target = i + other->start_i - num_knots_pruned_;
+            if (target < 0) {
+                // Window overlaps knots this spline already pruned — stale
+                // content, nothing to update.
+                continue;
+            }
+            if (target < num_knot) {
+                setOneStateKnot(static_cast<int>(target), other->t_knots[i], other->ort_delta[i]);
             } else {
                 addOneStateKnot(other->t_knots[i], other->ort_delta[i]);
             }
         }
-    }    
+    }
+
+    // Phase 3.1 (HARDENING.md): sliding-window knot pruning.
+    //
+    // Drops the oldest knots so at most `keep_knots` remain in the deques and
+    // slides the 3-slot idle window forward to take their place. The idle
+    // knots act as the knots at indices -3..-1 relative to knot 0 (t_idle[j] /
+    // q_idle[j] hold the pose of knot j-3, ort_delta_idle[j] the delta
+    // arriving at it — the same convention prepareInterpolation / itpPose /
+    // itpQuaternion read them with), so after pruning K knots the old knots
+    // [K-3 .. K-1] become the new idles and interpolation over the RETAINED
+    // time range is bit-for-bit identical to the unpruned spline.
+    //
+    // minTimeNs() advances by K*dt_ns. Absolute knot indexing — totalKnots()
+    // and the getSplineMsg start_idx contract with the Mapping node — is
+    // preserved via num_knots_pruned_. Returns the number of knots pruned.
+    int64_t pruneFrontKnots(int64_t keep_knots)
+    {
+        // Hard floor: the IEKF's recursive window reads the last 4 knots
+        // (getRCPs/updateRCPs) and the est_window message the last 5; keep a
+        // margin beyond both so a misconfigured caller cannot starve them.
+        keep_knots = std::max<int64_t>(keep_knots, 8);
+        const int64_t prune = num_knot - keep_knots;
+        if (prune <= 0) {
+            return 0;
+        }
+        // New idle slot j holds the knot at (new) index j-3 == old index
+        // prune-3+j: an old regular knot when that is >= 0, otherwise the old
+        // idle slot it maps to (only reachable for prune < 3).
+        std::array<Eigen::Vector3d, 3> t_idle_new;
+        std::array<Eigen::Vector3d, 3> ort_idle_new;
+        std::array<Eigen::Quaterniond, 3> q_idle_new;
+        for (int j = 0; j < 3; j++) {
+            const int64_t src = prune - 3 + j;
+            if (src >= 0) {
+                t_idle_new[j] = t_knots[src];
+                ort_idle_new[j] = ort_delta[src];
+                q_idle_new[j] = q_knots[src];
+            } else {
+                t_idle_new[j] = t_idle[3 + src];
+                ort_idle_new[j] = ort_delta_idle[3 + src];
+                q_idle_new[j] = q_idle[3 + src];
+            }
+        }
+        for (int j = 0; j < 3; j++) {
+            t_idle[j] = t_idle_new[j];
+            ort_delta_idle[j] = ort_idle_new[j];
+            q_idle[j] = q_idle_new[j];
+        }
+        t_knots.erase(t_knots.begin(), t_knots.begin() + prune);
+        q_knots.erase(q_knots.begin(), q_knots.begin() + prune);
+        ort_delta.erase(ort_delta.begin(), ort_delta.begin() + prune);
+        num_knot -= prune;
+        num_knots_pruned_ += prune;
+        start_t_ns += prune * dt_ns;
+        return prune;
+    }
 
     int64_t getKnotTimeNs(size_t i) const
     {
@@ -247,6 +321,20 @@ class SplineState
     int64_t numKnots() const
     {
         return num_knot;
+    }
+
+    // Knots currently held PLUS knots dropped by pruneFrontKnots — i.e. the
+    // monotonic count addOneStateKnot has produced since init(). This is the
+    // index space the est_window protocol (getSplineMsg start_idx /
+    // updateKnots start_i) is expressed in.
+    int64_t totalKnots() const
+    {
+        return num_knot + num_knots_pruned_;
+    }
+
+    int64_t numKnotsPruned() const
+    {
+        return num_knots_pruned_;
     }
 
     template <int Derivative = 0>
@@ -527,13 +615,29 @@ class SplineState
         }
     }
 
-    void getSplineMsg(estimate_msgs::msg::Spline& spline_msg, const int start_idx_hint)
+    void getSplineMsg(estimate_msgs::msg::Spline& spline_msg, const int64_t start_idx_hint)
     {
         spline_msg.dt = dt_ns;
-        int sidx = std::min(std::max((int)(num_knot - 5), 0), start_idx_hint);
-        spline_msg.start_idx = std::min(sidx, last_start_idx_+1);
-        spline_msg.start_t = getKnotTimeNs(num_knot - 5);
-        for (size_t i = spline_msg.start_idx; i < (size_t) num_knot; i++) {
+        // All indices in the message are ABSOLUTE (totalKnots() space) so the
+        // receiver's window bookkeeping survives sender-side pruning; the
+        // deque is addressed via (absolute - num_knots_pruned_).
+        const int64_t total = totalKnots();
+        int64_t sidx = std::min(std::max<int64_t>(total - 5, 0), start_idx_hint);
+        int64_t start_idx = std::min(sidx, last_start_idx_ + 1);
+        if (start_idx < num_knots_pruned_) {
+            // The publish-then-prune ordering (and the >=8 retention floor)
+            // keeps published windows ahead of pruning; clamp defensively so
+            // the loop below cannot index before the first retained knot.
+            RESPLE_LOG_INVARIANT_ONCE("getSplineMsg start_idx=" << start_idx
+                << " precedes first retained knot " << num_knots_pruned_
+                << "; clamping (window content lost to pruning)");
+            start_idx = num_knots_pruned_;
+        }
+        spline_msg.start_idx = start_idx;
+        // Time of absolute knot total-5 == local knot num_knot-5 (guarded for
+        // the first cycles, where num_knot can still be < 5).
+        spline_msg.start_t = getKnotTimeNs(std::max<int64_t>(num_knot - 5, 0));
+        for (int64_t i = start_idx - num_knots_pruned_; i < num_knot; i++) {
             estimate_msgs::msg::Knot knot_msg;
             knot_msg.position.x = t_knots[i].x();
             knot_msg.position.y = t_knots[i].y();
@@ -557,13 +661,13 @@ class SplineState
         spline_msg.start_q.x = q_idle[0].x();
         spline_msg.start_q.y = q_idle[0].y();
         spline_msg.start_q.z = q_idle[0].z();        
-        if (num_knot < 5) {
+        if (total < 5) {
             spline_msg.start_idx = 0;
 
-        } 
-        last_start_idx_ = std::max((int)spline_msg.start_idx, (int)(num_knot - 5));
+        }
+        last_start_idx_ = std::max<int64_t>(spline_msg.start_idx, total - 5);
 
-    }    
+    }
 
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
@@ -577,9 +681,13 @@ class SplineState
     double inv_dt;
     std::array<double, 4> pow_inv_dt;
     int64_t num_knot = 0;  // 0 until init(); a default-constructed spline reports no knots
+    // Knots dropped from the FRONT of the deques by pruneFrontKnots (Phase
+    // 3.1). Deque index = absolute index - num_knots_pruned_; start_t_ns is
+    // advanced in lock-step so time-based lookups need no translation.
+    int64_t num_knots_pruned_ = 0;
     int64_t start_i;
     int64_t start_t_ns;
-    int last_start_idx_ = 0;
+    int64_t last_start_idx_ = 0;
 
     std::array<Eigen::Vector3d, 3> t_idle;
     std::array<Eigen::Vector3d, 3> ort_delta_idle;

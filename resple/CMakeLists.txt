@@ -309,6 +309,22 @@ if(BUILD_TESTING)
     endif()
   endforeach()
 
+  # SplineState knot-pruning unit test (HARDENING Phase 3.1). Unlike the cores
+  # above it includes SplineState.h, which pulls the estimate_msgs message
+  # headers — real generated ones here (the standalone resple/test build uses
+  # the ROS-free stubs under test/stubs/ instead).
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/test_spline_state.cpp)
+    ament_add_gtest(test_spline_state test/test_spline_state.cpp)
+    target_include_directories(test_spline_state PRIVATE include)
+    ament_target_dependencies(test_spline_state estimate_msgs)
+    if(TARGET Eigen3::Eigen)
+      target_link_libraries(test_spline_state Eigen3::Eigen)
+    endif()
+    if(BLAS_FOUND)
+      target_link_libraries(test_spline_state ${BLAS_LIBRARIES})
+    endif()
+  endif()
+
   # ikd-Tree concurrency regression (HARDENING Phase 2.4 Push_Down race). Unlike
   # the cores above this one needs PCL (pcl::PointXYZINormal) — a hard package
   # dep — and compiles the kd-tree TU directly. It is a short multi-threaded
@@ -318,7 +334,7 @@ if(BUILD_TESTING)
     ament_add_gtest(test_ikdtree_concurrency
       test/test_ikdtree_concurrency.cpp
       include/ikd-Tree/ikd_Tree.cpp
-      TIMEOUT 120)
+      TIMEOUT 300)
     target_include_directories(test_ikdtree_concurrency PRIVATE
       include ${PCL_INCLUDE_DIRS})
     target_compile_definitions(test_ikdtree_concurrency PRIVATE ${PCL_DEFINITIONS})

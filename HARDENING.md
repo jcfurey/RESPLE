@@ -18,8 +18,8 @@ Companion docs:
 | 1   | Safety fixes (initial) | **Complete** | `512da1d` |
 | 1.5 | Defensive crash-hardening (3-pass) | **Complete** | `14e9be8` |
 | 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete (this commit)** — see "Phase 1.6" below | this commit |
-| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 Push_Down race + 2.5 #2 deadlock + 2.6 two data-path races FIXED + TSan-verified; 2.3 pending data; 2.5 #1 rebuild-vs-mutator race deferred** — see below | this commit |
-| 3   | Spline / mapping accuracy | Pending Phase 0 data | — |
+| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 + 2.5 #1 + 2.5 #2 + 2.6 + 2.7 FIXED + TSan-verified; 2.3 pending data** — see below | this commit |
+| 3   | Spline / mapping accuracy | **3.1 knot pruning IMPLEMENTED (this commit)** — gate satisfied by the 2.6 live measurement; 3.3 detection done (recovery policy pending); 3.2 / 3.4 pending | this commit |
 | 4   | Diagnostics publisher | Can start after Phase 3 begins | — |
 | 5   | Regression tests | Last | — |
 
@@ -394,9 +394,10 @@ standalone justification.
 ## Phase 2 — Concurrency hardening
 
 **Status: 2.1 fixed (Phase 1.5 K1); 2.2 partially fixed (Phase 1.5 Fix C);
-2.3 still pending Phase 0 data; 2.4 (Push_Down race) IMPLEMENTED + TSan-verified;
+2.3 capability landed (drop-oldest caps + counters; scan cap default-off); 2.4 (Push_Down race) IMPLEMENTED + TSan-verified;
 2.5 #2 (rebuild lock-order deadlock) FIXED + TSan-verified; 2.5 #1
-(rebuild-vs-mutator data race) deferred.**
+(rebuild-vs-mutator data race) FIXED + TSan-verified (recursive whole-op
+working_flag_mutex — see 2.5 below).**
 
 Three independent items. 2.1 was preempted by Phase 1.5 (defensive shared
 lock); 2.2's immediate race was closed by Phase 1.5 Fix C, full state-enum
@@ -457,17 +458,30 @@ state atomic — more explicit, less fragile.
 **Cost:** small refactor across `on_activate`, `on_deactivate`, `on_cleanup`,
 `getImuCallback`, `initialization()`. Can be done without Phase 0 data.
 
-### 2.3 Bounded input buffers
+### 2.3 Bounded input buffers — **IMPLEMENTED (scan cap off by default)**
 
-`pc_buff` (per-LiDAR) and `imu_int_buff` are unbounded `std::deque`s. If the
-worker stalls, memory grows without backpressure. Fix:
-- Parameter-configurable max size (default: sized from Phase 0 measured peak
-  × 2).
-- Drop-oldest on overflow.
-- Counter published in diagnostics (`… dropped this window`).
+`pc_buff` (per-LiDAR) was unbounded; `imu_int_buff` had a HARDCODED
+drop-oldest cap of 2000 (uncounted, unparameterized).
 
-**Decision gate:** only do this if Phase 0 shows the buffers trend up under
-normal operation. On a clean system they should empty every IEKF cycle.
+**Implemented (this commit):**
+- `max_scan_buffer` (scans per LiDAR, default **0 = unbounded** — the
+  decision gate asked for live evidence of growth under NORMAL operation,
+  and the growth observed so far came from a deliberately overloaded
+  sandbox worker, so the cap ships as an operational knob rather than a
+  default). All 7 LiDAR callbacks push through one `pushScanBounded`
+  helper: drop-oldest of `pc_buff`+`t_buff` in lock-step under `mtx_pc`.
+- `max_imu_staging` (samples, default **2000** = the previously hardcoded
+  value; 0 disables) replaces the magic constant in `getImuCallback`.
+- Drops are counted (`dropped_scans_` / `dropped_imu_` atomics) and exposed
+  in BOTH the `diagnostic_updater` output ("Scans/IMU Samples Dropped") and
+  the Phase 4 `Diagnostics` message — non-zero means the caps are engaging
+  (worker not keeping up with the sensors).
+
+**Verification:** live injector run with deliberately tight caps
+(`max_scan_buffer=2`, `max_imu_staging=300`, `num_threads=1`): staging depth
+pins at exactly 300, drop counters advance (127 scans / 200 samples), and
+the estimator stays healthy under the backpressure (NIS ~1–3, state OK,
+IEKF at full rate) — graceful degradation instead of unbounded growth.
 
 ### 2.4 Fix the ikd-Tree `Push_Down` child-write race — **IMPLEMENTED + TSan-VERIFIED**
 
@@ -577,7 +591,7 @@ node visited only when `need_push_down_to_*` is set (the pre-check skips the
 lock otherwise) — deletions are bursty (FOV segment + downsample), so the
 common search path stays lock-free.
 
-### 2.5 Rebuild-path hazards surfaced by the 2.4 stress test — **#1 DEFERRED, #2 FIXED**
+### 2.5 Rebuild-path hazards surfaced by the 2.4 stress test — **#1 FIXED, #2 FIXED**
 
 **Status: found while TSan-verifying 2.4; both pre-existing (present with AND
 without the 2.4 change) and inherited from upstream HKU-MARS. #1 (rebuild-vs-
@@ -585,7 +599,7 @@ mutator data race) remains deferred and suppressed in
 `resple/test/tsan_suppressions.txt`. #2 (the lock-order inversion / deadlock)
 is FIXED this commit.**
 
-1. **(DEFERRED) Rebuild-thread vs. mutator data race on `KD_TREE_NODE` fields.**
+1. **(FIXED — recursive whole-op `working_flag_mutex`, see below) Rebuild-thread vs. mutator data race on `KD_TREE_NODE` fields.**
    `multi_thread_rebuild` reads `(*Rebuild_Ptr)->father_ptr` (`ikd_Tree.cpp`
    ~255) while a concurrent mutator's `Update` writes `father_ptr`/aggregate
    fields (~1564), and the rebuild swap's ancestor `Update`-walk touches nodes
@@ -638,13 +652,52 @@ is FIXED this commit.**
    testing), and #1 was already the deferred upstream behavior. Fully suppressing
    #1 as well would need the larger redesign below.
 
-**Remaining work on #1 (deferred):** a complete fix needs consistent lock
-ordering between the mutators and the rebuild thread — e.g. a recursive
-`working_flag_mutex` so a mutator can hold it across its whole op (excluding the
-rebuild thread's critical sections) without self-deadlocking on the internal
-boundary acquisition; or routing all rebuilds through the single background
-thread; or making the few raced `KD_TREE_NODE` pointer/aggregate fields atomic.
-Each needs bag-replay validation (no bag available yet) before landing.
+**#1 FIX (landed):** the recursive-`working_flag_mutex` option, chosen after a
+new aggressive stress (`IkdTreeConcurrency.RebuildVsMutatorRace`, production
+`mtx_map_` discipline + bursty deletes hammering multi-thread rebuilds) showed
+the raced field set is wider than first diagnosed — the mutator pull-up
+`Update()` rewrites the node range float-arrays (memcpy), `alpha_*` and child
+links as well as `father_ptr`, so field-level atomics could not cover it.
+
+- `working_flag_mutex` is now initialized `PTHREAD_MUTEX_RECURSIVE`
+  (`start_thread`), and the four public mutators (`Add_Points`,
+  `Add_Point_Boxes`, `Delete_Points`, `Delete_Point_Boxes`) hold it across
+  their WHOLE operation (`ScopedPthreadLock` RAII); their internal rebuild-
+  boundary acquisitions nest on the recursive mutex.
+- This gives the mutator and the rebuild thread mutual exclusion over the
+  shared ancestor region (pull-up writes vs the rebuild's `father_ptr` read +
+  swap ancestor `Update`-walk) that previously raced with no common lock.
+- Lock-order safety: order stays `working_flag → {search_rw, rebuild_logger,
+  per-node push_down}` on both sides; `Rebuild()` only TRYlocks
+  `rebuild_ptr_mutex_lock`, so the opposite-order pairing with
+  `multi_thread_rebuild` cannot deadlock — a contended trylock defers the
+  rebuild request to a later mutation.
+- Cost: a mutator can now also block on the rebuild thread's flatten/swap
+  sections when operating on a DISJOINT subtree (previously only boundary-
+  touching ops blocked). Production has one map mutator (the async map task)
+  and the live sweep shows an unchanged IEKF rate.
+
+**Verification:** measured during the fix session with back-to-back runs of
+identical binaries differing only in `ikd_Tree.cpp`: pre-fix the new stress
+reported ~200 TSan races (`multi_thread_rebuild`/`Update`/memcpy on node
+fields), post-fix 0; BOTH concurrency tests run TSan-clean **with the
+suppressions file emptied** (the `race:multi_thread_rebuild` /
+`race:multi_thread_ptr` entries are deleted, so any regression now fails the
+gate). Live data-path TSan sweep: clean, IEKF rate unchanged, clean shutdown.
+
+**Detection-power caveat (be honest with yourself when re-running):** the
+pre-fix window is deep in scheduler territory — it fired reliably only on a
+heavily loaded host (CPU oversubscription stretches the rebuild thread's
+flatten/swap windows into the mutator's bursts); several pre-fix runs on a
+lightly loaded box reported nothing. The committed stress is therefore a
+CANARY: any TSan report is a real regression and fails CI
+(`halt_on_error=1`), but a quiet run is necessary, not sufficient. The
+4-vCPU CI runner (4 spin readers + mutator + rebuild thread = oversubscribed)
+is exactly where detection chances are best. See the tuning note in the test
+itself before "optimizing" its configuration — throttled readers and
+full-extent mutation were each measured to make it fast but blind. Bag
+replay remains worthwhile as an end-to-end confidence pass when a bag is
+available.
 
 ---
 
@@ -706,6 +759,30 @@ ASan/UBSan-clean; and `Spline Knots` grows unboundedly under zero pruning
 
 ---
 
+## Phase 2.7 — Bounded-join detach race (found during the 3.1 sweep)
+
+**Status: FIXED (both nodes), found by a TSan runtime CHECK-abort at shutdown
+while verifying Phase 3.1.**
+
+`joinProcessingThreadBounded` (RESPLE + Mapping) dispatched `join()` onto a
+`std::async` task and, on timeout, called `detach()` from the lifecycle
+thread — two threads operating on the SAME `std::thread` object. When the
+worker exited right at the deadline (TSan's slowdown made this reproducible),
+the async `join()` consumed the thread id concurrently with the `detach()` →
+UB; TSan's runtime aborted with `ThreadRegistry::ConsumeThreadUserId CHECK
+failed` inside `pthread_detach`. The async future's destructor also blocks
+until `join()` returns, so on a genuinely wedged worker the "bounded" join
+was never bounded.
+
+**Fix:** the worker lambda's final action is a release-store to
+`processing_thread_exited_`; the bounded join polls that flag against the
+deadline. Flag set → plain `join()` (guaranteed prompt); deadline hit →
+`detach()` — in both cases exactly one thread ever touches
+`processing_thread_`. Verified: the Phase 3.1 TSan sweep (30 s synthetic
+injection + SIGINT shutdown) completes with zero TSan output of any kind.
+
+---
+
 ## Phase 3 — Spline / mapping accuracy
 
 **Status: pending Phase 0 data.**
@@ -713,39 +790,100 @@ ASan/UBSan-clean; and `Spline Knots` grows unboundedly under zero pruning
 Four items. Each is a distinct PR with a before/after trajectory-plot
 regression before merging.
 
-### 3.1 Sliding-window knot pruning
+### 3.1 Sliding-window knot pruning — **IMPLEMENTED**
 
-`SplineState::t_knots` / `q_knots` / `ort_delta` grow indefinitely. Define a
-retention window (something like `max(5 × spline_order, active_measurement_span)`
-knots) and prune from the front. Must guard any consumer that reads historical
-knots — notably `getSplineMsg` and any plugin that walks backward from the
-current state.
+**Status: landed this commit. The decision gate was satisfied by the Phase 2.6
+live data-path sweep, which measured `Spline Knots` growing unboundedly (one
+knot per `knot_hz` tick, no pruning) for the first time on a running node.**
 
-**Complexity: medium.** Risks invariant violations in `updateKnots`,
-`setOneStateKnot`, and the IEKF's `getRCPs()`. Write unit tests before the
-refactor.
+`SplineState::t_knots` / `q_knots` / `ort_delta` grew indefinitely in BOTH
+nodes (RESPLE's estimator spline and Mapping's `spline_active_`).
 
-**Decision gate:** only schedule if Phase 0 shows knot count growing
-unboundedly relative to wall-clock runtime. On a clean system, the growth is
-`knot_hz × seconds` = `100 × t` and pruning keeps the working set small.
+**Implementation (`SplineState.h` + both nodes):**
+- `SplineState::pruneFrontKnots(keep_knots)` drops the oldest knots and slides
+  the 3-slot idle window into their place. Key invariant that makes this safe:
+  the idles act as knots `-3..-1` (`t_idle[j]`/`q_idle[j]` hold the pose of
+  knot `j-3`, `ort_delta_idle[j]` the delta arriving at it — the convention
+  `prepareInterpolation`/`itpPose`/`itpQuaternion` read them with), so after
+  pruning K knots the old knots `[K-3..K-1]` become the new idles and
+  interpolation over the retained range is **bit-for-bit identical** (unit-
+  tested as an exact-equality property, not approximate).
+- Absolute knot indexing is preserved via `num_knots_pruned_`:
+  `totalKnots() = numKnots() + pruned` is the monotonic index space of the
+  est_window protocol. `getSplineMsg` emits absolute `start_idx`; `updateKnots`
+  translates `start_i` through the receiver's own pruned offset (a window
+  entirely before the prune point is a no-op); a hard floor of 8 retained
+  knots protects `getRCPs`/`updateRCPs` (last 4) and the message window
+  (last 5). `start_t_ns` advances in lock-step so time-based queries need no
+  translation, and the Phase 1.5 B clamps now clamp to the pruned
+  `minTimeNs()`.
+- **RESPLE node:** prunes each worker cycle, under `spline_mutex_`, AFTER the
+  est_window publish (publish-then-prune keeps every knot on the wire before
+  it can drop). The publish gate and `getSplineMsg` hint now use
+  `totalKnots()` — a `numKnots()` gate would stop firing once pruning caps
+  the retained count. Diagnostics gain `Spline Knots (total incl. pruned)` so
+  the growth signal stays observable.
+- **Mapping node:** prunes `spline_active_` on the worker after the
+  path/odom/control-point publishes; the publish gate likewise moved to
+  `totalKnots()`. `updateKnots`' idle-copy is additionally gated on
+  `num_knots_pruned_ == 0` so a stale/duplicate window can no longer clobber
+  the slid idles.
+- **Parameter:** `spline_prune_keep_knots` (both nodes, default **600** ≈ 6 s
+  at `knot_hz=100`; `0` disables; values 1–99 clamp to 100 with a WARN). 600
+  is far wider than every backward-looking consumer: IEKF last 4 knots,
+  est_window last 5, deskew ~10 (one scan), Mapping's path/scan lag.
+- **Drive-by fix:** `SplineState::init()` now clears the knot deques — a
+  re-init (Mapping consuming a RESPLE respawn) previously reset `num_knot`
+  but left the deques populated, so knot index i silently read the PREVIOUS
+  run's data once knots were re-added.
 
-### 3.2 Plane-fit hardening
+**Verification:** `resple/test/test_spline_state.cpp` — 10 new ROS-free unit
+tests (exact interpolation equivalence incl. `itpPose` Jacobians, small-prune
+idle reuse, repeated-prune equivalence, floor/no-op edges, re-init reset, RCP
+round-trip, and a sender/receiver est_window protocol simulation with pruning
+on both sides plus a stale-window redelivery case). The standalone ROS-free
+build compiles `SplineState.h` against field-compatible stubs of the
+`estimate_msgs` headers (`test/stubs/`); the colcon `BUILD_TESTING` path uses
+the real generated messages.
 
-`Association::findCorresp` uses only a point-to-plane distance threshold
-(`pd2 < 5`, scaled by range²) and a hardcoded `esti_plane` threshold `0.1f`.
-No eigenvalue-ratio test (no degeneracy rejection for edge points or noise
-clusters). No counters for dropped candidates.
+### 3.2 Plane-fit hardening — **IMPLEMENTED (defaults preserve legacy behaviour)**
 
-**Work:**
-- Add eigenvalue ratio check `λ0 / λ2 > 20` (or parameter) in `esti_plane` or
-  after.
-- Expose thresholds as parameters in
-  `src/settings/params/localization/resple.yaml`.
-- Publish per-scan counters: `{candidates, passed_distance, passed_plane,
-  used_in_IEKF}` — routed through the Phase 4 diagnostic topic.
+**Status: landed this commit.** `Association::findCorresp` previously used a
+hardcoded k-NN distance gate (`pointSearchSqDis < 5` / search radius 2.236)
+and a hardcoded `esti_plane` threshold `0.1f`, with no degeneracy rejection
+and no visibility into where candidates were dropped.
 
-**Complexity: low-medium.** Numerical impact depends on parameter choices;
-benchmark against a known-good bag.
+**Implemented:**
+- **`Association::CorrespConfig`** (plumbed RESPLE node → `Estimator`
+  member, like `n_iter` → both `findCorresp` paths, CPU and CUDA):
+  - `nn_max_sq_dist` (param, default 5.0) — the k-th-neighbor squared
+    distance gate; the `Nearest_Search` radius is derived as its sqrt. NOTE:
+    the CUDA k-NN early-termination shell was validated for the default
+    2.236 m gate; raising above ~5.76 m² under `ENABLE_CUDA` needs that scan
+    widened first (comment at the field).
+  - `plane_fit_thresh` (param, default 0.1) — esti_plane residual threshold.
+  - `plane_min_cond_ratio` (param, default 0 = off) — degeneracy guard:
+    forwarded through `esti_plane` to `resple::geom::fitPlane`'s
+    rank-revealing-QR pivot-ratio test (the §3.2 hook landed with the
+    geometry core, unit-tested there). Rejects collinear / rank-deficient
+    neighbor patches that lie on infinitely many planes. Deliberately OFF by
+    default — turning it on changes which correspondences feed the IEKF, so
+    it stays a tuning decision gated on a known-good-bag benchmark.
+- **Per-update funnel counters** (`Association::CorrespStats`, accumulated by
+  the worker into cumulative atomics): `candidates → passed_window →
+  passed_distance (full k-NN within gate) → passed_plane (esti_plane) →
+  used_in_IEKF`. Published as per-window deltas in diagnostics ("Corresp
+  …(last window)"). Stage-to-stage drops localize losses: out-of-window vs
+  sparse map vs degenerate/noisy patch vs association outlier.
+
+**Verification:** colcon build + full test suites green (defaults are
+bit-for-bit the legacy values: same gate constants, min_cond_ratio off);
+live TSan data-path sweep clean with the counters active in the OpenMP
+parallel region (thread-local tallies, one atomic merge per thread).
+
+**Remaining (tuning, needs bags):** choose a production `plane_min_cond_ratio`
+(and revisit `nn_max_sq_dist` per sensor) by benchmarking trajectory error on
+a known-good bag, watching the new funnel counters.
 
 ### 3.3 Divergence detection and recovery — **DETECTION DONE**
 
@@ -773,34 +911,89 @@ and downstream consumers without any warning.
   fault bits + stationary gyro-bias norm exported to diagnostics, throttled
   WARN on faults.
 
-**Remaining (recovery policy):**
-- Action on trip: either (a) hold last estimate + skip publish until a stable
-  scan recovers it, or (b) reset filter with the last good pose. This is a
-  policy decision — (a) is safer operationally, (b) recovers faster from a
-  real divergence. Detection currently logs + escalates diagnostics to ERROR
-  so downstream consumers can gate on `/diagnostics`; no automatic reset yet.
-- Optional: covariance trace / `λ_min` metrics on a dedicated status topic
+**Recovery policy — IMPLEMENTED (parameter-selected, default off):**
+
+Per the operator decision (2026-06-10), both policies are implemented behind
+`nis_recovery_mode` (default `off` = detection-only legacy behaviour):
+
+- **`hold`** — on DIVERGED, suspend odometry/TF publication (the last
+  published pose is the held estimate; the downstream odom EKF coasts on its
+  other sources instead of fusing an untrustworthy pose). The hold latches
+  and releases only on a full OK verdict, so WARN during the detector's
+  hysteresis recovery keeps the gate closed. est_window / map updates
+  continue so internal estimation keeps running and the detector can observe
+  recovery. Logged on entry/exit; `NIS Recovery Hold Active` in diagnostics.
+- **`reset`** — on DIVERGED, reinflate the IEKF covariance to the
+  configure-time prior (`Estimator::resetCovarianceToPrior`), keeping the
+  state (spline + biases): an over-confident covariance is exactly what the
+  NIS verdict detects, and reinflation lets new measurements re-correct the
+  state. The detector window restarts so the next verdict reflects the
+  post-reset filter. `NIS Recovery Resets (cumulative)` in diagnostics.
+
+Note: `reset` deliberately reinflates covariance rather than rewinding the
+state to a stored "last good pose" — a state rewind would need pose history
+plus a spline/Mapping window restart (respawn-equivalent), and the
+covariance reinflation addresses the failure mode NIS actually measures.
+
+**Remaining (optional):**
+- Covariance trace / `λ_min` metrics on a dedicated status topic
   (the NIS verdict largely subsumes them for divergence purposes).
+- Policy validation on a bag with a real divergence episode (hold-vs-reset
+  comparison is a tuning exercise, like the §3.2 thresholds).
 
-### 3.4 Map pruning policy
+### 3.4 Map pruning policy — **RADIUS PRUNING IMPLEMENTED (off by default)**
 
-`lasermapFovSegment` uses a hardcoded cube around the current pose (size set
-by `cube_len` param). Two issues: no radius-based pruning, and no temporal
-decay (dynamic obstacles never drop out).
+`lasermapFovSegment` uses a sliding cube around the current pose (size set by
+`cube_len`). The cube only deletes when the pose nears its edge — wandering
+inside a large cube (the shipping `cube_len` is 1000 m) keeps stale far
+geometry alive for the whole run.
 
-**Work:**
-- Add radius-based pruning (drop cells > `prune_radius` m from current pose)
-  as an alternative or supplement to the cube.
-- Optional temporal decay: drop cells not hit in `temporal_half_life` seconds
-  (requires a per-cell timestamp — potentially expensive, defer).
+**Implemented (this commit):**
+- `RESPLE::pruneMapRadius` — when `map_prune_radius > 0`, keep only the
+  axis-aligned box of half-extent R centered on the current lidar pose: on
+  first activation, and whenever the pose has moved > 10% of R since the last
+  prune, delete the slabs of the local-map cube outside the retention box.
+  Runs inside the async map task under `mtx_map_` unique (same locking as the
+  cube deletions), every tick of `lasermapFovSegment` with its own movement
+  hysteresis.
+- R is floored at **2× `det_range`** so pruning can never bite into the
+  sensor's live measurement sphere (all findCorresp matches are within
+  `det_range`); a configure-time WARN reports the effective radius.
+- The cube∖box slab decomposition lives in the geometry core
+  (`resple::geom::subtractBox`, ≤6 disjoint slabs) with unit tests proving
+  disjointness + exact tiling by dense sampling.
+- Diagnostics: `Map Radius Prunes (cumulative)`.
+- **Default `map_prune_radius = 0` (disabled)** — legacy cube-only behaviour.
+  Enabling it is an operational choice per environment (e.g. long tunnel
+  traverses vs loopy sites where revisited geometry is useful).
 
-**Complexity: medium-low.** Radius is cheap; temporal decay needs storage.
+**Deliberately not done:** temporal decay (per-cell timestamps — storage cost;
+deferred, as originally planned).
 
 ---
 
 ## Phase 4 — Diagnostics publisher
 
-**Status: can start after Phase 3 begins.**
+**Status: IMPLEMENTED (this commit).**
+
+`estimate_msgs/msg/Diagnostics` — typed fields (plottable directly in
+Foxglove / PlotJuggler, unlike the string-keyed `diagnostic_updater` output,
+which remains on `/diagnostics` for aggregation). Published by the RESPLE
+node on the relative topic **`resple_diagnostics`** (the production namespace
+yields `/localization/resple/resple_diagnostics` — the proposal's
+`…/diagnostics` literal would collide with the global `diagnostic_updater`
+topic on an un-namespaced node), once per processed worker frame (~20 Hz),
+best-effort QoS.
+
+Carries everything from the proposal table below: knot count + monotonic
+total, the three input-buffer depths, IEKF failures / NIS / dof / filter
+state, the §3.3 recovery state, pose-covariance trace + λ_min (6×6 at
+`maxTimeNs`), the §3.2 correspondence funnel, deskew out-of-range count,
+ikd-tree size, §3.4 prune count, and per-stage timings for the last frame
+(drain / IEKF / deskew / frame total / async map update — measured live, the
+map-update duration from inside the async lambda via a relaxed atomic).
+
+Original proposal kept below for reference.
 
 Today, diagnostics scatter across `diagnostic_updater` fields and ROS logger
 output. Consolidate into a single topic for easier monitoring.
@@ -829,24 +1022,43 @@ New topic `/localization/resple/diagnostics` (custom msg or
 
 ## Phase 5 — Regression tests
 
-**Status: last.**
+**Status: DONE except the bag-gated smoke test.**
 
-The package ships no tests today. Each earlier phase should contribute tests;
-Phase 5 is about filling gaps and wiring them into CI.
+| Test | Scope | Status |
+| --- | --- | --- |
+| `SplineState` unit | Bounds, bootstrap, pruning | **done** (Phase 3.1: `test_spline_state.cpp`, 10 tests incl. exact prune-equivalence + est_window protocol) |
+| `Association::findCorresp` stress | Multi-threaded `Nearest_Search` under concurrent mutation | **done** (`test_ikdtree_concurrency.cpp`: phased Push_Down test + `RebuildVsMutatorRace` canary) |
+| `Estimator<>` unit | Joseph-form PSD property | **done** (geometry core: `JosephUpdate.ResultIsSymmetricAndPSD` — the in-Estimator update delegates to it) |
+| Bag-replay CI smoke | Replay short bag, pose tolerance, divergence flag | **pending a representative bag** |
+| Sanitizer CI | TSan + ASan gates on every push/PR | **done (this commit)** — see below |
 
-### Targets
+### What landed (this commit)
 
-| Test | Scope |
-| --- | --- |
-| `SplineState` unit | Bounds, bootstrap, (future) pruning |
-| `Association::findCorresp` stress | Multi-threaded `Nearest_Search` under concurrent mutation (validates Phase 2.1) |
-| `Estimator<>` unit | Joseph-form PSD property preserved across iterations |
-| Bag-replay CI smoke | Replay short sim bag, compare final pose to tolerance, fail on divergence flag |
-| Sanitizer CI | Nightly build + smoke test with `ENABLE_TSAN=ON` and `ENABLE_ASAN=ON` |
+- **`.github/workflows/unit-tests.yml`** now has three jobs:
+  - `estimator-core` — the ROS-free suite (also gained the previously missing
+    `libboost-math-dev`, which `test_spline_state` → `math_tools.h` needs —
+    CI would have broken on the Phase 3.1 commit otherwise);
+  - `estimator-core-asan` — the same suite under ASan+UBSan with
+    `detect_leaks=1` (no PCL installed, so the long ikd-Tree stress is
+    excluded there by the existing PCL gate);
+  - `ikdtree-tsan` — both ikd-Tree concurrency tests under ThreadSanitizer,
+    run directly (no ctest timeout) with `halt_on_error=1` and the (empty)
+    suppressions file, generous job timeout.
+- **The new ASan job immediately paid for itself**, catching two real issues
+  in the standalone test build:
+  1. the **Phase 1.6 Eigen allocator mismatch** (heap-buffer-overflow in
+     `handmade_aligned_free`) — the package build pins
+     `_GNU_SOURCE`/`EIGEN_MALLOC_ALREADY_ALIGNED=1`/`EIGEN_DEFAULT_ALIGN_BYTES=16`
+     but the standalone test build never did; it now applies the same pinning;
+  2. a **1-node leak per `KD_TREE::Build()`** — upstream allocates
+     `STATIC_ROOT_NODE` and never frees it; the destructor (and a re-`Build`)
+     now release it.
+- ctest timeouts for the concurrency binary raised 120 → 300 s (native
+  runtime of the stress is ~10 s on a many-core box but ~70 s on 4 cores).
 
-### Wire-up
-Flip `BUILD_TESTING` to `ON` for this package in `colcon_defaults.yaml`
-(currently OFF workspace-wide). Add the gtest binaries to `ament_add_gtest`.
+The old wire-up note (flip `BUILD_TESTING` in `colcon_defaults.yaml`) is
+overtaken: the package's colcon `BUILD_TESTING` path has been live since the
+Phase 3.1 commit (all unit tests run under `colcon test`).
 
 ---
 

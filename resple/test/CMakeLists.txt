@@ -26,10 +26,22 @@ find_package(GTest REQUIRED)
 include(GoogleTest)
 enable_testing()
 
+# Pin Eigen's aligned-allocator dispatch exactly like the package build
+# (resple/CMakeLists.txt, HARDENING Phase 1.6): without these, mixed
+# preprocessor evaluation across TUs (PCL headers vs plain Eigen) can pair
+# aligned_malloc's plain-malloc path with handmade_aligned_free's
+# header-word path => heap-buffer-overflow on free. Surfaced here by the
+# Phase 5 ASan CI job on test_ikdtree_concurrency.
+add_compile_definitions(
+  _GNU_SOURCE
+  EIGEN_MALLOC_ALREADY_ALIGNED=1
+  EIGEN_DEFAULT_ALIGN_BYTES=16)
+
 set(RESPLE_TEST_SOURCES
   test_geometry_core.cpp
   test_point_cloud_adapter.cpp
   test_filter_health.cpp
+  test_spline_state.cpp
 )
 
 foreach(src ${RESPLE_TEST_SOURCES})
@@ -48,6 +60,15 @@ foreach(src ${RESPLE_TEST_SOURCES})
     gtest_discover_tests(${name})
   endif()
 endforeach()
+
+# test_spline_state includes SplineState.h, which pulls the estimate_msgs
+# message headers. The standalone (ROS-free) build satisfies those includes
+# with the field-compatible stubs under test/stubs/; the colcon BUILD_TESTING
+# path (resple/CMakeLists.txt) uses the real generated messages instead.
+if(TARGET test_spline_state)
+  target_include_directories(test_spline_state PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
+endif()
 
 # ikd-Tree concurrency regression (HARDENING Phase 2.4). This one DOES need PCL
 # (pcl::PointXYZINormal) and compiles the kd-tree TU directly, so it is gated on
@@ -75,7 +96,7 @@ if(PCL_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_ikdtree_concurrency.cpp
   target_link_libraries(test_ikdtree_concurrency PRIVATE
     GTest::gtest GTest::gtest_main Threads::Threads)
   target_compile_options(test_ikdtree_concurrency PRIVATE -Wall -Wextra)
-  gtest_discover_tests(test_ikdtree_concurrency PROPERTIES TIMEOUT 120)
+  gtest_discover_tests(test_ikdtree_concurrency PROPERTIES TIMEOUT 300)
 else()
   message(STATUS "PCL not found; skipping test_ikdtree_concurrency (ikd-Tree stress).")
 endif()

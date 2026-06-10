@@ -16,6 +16,15 @@ class Estimator
     static const int BG_OFFSET = 27;
     int n_iter = 1;
 
+    // HARDENING §3.2: correspondence thresholds + per-update funnel counters.
+    // corresp_cfg is set once by the node at configure (like n_iter);
+    // corresp_stats is reset at the top of each updateIEKF* call and
+    // accumulated across its inner iterations. Both are touched on the worker
+    // thread only (the node snapshots stats right after the update returns),
+    // so neither is atomic by design.
+    Association::CorrespConfig corresp_cfg;
+    Association::CorrespStats corresp_stats;
+
     // Atomic because updateDiagnostics may read these from the ROS executor
     // thread while the worker is mid-IEKF. Monotonic; no reset — the diagnostics
     // publisher snapshots deltas.
@@ -29,6 +38,13 @@ class Estimator
     double lastNis() const { return last_nis_; }
     int lastNisDof() const { return last_nis_dof_; }
 
+    // HARDENING SS3.3 'reset' recovery: reinflate the IEKF covariance to the
+    // configure-time prior while keeping the state (spline + biases). NIS
+    // divergence signals an over-confident covariance; reinflation lets
+    // subsequent measurements re-correct the state instead of being
+    // near-ignored. Worker-thread only (same thread as updateIEKF*).
+    void resetCovarianceToPrior() { cov_rcp = cov_prior_; }
+
     Estimator() {};
 
     void setState(int64_t dt_ns, int64_t start_t_ns, const Eigen::Vector3d& t0, const Eigen::Quaterniond& q0, 
@@ -40,6 +56,7 @@ class Estimator
         }        
         cov_sys = Q;
         cov_rcp = P;
+        cov_prior_ = P;
         a_mat = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
         Eigen::Matrix<double, 6, 6> matblock = Eigen::Matrix<double, 6, 6>::Zero();
         matblock.topLeftCorner<3, 3>().setIdentity();
@@ -74,6 +91,7 @@ class Estimator
                          KD_TREE<pcl::PointXYZINormal>* ikdtree, const double pt_thresh, const double cov_thresh,
                           int num_threads = 5, int num_match_points = 5)
     {
+        corresp_stats.reset();
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -83,7 +101,7 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, num_threads, num_match_points);
+                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, corresp_cfg, &corresp_stats, num_threads, num_match_points);
             }
             if (num_tot_eff > 0) {
                 if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
@@ -121,6 +139,7 @@ class Estimator
                          resple_gpu::CudaMap* cuda_map, const double pt_thresh, const double cov_thresh,
                          int num_threads = 5, int num_match_points = 5)
     {
+        corresp_stats.reset();
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -130,7 +149,7 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, num_threads, num_match_points);
+                Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, corresp_cfg, &corresp_stats, num_threads, num_match_points);
             }
             if (num_tot_eff > 0) {
                 if (!updateLiDAR(pt_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, num_threads)) {
@@ -165,6 +184,7 @@ class Estimator
         Eigen::aligned_deque<ImuData>& imu_meas, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro, const double cov_thresh,
         int num_threads = 5, int num_match_points = 5)
     {
+        corresp_stats.reset();
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -174,7 +194,7 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, num_threads, num_match_points);
+                Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, corresp_cfg, &corresp_stats, num_threads, num_match_points);
             }
             bool update_ok = false;
             if (num_tot_eff > 0 && imu_meas.empty()) {
@@ -214,6 +234,7 @@ class Estimator
         Eigen::aligned_deque<ImuData>& imu_meas, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro, const double cov_thresh,
         int num_threads = 5, int num_match_points = 5)
     {
+        corresp_stats.reset();
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -223,7 +244,7 @@ class Estimator
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
                 num_tot_eff = 0;
-                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, num_threads, num_match_points);
+                Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, corresp_cfg, &corresp_stats, num_threads, num_match_points);
             }
             bool update_ok = false;
             if (num_tot_eff > 0 && imu_meas.empty()) {
@@ -395,6 +416,9 @@ class Estimator
     // read before that first write would have been UB. setState() now runs
     // on valid zeros.
     Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp  = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
+    // Initial covariance from setState(), kept for the HARDENING SS3.3
+    // 'reset' recovery mode (resetCovarianceToPrior).
+    Eigen::Matrix<double, XSIZE, XSIZE> cov_prior_ = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Matrix<double, XSIZE, XSIZE> cov_sys  = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Matrix<double, XSIZE, XSIZE> a_mat    = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Vector3d bg = Eigen::Vector3d::Zero();

@@ -63,6 +63,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.hpp>
 
+#include "utils/common_utils.h"
 #include "SplineState.h"
 #include "utils/point_cloud_ingest.h"
 
@@ -800,8 +801,21 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         map_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "map/frame_id", "map");
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/publish_tf", true);
-        invert_tf  = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/invert_tf", false);        
-    
+        invert_tf  = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/invert_tf", false);
+
+        // HARDENING §3.1: same retention parameter as the RESPLE node.
+        // spline_active_ otherwise grows one knot per est_window knot for the
+        // whole run. Retention must stay wider than the publish/scan lag
+        // (publishPath walks path_t_ns_ forward each cycle; processScan only
+        // consumes scans inside the latest window), so clamp like RESPLE does.
+        spline_prune_keep_knots_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "spline_prune_keep_knots", 600);
+        if (spline_prune_keep_knots_ != 0 && spline_prune_keep_knots_ < 100) {
+            RCLCPP_WARN(this->get_logger(),
+                "spline_prune_keep_knots=%d is below the safe minimum; using 100",
+                spline_prune_keep_knots_);
+            spline_prune_keep_knots_ = 100;
+        }
+
         std::vector<double> cov_varp = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
         cov_pose << cov_varp.at(0), cov_varp.at(1), cov_varp.at(2), cov_varp.at(3), cov_varp.at(4), cov_varp.at(5);        
 
@@ -844,9 +858,14 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         sub_est = this->create_subscription<estimate_msgs::msg::Estimate>("est_window", large_reliable_qos, 
             std::bind(&Mapping::getEstCallback, this, std::placeholders::_1));
         
-        // Start processing thread
+        // Start processing thread (exited-flag store last, for the bounded
+        // join's join-vs-detach decision — see joinProcessingThreadBounded).
         processing_active_ = true;
-        processing_thread_ = std::thread(&Mapping::process, this);
+        processing_thread_exited_.store(false, std::memory_order_release);
+        processing_thread_ = std::thread([this] {
+            process();
+            processing_thread_exited_.store(true, std::memory_order_release);
+        });
         
         RCLCPP_INFO(this->get_logger(), "Mapping activated successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -944,21 +963,26 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         std::vector<MappingBase<pcl::PointXYZINormal>*>& maps_;
     };
 
-    // Bounded join: dispatch the join() onto an async future and wait
-    // with a deadline. If the worker is wedged (TF lookup, third-party
-    // lock), detach so shutdown can complete inside the launcher's 5s
-    // SIGINT→SIGTERM window.
+    // Bounded join. If the worker is wedged (TF lookup, third-party lock),
+    // detach so shutdown can complete inside the launcher's 5s SIGINT→SIGTERM
+    // window. Poll-based for the same reason as RESPLE's twin (see the
+    // comment there): the previous std::async-join + timeout-detach raced two
+    // threads on the same std::thread object (UB when the worker exited right
+    // at the deadline), and the future destructor un-bounded the wait.
     void joinProcessingThreadBounded(std::chrono::milliseconds timeout)
     {
         if (!processing_thread_.joinable()) return;
-        auto join_done = std::async(std::launch::async,
-            [this]{ processing_thread_.join(); });
-        if (join_done.wait_for(timeout) != std::future_status::ready) {
-            if (processing_thread_.joinable()) {
-                processing_thread_.detach();
-                RCLCPP_WARN(this->get_logger(),
-                    "Mapping process thread did not exit within timeout; detached");
-            }
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!processing_thread_exited_.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (processing_thread_exited_.load(std::memory_order_acquire)) {
+            processing_thread_.join();
+        } else {
+            processing_thread_.detach();
+            RCLCPP_WARN(this->get_logger(),
+                "Mapping process thread did not exit within timeout; detached");
         }
     }
 
@@ -1014,12 +1038,24 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             // + swap above) is on this worker thread, so these reads are now
             // genuinely single-threaded with respect to spline_active_ — no
             // m_spline coverage needed here.
-            if (if_init_succeed.load(std::memory_order_acquire) && spline_active_.numKnots() > num_knot) {
+            if (if_init_succeed.load(std::memory_order_acquire) && spline_active_.totalKnots() > num_knot) {
                 ScopedMappingsLock maps_lock(vis_maps);
                 publishPath();
                 displayControlPoints();
                 pubOdom();
-                num_knot = spline_active_.numKnots();
+                // totalKnots() (monotonic, includes pruned) rather than
+                // numKnots(): once Phase 3.1 pruning caps the retained count
+                // at the retention window, a numKnots() gate would never fire
+                // again and path/odom would silently freeze.
+                num_knot = spline_active_.totalKnots();
+                // Phase 3.1: prune after the publishes consumed this growth
+                // step. All spline_active_ mutation happens on this worker
+                // thread (Option B), so no extra locking is needed beyond
+                // m_spline, which serializes against the swap above.
+                if (spline_prune_keep_knots_ > 0) {
+                    std::lock_guard<std::mutex> lock(m_spline);
+                    spline_active_.pruneFrontKnots(spline_prune_keep_knots_);
+                }
             }
             if (!if_init_succeed.load(std::memory_order_acquire)) {
                 // chrono sleep so SIGINT-invalidated context never throws here.
@@ -1056,6 +1092,10 @@ private:
     // Lifecycle management
     std::atomic<bool> processing_active_;
     std::thread processing_thread_;
+    // Set by the worker lambda as its final action; consumed by
+    // joinProcessingThreadBounded (join-vs-detach without concurrent access
+    // to processing_thread_).
+    std::atomic<bool> processing_thread_exited_{false};
     std::vector<MappingBase<pcl::PointXYZINormal>*> vis_maps;
     std::string frame_id;
     std::string odom_id;
@@ -1092,6 +1132,8 @@ private:
     std::atomic<bool> start_pending_{false};
     std::atomic<int64_t> start_bag_time_pending_{0};
     std::mutex m_spline;
+    // Phase 3.1: knots retained by the sliding-window prune (0 disables).
+    int spline_prune_keep_knots_ = 600;
 
     void displayControlPoints()
     {

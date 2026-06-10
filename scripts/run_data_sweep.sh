@@ -46,11 +46,21 @@ ln -sfn "${TOOLS}/data_injector" "${WS}/src/data_injector"
 
 cd "${WS}"
 echo "==> build resple (${MODE}) + data_injector"
-colcon build --packages-up-to resple data_injector \
-  --cmake-args -DENABLE_NATIVE_ARCH=OFF "-DPython3_EXECUTABLE=${PYEXE}" \
-  --packages-select-cmake-args resple ${SAN_ARG}
+# --packages-select-cmake-args needs colcon-cmake >= 0.2.27; fall back to
+# passing the sanitizer flag globally (the message packages and the injector
+# simply ignore the unused ENABLE_* variable) on older colcon.
+if colcon build --help 2>/dev/null | grep -q "packages-select-cmake-args"; then
+  colcon build --packages-up-to resple data_injector \
+    --cmake-args -DENABLE_NATIVE_ARCH=OFF "-DPython3_EXECUTABLE=${PYEXE}" \
+    --packages-select-cmake-args resple ${SAN_ARG}
+else
+  colcon build --packages-up-to resple data_injector \
+    --cmake-args -DENABLE_NATIVE_ARCH=OFF "-DPython3_EXECUTABLE=${PYEXE}" ${SAN_ARG}
+fi
 # shellcheck disable=SC1091
-source install/setup.bash
+# (wrapped in +u like the ROS setup above: colcon's setup.bash reads
+# COLCON_TRACE and trips `set -u` on some versions)
+set +u; source install/setup.bash; set -u
 
 # Config with num_threads=1 (see note above).
 CFG="$(mktemp /tmp/inject_sweep.XXXX.yaml)"

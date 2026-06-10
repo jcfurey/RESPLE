@@ -68,6 +68,7 @@
 #include "estimate_msgs/msg/calib.hpp"
 #include "estimate_msgs/msg/spline.hpp"
 #include "estimate_msgs/msg/estimate.hpp"
+#include "estimate_msgs/msg/diagnostics.hpp"
 #include "estimate_msgs/action/save_map.hpp"
 #include "Estimator.h"
 #include "utils/point_cloud_ingest.h"
@@ -157,6 +158,13 @@ public:
         
         // Create publishers (inactive until activated)
         pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
+        // HARDENING Phase 4: consolidated, typed estimator diagnostics for
+        // plotting (Foxglove / PlotJuggler). Relative topic so the production
+        // namespace yields /localization/resple/resple_diagnostics; the
+        // string-keyed diagnostic_updater output on /diagnostics remains for
+        // aggregation. ~20 Hz while data flows — keep the queue shallow.
+        pub_diag_ = this->create_publisher<estimate_msgs::msg::Diagnostics>(
+            "resple_diagnostics", rclcpp::QoS(10).best_effort());
         // transient_local: start_time is published once after gravity
         // alignment; without late-joiner durability, a Mapping node that
         // subscribes after publish() never sees it and `if_init_succeed`
@@ -208,6 +216,7 @@ public:
 
         // Activate publishers
         pub_est->on_activate();
+        pub_diag_->on_activate();
         pub_start_time->on_activate();
         pub_pose->on_activate();
         pub_pose_cov->on_activate();
@@ -282,9 +291,16 @@ public:
             }
         }
         
-        // Start processing thread
+        // Start processing thread. The exited-flag store is the lambda's last
+        // action so joinProcessingThreadBounded can tell "worker finished,
+        // join() will return promptly" from "worker wedged, must detach"
+        // without a second thread touching processing_thread_ (see there).
         processing_active_ = true;
-        processing_thread_ = std::thread(&RESPLE::processData, this);
+        processing_thread_exited_.store(false, std::memory_order_release);
+        processing_thread_ = std::thread([this] {
+            processData();
+            processing_thread_exited_.store(true, std::memory_order_release);
+        });
 
         RCLCPP_INFO(this->get_logger(), "RESPLE activated successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -325,6 +341,7 @@ public:
 
         // Deactivate publishers
         pub_est->on_deactivate();
+        pub_diag_->on_deactivate();
         pub_start_time->on_deactivate();
         pub_pose->on_deactivate();
         pub_pose_cov->on_deactivate();
@@ -377,6 +394,8 @@ public:
         if_init_filter = false;
         if_init_map = false;
         localmap_initialized_ = false;
+        radius_prune_initialized_ = false;
+        nis_hold_active_.store(false);
         imu_first_logged_.store(false);
         imu_count_logged_.store(false);
         lidar_first_logged_.store(false);
@@ -386,6 +405,7 @@ public:
         
         // Reset publishers
         pub_est.reset();
+        pub_diag_.reset();
         pub_start_time.reset();
         pub_pose.reset();
         pub_pose_cov.reset();
@@ -431,24 +451,37 @@ public:
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
 
-    // Bounded join: dispatch the join() onto an async future and wait
-    // with a deadline. Used during lifecycle teardown so that a wedged
-    // ikd-Tree (rebuild thread holding internal locks) can't hold up
-    // shutdown past the launcher's 5-second SIGINT→SIGTERM grace window.
+    // Bounded join, used during lifecycle teardown so that a wedged ikd-Tree
+    // (rebuild thread holding internal locks) can't hold up shutdown past the
+    // launcher's 5-second SIGINT→SIGTERM grace window.
+    //
+    // Implementation note: this used to dispatch join() onto a std::async
+    // task and detach() from this thread on timeout. That raced two threads
+    // on the SAME std::thread object — when the worker exited just after the
+    // deadline, the async join() consumed the thread id while this thread
+    // called detach() on it (UB; TSan's runtime CHECK-aborted on it during
+    // the Phase 3.1 sweep). The async future's destructor also blocked until
+    // join() returned, so the join wasn't actually bounded. Instead, poll the
+    // worker's exited flag (its last store before returning): once set,
+    // join() is guaranteed to return promptly; until then nobody touches
+    // processing_thread_, so the timeout detach() is single-threaded.
     void joinProcessingThreadBounded(std::chrono::milliseconds timeout)
     {
         if (!processing_thread_.joinable()) return;
-        auto join_done = std::async(std::launch::async,
-            [this]{ processing_thread_.join(); });
-        if (join_done.wait_for(timeout) != std::future_status::ready) {
-            if (processing_thread_.joinable()) {
-                // processing_active_ is already false; the worker is just
-                // wedged on a third-party lock and will tear down with the
-                // process. Detach so shutdown can proceed.
-                processing_thread_.detach();
-                RCLCPP_WARN(this->get_logger(),
-                    "processing thread did not exit within timeout; detached");
-            }
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!processing_thread_exited_.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (processing_thread_exited_.load(std::memory_order_acquire)) {
+            processing_thread_.join();
+        } else {
+            // processing_active_ is already false; the worker is just
+            // wedged on a third-party lock and will tear down with the
+            // process. Detach so shutdown can proceed.
+            processing_thread_.detach();
+            RCLCPP_WARN(this->get_logger(),
+                "processing thread did not exit within timeout; detached");
         }
     }
 
@@ -638,6 +671,10 @@ public:
             }
             bool collected_any = false;
             while (true) {
+                // Phase 4 stage timing: drain covers THIS frame's collection
+                // (captured per inner iteration — several frames can process
+                // per outer loop pass).
+                const auto drain_start = std::chrono::high_resolution_clock::now();
                 bool have_meas;
                 {
                     std::lock_guard<std::mutex> spline_lock(spline_mutex_);
@@ -652,8 +689,9 @@ public:
                         "[RESPLE] first IEKF iteration (pt_meas=%zu, spline knots=%ld)",
                         pt_meas.size(), spline->numKnots());
                 }
-                // Track computation time
+                // Track computation time (Phase 4 also splits per-stage).
                 auto frame_start = std::chrono::high_resolution_clock::now();
+                const float drain_ms = std::chrono::duration<float, std::milli>(frame_start - drain_start).count();
 
                 int64_t max_time_ns = !pt_meas.empty() ? pt_meas.back().time_ns
                                                         : imu_meas.back().time_ns;
@@ -708,6 +746,18 @@ public:
                         total_iekf_iterations_.fetch_add(estimator_lio.n_iter, std::memory_order_relaxed);
                     }
                 }
+                const auto iekf_end = std::chrono::high_resolution_clock::now();
+                {
+                    // HARDENING §3.2: accumulate this update's correspondence
+                    // funnel into the cumulative atomics consumed by
+                    // updateDiagnostics (executor thread).
+                    const Association::CorrespStats& cs = if_lidar_only
+                        ? estimator_lo.corresp_stats : estimator_lio.corresp_stats;
+                    corresp_candidates_.fetch_add(cs.candidates, std::memory_order_relaxed);
+                    corresp_passed_knn_.fetch_add(cs.passed_knn, std::memory_order_relaxed);
+                    corresp_passed_plane_.fetch_add(cs.passed_plane, std::memory_order_relaxed);
+                    corresp_used_.fetch_add(cs.used, std::memory_order_relaxed);
+                }
                 {
                     // HARDENING §3.3: feed the windowed NIS consistency
                     // detector with the final IEKF iteration's innovation
@@ -733,6 +783,50 @@ public:
                             "or correspondences are inconsistent — pose covariance is no "
                             "longer trustworthy.", nis_detector_.lastWindowMean());
                     }
+                    // HARDENING §3.3 recovery policy (nis_recovery_mode param).
+                    switch (nis_recovery_mode_) {
+                    case NisRecoveryMode::OFF:
+                        break;
+                    case NisRecoveryMode::HOLD:
+                        // Latch the hold on DIVERGED; release only on a full
+                        // OK verdict (the detector's hysteresis), so WARN
+                        // during recovery keeps the gate closed.
+                        if (fh_state == resple::health::FilterState::DIVERGED) {
+                            if (!nis_hold_active_) {
+                                RCLCPP_ERROR(this->get_logger(),
+                                    "[RESPLE] nis_recovery_mode=hold: suspending odometry/TF "
+                                    "publication until the NIS window recovers.");
+                            }
+                            nis_hold_active_ = true;
+                        } else if (fh_state == resple::health::FilterState::OK && nis_hold_active_) {
+                            nis_hold_active_ = false;
+                            RCLCPP_WARN(this->get_logger(),
+                                "[RESPLE] NIS window recovered; resuming odometry/TF publication.");
+                        }
+                        break;
+                    case NisRecoveryMode::RESET:
+                        if (fh_state == resple::health::FilterState::DIVERGED) {
+                            // Reinflate the IEKF covariance to the configure-
+                            // time prior, keeping the state (spline + biases):
+                            // an over-confident covariance is exactly what the
+                            // NIS verdict detects, and reinflation lets new
+                            // measurements re-correct the state. Restart the
+                            // detector window so the next verdict reflects the
+                            // post-reset filter.
+                            if (if_lidar_only) {
+                                estimator_lo.resetCovarianceToPrior();
+                            } else {
+                                estimator_lio.resetCovarianceToPrior();
+                            }
+                            nis_detector_.reset();
+                            nis_resets_.fetch_add(1, std::memory_order_relaxed);
+                            RCLCPP_ERROR(this->get_logger(),
+                                "[RESPLE] nis_recovery_mode=reset: IEKF covariance reinflated "
+                                "to the configure-time prior (reset #%lu).",
+                                static_cast<unsigned long>(nis_resets_.load(std::memory_order_relaxed)));
+                        }
+                        break;
+                    }
                 }
                 {
                     // pointBodyToWorld reads spline; keep serialized with
@@ -746,6 +840,7 @@ public:
                     // Cache knot count for updateDiagnostics (may run on the
                     // executor thread; atomic read there is lock-free).
                     cached_spline_knots_.store(spline->numKnots(), std::memory_order_relaxed);
+                    cached_spline_total_knots_.store(spline->totalKnots(), std::memory_order_relaxed);
                 }
                 for (size_t i = 0; i < pt_meas.size(); i++) {
                     PointData& pt_data = pt_meas[i];
@@ -753,12 +848,16 @@ public:
                     accum_nearest_points.push_back(std::move(pt_neighbors_[i]));
                 }
                 pt_meas.clear();
-                if (spline->numKnots() > max_spl_knots) {
+                const auto deskew_end = std::chrono::high_resolution_clock::now();
+                // max_spl_knots tracks totalKnots() (monotonic, includes
+                // pruned knots) so the growth gate keeps firing once Phase 3.1
+                // pruning caps numKnots() at the retention window.
+                if (spline->totalKnots() > max_spl_knots) {
                     estimate_msgs::msg::Spline spline_msg;
                     {
                         std::lock_guard<std::mutex> spline_lock(spline_mutex_);
-                        spline->getSplineMsg(spline_msg, std::max(int(max_spl_knots-1),0));
-                        max_spl_knots = spline->numKnots();
+                        spline->getSplineMsg(spline_msg, std::max<int64_t>(max_spl_knots - 1, 0));
+                        max_spl_knots = spline->totalKnots();
                     }
                     estimate_msgs::msg::Estimate est_msg;
                     est_msg.spline = spline_msg;
@@ -771,13 +870,38 @@ public:
                             spline->numKnots());
                     }
                 }
-                // Pose/odom/TF publish is INLINE and unconditional. Keeping
-                // it out of the async-map-update lambda means the odom frame
-                // keeps flowing even if the background map mutation is
+                // Phase 3.1 sliding-window knot pruning (hazard 4: unbounded
+                // knot growth, measured live in the 2.6 data-path sweep).
+                // Runs AFTER the est_window publish so every knot is on the
+                // wire before it can be dropped, and under spline_mutex_ —
+                // the same lock every other spline reader/writer takes. The
+                // retention window is far wider than every backward-looking
+                // consumer (IEKF: last 4 knots; est_window: last 5; deskew:
+                // the current scan, ~10 knots at 100 Hz).
+                if (spline_prune_keep_knots_ > 0) {
+                    std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                    spline->pruneFrontKnots(spline_prune_keep_knots_);
+                }
+                // Pose/odom/TF publish is INLINE and (normally) unconditional.
+                // Keeping it out of the async-map-update lambda means the odom
+                // frame keeps flowing even if the background map mutation is
                 // wedged inside ikd-Tree (rebuild can stall on big trees,
                 // and previously this also stalled processData itself
                 // because the loop blocked on map_update_future_.wait()).
-                publishPoseAndTf();
+                //
+                // HARDENING §3.3 'hold' recovery: while the NIS hold is
+                // latched, the last published pose IS the held estimate —
+                // downstream (the odom EKF) coasts on its other sources
+                // instead of fusing an untrustworthy pose. est_window /
+                // map updates continue (internal estimation keeps running so
+                // the detector can observe recovery).
+                if (nis_hold_active_) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "[RESPLE] odometry/TF publication held (NIS divergence, "
+                        "nis_recovery_mode=hold).");
+                } else {
+                    publishPoseAndTf();
+                }
 
                 if (max_time_ns >= t_last_map_upd + 100000000LL) {
                     // Wait for any prior async map update before swapping buffers.
@@ -875,9 +999,14 @@ public:
                             // d_buckets / d_sorted_points arrays that
                             // batch_search reads — running them concurrently
                             // produced an "illegal memory access" SIGABRT.)
+                            const auto map_upd_start = std::chrono::high_resolution_clock::now();
                             std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
                             mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
                             lasermapFovSegment();
+                            last_map_update_us_.store(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::high_resolution_clock::now() - map_upd_start).count(),
+                                std::memory_order_relaxed);
 #ifdef RESPLE_USE_CUDA
                             ikdtree.PCL_Storage.clear();
                             ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
@@ -903,6 +1032,67 @@ public:
                 total_computation_time_us_.fetch_add(
                     static_cast<uint64_t>(frame_duration.count()), std::memory_order_relaxed);
                 frame_count_.fetch_add(1, std::memory_order_relaxed);
+
+                // HARDENING Phase 4: consolidated typed diagnostics, one
+                // message per processed frame. Everything here is either a
+                // worker-local value or a relaxed atomic snapshot — no locks
+                // beyond the brief spline/cov reads below.
+                {
+                    estimate_msgs::msg::Diagnostics dmsg;
+                    dmsg.header.stamp = rclcpp::Time(max_time_ns);
+                    dmsg.header.frame_id = odom_id;
+                    {
+                        std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                        dmsg.knot_count = spline->numKnots();
+                        dmsg.knot_total = spline->totalKnots();
+                        // 6x6 pose covariance at maxTimeNs (reads the spline
+                        // for the interpolation Jacobian — hence the lock).
+                        const Eigen::Matrix<double, 6, 6> pose_cov = if_lidar_only
+                            ? estimator_lo.getLastPoseCovariance()
+                            : estimator_lio.getLastPoseCovariance();
+                        dmsg.cov_trace = pose_cov.trace();
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(pose_cov);
+                        dmsg.cov_lambda_min = (es.info() == Eigen::Success)
+                            ? es.eigenvalues().minCoeff()
+                            : std::numeric_limits<double>::quiet_NaN();
+                    }
+                    dmsg.lidar_buffer_depth = cached_lidar_buf_.load(std::memory_order_relaxed);
+                    dmsg.imu_buffer_depth = static_cast<int64_t>(imu_buff.size());
+                    {
+                        std::lock_guard<std::mutex> lock(m_buff);
+                        dmsg.imu_staging_depth = static_cast<int64_t>(imu_int_buff.size());
+                    }
+                    const Association::CorrespStats& cs = if_lidar_only
+                        ? estimator_lo.corresp_stats : estimator_lio.corresp_stats;
+                    dmsg.corresp_candidates = cs.candidates;
+                    dmsg.corresp_passed_window = cs.passed_window;
+                    dmsg.corresp_passed_knn = cs.passed_knn;
+                    dmsg.corresp_passed_plane = cs.passed_plane;
+                    dmsg.corresp_used = cs.used;
+                    if (if_lidar_only) {
+                        dmsg.iekf_numerical_failures = estimator_lo.num_numerical_failures_.load(std::memory_order_relaxed);
+                        dmsg.nis = estimator_lo.lastNis();
+                        dmsg.nis_dof = estimator_lo.lastNisDof();
+                    } else {
+                        dmsg.iekf_numerical_failures = estimator_lio.num_numerical_failures_.load(std::memory_order_relaxed);
+                        dmsg.nis = estimator_lio.lastNis();
+                        dmsg.nis_dof = estimator_lio.lastNisDof();
+                    }
+                    dmsg.filter_state = static_cast<uint8_t>(filter_health_state_.load(std::memory_order_relaxed));
+                    dmsg.recovery_hold_active = nis_hold_active_.load(std::memory_order_relaxed);
+                    dmsg.recovery_resets = nis_resets_.load(std::memory_order_relaxed);
+                    dmsg.deskew_out_of_range = Association::out_of_range_queries_.load(std::memory_order_relaxed);
+                    dmsg.map_size = ikdtree.size();
+                    dmsg.map_radius_prunes = radius_prune_ops_.load(std::memory_order_relaxed);
+                    dmsg.dropped_scans = dropped_scans_.load(std::memory_order_relaxed);
+                    dmsg.dropped_imu = dropped_imu_.load(std::memory_order_relaxed);
+                    dmsg.drain_ms = drain_ms;
+                    dmsg.iekf_ms = std::chrono::duration<float, std::milli>(iekf_end - frame_start).count();
+                    dmsg.deskew_ms = std::chrono::duration<float, std::milli>(deskew_end - iekf_end).count();
+                    dmsg.frame_total_ms = frame_duration.count() / 1000.0f;
+                    dmsg.map_update_ms = last_map_update_us_.load(std::memory_order_relaxed) / 1000.0f;
+                    pub_diag_->publish(dmsg);
+                }
 
                 // Update diagnostics at 1 Hz
                 if ((this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) >= 1000000000LL) {
@@ -945,6 +1135,9 @@ private:
     // Performance tuning parameters (Phase 3)
     int num_threads_;
     int num_match_points_;
+    // Phase 3.1: knots retained by the sliding-window prune each cycle.
+    // 0 disables pruning (pre-3.1 unbounded-growth behaviour).
+    int spline_prune_keep_knots_ = 600;
     
     // Diagnostics
     diagnostic_updater::Updater diagnostics_;
@@ -965,6 +1158,21 @@ private:
     // timer, not just from the worker's force_update). Atomic so the read is
     // not a data race; stale-by-one-cycle is acceptable.
     std::atomic<int64_t> cached_spline_knots_{0};
+    // Total knots ever created (numKnots + pruned). With Phase 3.1 pruning
+    // active, "Spline Knots" plateaus at the retention window; this one keeps
+    // the original unbounded-growth signal visible in diagnostics.
+    std::atomic<int64_t> cached_spline_total_knots_{0};
+    // HARDENING §3.2 correspondence funnel (cumulative; worker adds each IEKF
+    // update's CorrespStats, updateDiagnostics publishes per-window deltas).
+    std::atomic<uint64_t> corresp_candidates_{0};
+    std::atomic<uint64_t> corresp_passed_knn_{0};
+    std::atomic<uint64_t> corresp_passed_plane_{0};
+    std::atomic<uint64_t> corresp_used_{0};
+    // Previous-window snapshots, touched only inside updateDiagnostics.
+    uint64_t last_corresp_candidates_ = 0;
+    uint64_t last_corresp_passed_knn_ = 0;
+    uint64_t last_corresp_passed_plane_ = 0;
+    uint64_t last_corresp_used_ = 0;
     // Diagnostic buffer depths. Refreshed by the worker each loop iteration and
     // read by updateDiagnostics, which can run on the executor thread via the
     // Updater's internal 1 Hz timer. Atomic so the cross-thread read is not a
@@ -981,6 +1189,15 @@ private:
     // The atomics export their verdicts to updateDiagnostics on the executor
     // thread, same pattern as the cached_* metrics above.
     resple::health::NisDivergenceDetector nis_detector_;
+    // HARDENING §3.3 recovery policy. OFF = detection-only (log +
+    // diagnostics, legacy); HOLD = gate odometry/TF publication while
+    // DIVERGED (released on full OK); RESET = reinflate the IEKF covariance
+    // to the configure-time prior on DIVERGED. nis_hold_active_ is
+    // worker-thread-only; the reset counter is atomic for diagnostics.
+    enum class NisRecoveryMode { OFF, HOLD, RESET };
+    NisRecoveryMode nis_recovery_mode_ = NisRecoveryMode::OFF;
+    std::atomic<bool> nis_hold_active_{false};  // worker writes, diagnostics reads
+    std::atomic<uint64_t> nis_resets_{0};
     resple::health::ImuHealthMonitor imu_health_;
     std::atomic<int> filter_health_state_{0};        // FilterState as int
     std::atomic<double> nis_window_mean_{0.0};
@@ -994,6 +1211,10 @@ private:
     // Lifecycle management
     std::atomic<bool> processing_active_;
     std::thread processing_thread_;
+    // Set by the worker lambda as its final action; consumed by
+    // joinProcessingThreadBounded to decide join-vs-detach without two
+    // threads ever touching processing_thread_ concurrently.
+    std::atomic<bool> processing_thread_exited_{false};
     
     // SaveMap action server
     using SaveMapAction = estimate_msgs::action::SaveMap;
@@ -1022,6 +1243,9 @@ private:
     resple::pc2::AdapterConfig generic_adapter_cfg_;
     rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan;
     rclcpp_lifecycle::LifecyclePublisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
+    rclcpp_lifecycle::LifecyclePublisher<estimate_msgs::msg::Diagnostics>::SharedPtr pub_diag_;
+    // Phase 4: duration of the last completed async map update (µs).
+    std::atomic<int64_t> last_map_update_us_{0};
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_pose_cov;
     rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;
@@ -1048,6 +1272,13 @@ private:
 
     std::vector<BoxPointType> cub_needrm;
     BoxPointType LocalMap_Points;
+    // HARDENING §3.4 radius pruning state (see pruneMapRadius). The double /
+    // Vector3d / bool members are only touched inside the async map-update
+    // task (single in flight); the op counter is atomic for updateDiagnostics.
+    double map_prune_radius_ = 0.0;  // 0 disables (cube-only legacy behaviour)
+    Eigen::Vector3d last_radius_prune_center_ = Eigen::Vector3d::Zero();
+    bool radius_prune_initialized_ = false;
+    std::atomic<uint64_t> radius_prune_ops_{0};
     std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> accum_nearest_points;
     // Per-frame parallel buffer for k-NN results (used to live in PointData::nearest_points).
     // Sized to pt_meas.size() before each IEKF call; results moved into accum_nearest_points after.
@@ -1070,6 +1301,31 @@ private:
         std::atomic<int64_t> last_t_ns{0};
     };
     std::map<std::string, LidarData> lidars_data;    
+    // HARDENING §2.3: bounded input buffers. 0 = unbounded (legacy); when
+    // set, the scan push drops the OLDEST scan (pc_buff+t_buff in lock-step)
+    // and the IMU staging cap below replaces the old hardcoded 2000. Drops
+    // are counted for diagnostics — on a healthy system both stay 0.
+    int max_scan_buffer_ = 0;
+    int max_imu_staging_ = 2000;
+    std::atomic<uint64_t> dropped_scans_{0};
+    std::atomic<uint64_t> dropped_imu_{0};
+
+    // Single push path for every LiDAR callback (HARDENING §2.3).
+    template<typename PtsT>
+    void pushScanBounded(LidarData& ld, PtsT&& pts, int64_t t_begin)
+    {
+        std::lock_guard<std::mutex> lock(ld.mtx_pc);
+        if (max_scan_buffer_ > 0) {
+            while (static_cast<int>(ld.pc_buff.size()) >= max_scan_buffer_) {
+                ld.pc_buff.pop_front();
+                ld.t_buff.pop_front();
+                dropped_scans_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        ld.pc_buff.push_back(std::forward<PtsT>(pts));
+        ld.t_buff.push_back(t_begin);
+    }
+
     Eigen::aligned_deque<PointData> pt_meas;    
 
     // Atomic: worker reads this in processData without m_buff. Set once during
@@ -1283,6 +1539,68 @@ private:
             RCLCPP_WARN(this->get_logger(), 
                 "nn_thresh value %.3f outside recommended range [0.1, 5.0]", param.nn_thresh);
         }
+        // HARDENING §3.2 correspondence thresholds. Defaults reproduce the
+        // previously hardcoded values exactly; plane_min_cond_ratio > 0
+        // additionally rejects degenerate (collinear / rank-deficient)
+        // neighbor patches — off by default until tuned against a known-good
+        // bag (see HARDENING.md §3.2 for the benchmark requirement).
+        {
+            Association::CorrespConfig ccfg;
+            ccfg.max_neighbor_sq_dist = static_cast<float>(
+                CommonUtils::readParam<double>(this->get_node_parameters_interface(), "nn_max_sq_dist", 5.0));
+            ccfg.plane_fit_thresh = static_cast<float>(
+                CommonUtils::readParam<double>(this->get_node_parameters_interface(), "plane_fit_thresh", 0.1));
+            ccfg.plane_min_cond_ratio = static_cast<float>(
+                CommonUtils::readParam<double>(this->get_node_parameters_interface(), "plane_min_cond_ratio", 0.0));
+            if (ccfg.max_neighbor_sq_dist <= 0.0f || ccfg.plane_fit_thresh <= 0.0f) {
+                RCLCPP_WARN(this->get_logger(),
+                    "nn_max_sq_dist=%.3f / plane_fit_thresh=%.3f must be > 0; using defaults 5.0 / 0.1",
+                    ccfg.max_neighbor_sq_dist, ccfg.plane_fit_thresh);
+                ccfg = Association::CorrespConfig{};
+            }
+            estimator_lo.corresp_cfg = ccfg;
+            estimator_lio.corresp_cfg = ccfg;
+        }
+
+        // HARDENING §3.1 sliding-window knot pruning. Default 600 knots
+        // (6 s at the canonical knot_hz=100) bounds spline memory while
+        // staying far wider than any backward-looking consumer. 0 disables.
+        // Values below 100 keep too little margin for the startup gates
+        // (collectMeasurements treats numKnots()<10 specially) and for
+        // deskew under scan-buffer backlog, so clamp them up.
+        spline_prune_keep_knots_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "spline_prune_keep_knots", 600);
+        if (spline_prune_keep_knots_ != 0 && spline_prune_keep_knots_ < 100) {
+            RCLCPP_WARN(this->get_logger(),
+                "spline_prune_keep_knots=%d is below the safe minimum; using 100",
+                spline_prune_keep_knots_);
+            spline_prune_keep_knots_ = 100;
+        }
+        // HARDENING §2.3 bounded input buffers. max_scan_buffer caps each
+        // per-LiDAR raw-scan deque in SCANS (0 = unbounded legacy);
+        // max_imu_staging caps imu_int_buff in SAMPLES (default keeps the
+        // previously hardcoded 2000; 0 disables). Drop-oldest + counters.
+        max_scan_buffer_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_scan_buffer", 0);
+        max_imu_staging_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_imu_staging", 2000);
+
+        // HARDENING §3.3 divergence recovery policy: off (detection-only,
+        // legacy) | hold (gate odometry/TF while DIVERGED) | reset
+        // (reinflate IEKF covariance to the prior on DIVERGED).
+        {
+            const std::string mode = CommonUtils::readParam<std::string>(
+                this->get_node_parameters_interface(), "nis_recovery_mode", std::string("off"));
+            if (mode == "hold") {
+                nis_recovery_mode_ = NisRecoveryMode::HOLD;
+            } else if (mode == "reset") {
+                nis_recovery_mode_ = NisRecoveryMode::RESET;
+            } else {
+                if (mode != "off") {
+                    RCLCPP_WARN(this->get_logger(),
+                        "nis_recovery_mode='%s' not recognized (off|hold|reset); using 'off'",
+                        mode.c_str());
+                }
+                nis_recovery_mode_ = NisRecoveryMode::OFF;
+            }
+        }
         if_lidar_only = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "if_lidar_only", false);
         if (!if_lidar_only) {
             acc_ratio = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "acc_ratio", false);
@@ -1325,6 +1643,16 @@ private:
         param.coeff_cov = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "coeff_cov", 10);
 
         cube_len = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "cube_len", 1000.0);
+        // HARDENING §3.4: keep only map points within this distance of the
+        // current pose (0 = disabled, legacy cube-only behaviour). Floored at
+        // 2x det_range in pruneMapRadius; warn here so the operator sees the
+        // effective value.
+        map_prune_radius_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "map_prune_radius", 0.0);
+        if (map_prune_radius_ > 0.0 && map_prune_radius_ < 2.0 * double(det_range)) {
+            RCLCPP_WARN(this->get_logger(),
+                "map_prune_radius=%.1f is below 2x det_range (%.1f); the effective radius will be %.1f",
+                map_prune_radius_, 2.0 * double(det_range), 2.0 * double(det_range));
+        }
         point_filter_num = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "point_filter_num", 1);
         num_points_upd = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "num_points_upd", 100);
         if (if_lidar_only) {
@@ -1568,8 +1896,12 @@ private:
                 imu_msg->header.frame_id.c_str());
         }
 
-        if (imu_int_buff.size() >= 2000) {
+        // HARDENING §2.3: parameterized staging cap (was hardcoded 2000),
+        // drop-oldest + counted. 0 disables.
+        if (max_imu_staging_ > 0 &&
+            static_cast<int>(imu_int_buff.size()) >= max_imu_staging_) {
             imu_int_buff.erase(imu_int_buff.begin());
+            dropped_imu_.fetch_add(1, std::memory_order_relaxed);
         }
 
         // Pre-init: accept raw IMU for gravity alignment. Gravity direction is
@@ -1648,6 +1980,8 @@ private:
         // whether the unbounded-knot / unbounded-buffer / silent-failure
         // hazards listed in CLAUDE.md actually fire in practice.
         stat.add("Spline Knots", static_cast<int>(cached_spline_knots_.load(std::memory_order_relaxed)));
+        stat.add("Spline Knots (total incl. pruned)",
+                 static_cast<int>(cached_spline_total_knots_.load(std::memory_order_relaxed)));
         size_t imu_int_size = 0;
         {
             std::lock_guard<std::mutex> lock(m_buff);
@@ -1669,6 +2003,45 @@ private:
         stat.add("IEKF Numerical Failures (LIO, cumulative)", static_cast<int>(fails_lio));
         stat.add("IEKF Numerical Failures (LO, last window)",  static_cast<int>(dfails_lo));
         stat.add("IEKF Numerical Failures (LIO, last window)", static_cast<int>(dfails_lio));
+
+        // HARDENING §3.2 correspondence funnel, per diagnostics window.
+        // candidates → passed_distance (full k-NN within gate) → passed_plane
+        // (esti_plane accepted) → used (point-to-plane range gate, fed to the
+        // IEKF). Stage-to-stage drops localize where matches are lost: sparse
+        // map vs degenerate/noisy patches vs association outliers.
+        {
+            const uint64_t cand  = corresp_candidates_.load(std::memory_order_relaxed);
+            const uint64_t knn   = corresp_passed_knn_.load(std::memory_order_relaxed);
+            const uint64_t plane = corresp_passed_plane_.load(std::memory_order_relaxed);
+            const uint64_t used  = corresp_used_.load(std::memory_order_relaxed);
+            stat.add("Corresp Candidates (last window)",     static_cast<int>(cand  - last_corresp_candidates_));
+            stat.add("Corresp Passed Distance (last window)", static_cast<int>(knn   - last_corresp_passed_knn_));
+            stat.add("Corresp Passed Plane (last window)",    static_cast<int>(plane - last_corresp_passed_plane_));
+            stat.add("Corresp Used in IEKF (last window)",    static_cast<int>(used  - last_corresp_used_));
+            last_corresp_candidates_   = cand;
+            last_corresp_passed_knn_   = knn;
+            last_corresp_passed_plane_ = plane;
+            last_corresp_used_         = used;
+        }
+
+        // HARDENING §3.4: how many radius-prune deletions have run (0 when
+        // map_prune_radius is disabled or the pose hasn't moved enough).
+        stat.add("Map Radius Prunes (cumulative)",
+                 static_cast<int>(radius_prune_ops_.load(std::memory_order_relaxed)));
+
+        // HARDENING §2.3: drop-oldest counters (non-zero means the caps are
+        // engaging — the worker is not keeping up with the sensors).
+        stat.add("Scans Dropped (cumulative)",
+                 static_cast<int>(dropped_scans_.load(std::memory_order_relaxed)));
+        stat.add("IMU Samples Dropped (cumulative)",
+                 static_cast<int>(dropped_imu_.load(std::memory_order_relaxed)));
+
+        // HARDENING §3.3 recovery-policy observability: whether odometry/TF
+        // publication is currently held, and how many covariance resets the
+        // 'reset' mode has performed.
+        stat.add("NIS Recovery Hold Active", nis_hold_active_.load(std::memory_order_relaxed));
+        stat.add("NIS Recovery Resets (cumulative)",
+                 static_cast<int>(nis_resets_.load(std::memory_order_relaxed)));
 
         // Out-of-spline-range query counter from Association::pointBodyToWorld.
         // Signals that the deskew loop saw a scan timestamp outside the current
@@ -1775,11 +2148,7 @@ private:
         // Transform point cloud to body frame
         pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_last->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_last->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1853,11 +2222,7 @@ private:
         // Transform point cloud to body frame
         pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_last->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_last->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1920,11 +2285,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_transformed->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1986,11 +2347,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_transformed->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2053,11 +2410,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs.mtx_pc);
-            lidar_buffs.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs, pc_transformed->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2111,11 +2464,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs_hesai.mtx_pc);
-            lidar_buffs_hesai.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs_hesai.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs_hesai, pc_transformed->points, time_begin);
         lidar_buffs_hesai.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2167,11 +2516,7 @@ private:
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
 
-        {
-            std::lock_guard<std::mutex> lock(lidar_buffs_boxi.mtx_pc);
-            lidar_buffs_boxi.pc_buff.push_back(pc_transformed->points);
-            lidar_buffs_boxi.t_buff.push_back(time_begin);
-        }
+        pushScanBounded(lidar_buffs_boxi, pc_transformed->points, time_begin);
         lidar_buffs_boxi.last_t_ns.store(time_begin + max_ofs_ns);
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2663,6 +3008,12 @@ private:
             localmap_initialized_ = true;
             return;
         }
+        // HARDENING §3.4: radius-based pruning runs every tick (it has its
+        // own movement hysteresis), independent of the cube's edge trigger
+        // below — the cube only deletes when the pose nears its edge, so
+        // wandering inside a large cube otherwise keeps stale far geometry
+        // alive for the whole run.
+        pruneMapRadius(0.5 * (pos_lidar_min + pos_lidar_max));
         float dist_to_map_edge[3][2];
         bool need_move = false;
         for (int i = 0; i < 3; i++){
@@ -2695,6 +3046,58 @@ private:
         if(cub_needrm.size() > 0) {
             ikdtree.Delete_Point_Boxes(cub_needrm);
         }
+    }
+
+    // HARDENING §3.4: radius-based map pruning (supplement to the FOV cube).
+    // When map_prune_radius > 0, keep only the axis-aligned box of half-extent
+    // R centered on the current lidar pose: on first activation, and whenever
+    // the pose has moved more than 10% of R since the last prune, delete the
+    // slabs of the local-map cube that lie outside that box. R is floored at
+    // 2x det_range so pruning can never bite into the sensor's live
+    // measurement sphere (matches in findCorresp are all within det_range).
+    //
+    // Threading: called only from lasermapFovSegment, i.e. inside the async
+    // map-update task under mtx_map_ unique; successive tasks are serialized
+    // by the worker's future wait, so the plain (non-atomic) prune-state
+    // members are single-threaded.
+    void pruneMapRadius(const Eigen::Vector3d& center)
+    {
+        if (map_prune_radius_ <= 0.0) {
+            return;
+        }
+        const double R = std::max(map_prune_radius_, 2.0 * double(det_range));
+        if (radius_prune_initialized_ &&
+            (center - last_radius_prune_center_).norm() < 0.1 * R) {
+            return;
+        }
+        // Every live map point lies inside LocalMap_Points (mapIncremental
+        // only adds within the FOV cube), so carving cube \ keep into at most
+        // 6 disjoint slabs covers everything outside the retention box. The
+        // decomposition lives in the unit-tested geometry core.
+        resple::geom::AabBox outer, keep;
+        for (int i = 0; i < 3; i++) {
+            outer.min(i) = LocalMap_Points.vertex_min[i];
+            outer.max(i) = LocalMap_Points.vertex_max[i];
+            keep.min(i) = center(i) - R;
+            keep.max(i) = center(i) + R;
+        }
+        const std::vector<resple::geom::AabBox> slabs = resple::geom::subtractBox(outer, keep);
+        if (!slabs.empty()) {
+            std::vector<BoxPointType> rm;
+            rm.reserve(slabs.size());
+            for (const auto& s : slabs) {
+                BoxPointType b;
+                for (int i = 0; i < 3; i++) {
+                    b.vertex_min[i] = static_cast<float>(s.min(i));
+                    b.vertex_max[i] = static_cast<float>(s.max(i));
+                }
+                rm.push_back(b);
+            }
+            ikdtree.Delete_Point_Boxes(rm);
+            radius_prune_ops_.fetch_add(1, std::memory_order_relaxed);
+        }
+        last_radius_prune_center_ = center;
+        radius_prune_initialized_ = true;
     }
 
     void mapIncremental(pcl::PointCloud<pcl::PointXYZINormal>& pc,
