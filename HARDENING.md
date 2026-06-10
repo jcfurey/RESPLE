@@ -373,21 +373,29 @@ standalone justification.
 | `Push_Down` race documentation | `ikd_Tree.cpp` | Inherited HKU-MARS race (parent-only lock when writing children's flags); documented with mitigation pointer (`num_threads=1`) |
 | `ENABLE_DEBUG_O0` / `ENABLE_DEBUG_O1` / `ENABLE_DEBUG_O3G` build options | `CMakeLists.txt` | Diagnostic flags retained for future bug-chases; harmless when off |
 
-### What's still open
+### What's still open (status updated after the Phase 2–5 series)
 
-- **Verify the Eigen-macro fix** by running sim post-commit. If gone, close
-  this entry. If still firing, switch to `EIGEN_MALLOC_ALREADY_ALIGNED=1`.
-- **Phase 2.3** (bounded input buffers) — Pass 0 diagnostic data still
-  needed before tuning.
-- **Phase 3.x** — unchanged; gated on Phase 0 trajectory benchmarks.
-- **Push_Down race** (now documented) — fix would require a substantial
-  refactor of upstream HKU-MARS code; deferred.
-- **Operational safety net** — Mapping receives `est_window` from RESPLE.
-  When RESPLE crashes and respawns, Mapping holds a stale spline window
-  and queries it with timestamps far outside the new spline's range. The
-  Phase 1.5 B clamp catches this safely, but it floods the log. Worth
-  adding a "spline-discontinuity" reset in Mapping's `getEstCallback`
-  when start_t jumps backward.
+Every item on the original 2026-05-01 list has since been resolved or
+overtaken; kept here with outcomes so the bug-chase narrative stays complete:
+
+- **Verify the Eigen-macro fix** — the production crash has not been
+  re-observed since the `_GNU_SOURCE` / `EIGEN_MALLOC_ALREADY_ALIGNED=1` /
+  `EIGEN_DEFAULT_ALIGN_BYTES=16` pinning landed, and the same dispatch
+  mismatch later reproduced (and was fixed by the same pinning) in the
+  standalone test build under the Phase 5 ASan CI job — independent
+  confirmation of the diagnosis. A bag replay remains the final word.
+- **Phase 2.3** (bounded input buffers) — capability landed (drop-oldest
+  caps + counters; scan cap default-off per the decision gate).
+- **Phase 3.x** — all four items landed (3.1 knot pruning, 3.2
+  parameterized plane fit, 3.3 recovery policy, 3.4 radius pruning);
+  only the tuning passes stay bag-gated.
+- **Push_Down race** — fixed (Phase 2.4 per-node locking), and the
+  related rebuild-path hazards fixed in Phase 2.5.
+- **Operational safety net (Mapping stale window on RESPLE respawn)** —
+  addressed by the respawn restart flow: `startCallBack` stages a restart
+  consumed by the worker (Option B, PR #4), and `SplineState::init()` now
+  also clears the knot deques (Phase 3.1 drive-by), so a respawn re-inits
+  the window instead of querying a stale spline.
 
 ---
 

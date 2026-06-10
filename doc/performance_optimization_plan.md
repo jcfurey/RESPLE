@@ -1,5 +1,26 @@
 # RESPLE Performance Optimization Plan
 
+> **STATUS (2026-06): HISTORICAL — read with care.** This plan predates the
+> hardening series (`../HARDENING.md`) and parts of it are now WRONG or
+> overtaken:
+>
+> - **§1.1 `-ffast-math`: do NOT apply.** It was deliberately removed
+>   (hazard 10): it reassociates the Joseph-form covariance update (breaking
+>   its PSD-preservation argument) and silences the NaN/Inf divergence
+>   checks the §3.3 health monitoring relies on.
+> - **ikd-Tree internals (§1.2 and any locking/spin-wait changes):** the
+>   tree's concurrency contract was reworked in Phases 1.5/2.4/2.5 (always-
+>   shared search lock, per-node `Push_Down` locking, recursive whole-op
+>   `working_flag_mutex`). Any optimization touching the tree must preserve
+>   those contracts and re-run the TSan CI gate.
+> - The **CUDA k-NN phase** has since landed (`ENABLE_CUDA`, off by
+>   default) — see `gpu/cuda_knn`.
+>
+> Remaining CPU items may still be worthwhile, but benchmark against the
+> Phase 4 `resple_diagnostics` stage timings rather than this plan's
+> estimates.
+
+
 ## Context
 
 RESPLE runs at ~10-20 Hz processing LiDAR point clouds through a B-spline IEKF pipeline. The main bottlenecks are ikd-Tree k-NN search (~35-40%), Jacobian/spline evaluation (~25-30%), and spline interpolation (~15-20%). The system currently uses OpenMP on the main parallel loops but has several low-hanging performance issues: disabled SIMD flags, forced heap allocations in hot paths, O(k^2) vector insertions in every k-NN query, and busy-wait spin-loops in the tree. Hardware: Ryzen 9 3950X (16c/32t, AVX2+FMA) + RTX 3090 (24GB, compute 8.6).
