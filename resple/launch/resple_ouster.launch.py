@@ -21,15 +21,19 @@ def generate_launch_description():
     _start_delay = PythonExpression(['float(', LaunchConfiguration('start_delay'), ')'])
     _mapping_delay = PythonExpression(['float(', LaunchConfiguration('mapping_delay'), ')'])
 
-    config_yaml_fusion = os.path.join(
-        get_package_share_directory('resple'),
-        'config',
-        'config_ouster.yaml')
+    config_file_arg = DeclareLaunchArgument(
+        'config_file',
+        default_value=os.path.join(
+            get_package_share_directory('resple'), 'config', 'config_ouster.yaml'),
+        description='Parameter YAML for both nodes — pass a copied/adapted '
+                    'config without editing the installed one.')
+    config_yaml_fusion = LaunchConfiguration('config_file')
     viz_launch = os.path.join(
         get_package_share_directory('resple'),
         'launch',
         'resple_viz.launch.py')
     return launch.LaunchDescription([
+        config_file_arg,
         start_delay_arg,
         mapping_delay_arg,
         launch_ros.actions.Node(

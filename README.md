@@ -253,7 +253,9 @@ Operational highlights:
   producing the same estimates.
 
 The complete parameter and topic reference is
-[`doc/PARAMETERS.md`](doc/PARAMETERS.md). The commented blocks at the bottom
+[`doc/PARAMETERS.md`](doc/PARAMETERS.md). The live-sensor launch files accept
+`config_file:=/path/to/your.yaml`, so a copied config can be used without
+editing the installed one. The commented blocks at the bottom
 of [`config_pointcloud2.yaml`](resple/config/config_pointcloud2.yaml),
 [`config_ouster.yaml`](resple/config/config_ouster.yaml) and
 [`config_demonstrator.yaml`](resple/config/config_demonstrator.yaml) show

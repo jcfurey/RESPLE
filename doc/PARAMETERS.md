@@ -13,6 +13,15 @@ Example configurations: [`resple/config/config_pointcloud2.yaml`](../resple/conf
 The dataset configs (`config_nc_short.yaml`, …) are kept at the values used
 for the published benchmarks.
 
+The live-sensor launch files (`resple_pointcloud2.launch.py`,
+`resple_ouster.launch.py`, `resple_demonstrator.launch.py`) accept a
+`config_file` argument so a copied/adapted YAML can be used without editing
+the installed one:
+
+```bash
+ros2 launch resple resple_pointcloud2.launch.py config_file:=/path/to/my_config.yaml
+```
+
 ## Published topics
 
 ### RESPLE node (estimator)
