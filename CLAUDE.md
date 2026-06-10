@@ -320,7 +320,7 @@ directory). Summary:
 | 1   | Safety fixes (initial)             | complete (`512da1d`) |
 | 1.5 | Defensive crash-hardening          | complete (`14e9be8`) — 13 fixes across 3 passes |
 | 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 still pending Phase 0 data |
-| 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.3 detection done; 3.2 / 3.4 pending |
+| 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.2 instrumented/parameterized (tuning pending bags); 3.3 detection done; 3.4 pending |
 | 4   | Diagnostics publisher              | after Phase 3 begins |
 | 5   | Regression tests                   | last |
 
@@ -338,7 +338,7 @@ reference (status as of latest pass):
 | 5  | Unbounded input buffers | open, measuring | 2.3 |
 | 6  | `assert()` in hot paths → silent UB under `-DNDEBUG` | **fixed** | 1 |
 | 7  | No divergence detection | partial (failure counter) | 0 → 3.3 |
-| 8  | Plane-fit outlier rejection incomplete | open | 3.2 |
+| 8  | Plane-fit outlier rejection incomplete | **instrumented + parameterized** (CorrespConfig: `nn_max_sq_dist`/`plane_fit_thresh`/`plane_min_cond_ratio` params, degeneracy guard off by default pending bag benchmark; per-window funnel counters in diagnostics) | 3.2 |
 | 9  | Deskew out-of-window extrapolation | **fixed (clamp + counter)** | 1 + 1.5 A/B |
 | 10 | `-ffast-math` on | **fixed** | 1 |
 | 11 | `pointBodyToWorld` OOB on out-of-range t_ns (logged but not clamped by Phase 1) | **fixed** | 1.5 A |
@@ -390,6 +390,9 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `cube_len` | local map cube size (m) | `1000.0` |
 | `num_threads` | OpenMP threads | `4` |
 | `spline_prune_keep_knots` | knots retained by the Phase 3.1 sliding-window prune (both nodes; 0 disables, <100 clamps to 100) | `600` |
+| `nn_max_sq_dist` | §3.2 k-th-neighbor squared-distance gate (m²); search radius = sqrt of this | `5.0` |
+| `plane_fit_thresh` | §3.2 esti_plane residual threshold (m) | `0.1` |
+| `plane_min_cond_ratio` | §3.2 plane-fit degeneracy guard (QR pivot ratio; 0 = off, pending bag benchmark) | `0.0` |
 
 The `cube_len` hardcoded default in code (`RESPLE.cpp:580`, value 2000) is
 overridden by the param; check the logged value on startup rather than reading

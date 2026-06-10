@@ -793,23 +793,44 @@ build compiles `SplineState.h` against field-compatible stubs of the
 `estimate_msgs` headers (`test/stubs/`); the colcon `BUILD_TESTING` path uses
 the real generated messages.
 
-### 3.2 Plane-fit hardening
+### 3.2 Plane-fit hardening — **IMPLEMENTED (defaults preserve legacy behaviour)**
 
-`Association::findCorresp` uses only a point-to-plane distance threshold
-(`pd2 < 5`, scaled by range²) and a hardcoded `esti_plane` threshold `0.1f`.
-No eigenvalue-ratio test (no degeneracy rejection for edge points or noise
-clusters). No counters for dropped candidates.
+**Status: landed this commit.** `Association::findCorresp` previously used a
+hardcoded k-NN distance gate (`pointSearchSqDis < 5` / search radius 2.236)
+and a hardcoded `esti_plane` threshold `0.1f`, with no degeneracy rejection
+and no visibility into where candidates were dropped.
 
-**Work:**
-- Add eigenvalue ratio check `λ0 / λ2 > 20` (or parameter) in `esti_plane` or
-  after.
-- Expose thresholds as parameters in
-  `src/settings/params/localization/resple.yaml`.
-- Publish per-scan counters: `{candidates, passed_distance, passed_plane,
-  used_in_IEKF}` — routed through the Phase 4 diagnostic topic.
+**Implemented:**
+- **`Association::CorrespConfig`** (plumbed RESPLE node → `Estimator`
+  member, like `n_iter` → both `findCorresp` paths, CPU and CUDA):
+  - `nn_max_sq_dist` (param, default 5.0) — the k-th-neighbor squared
+    distance gate; the `Nearest_Search` radius is derived as its sqrt. NOTE:
+    the CUDA k-NN early-termination shell was validated for the default
+    2.236 m gate; raising above ~5.76 m² under `ENABLE_CUDA` needs that scan
+    widened first (comment at the field).
+  - `plane_fit_thresh` (param, default 0.1) — esti_plane residual threshold.
+  - `plane_min_cond_ratio` (param, default 0 = off) — degeneracy guard:
+    forwarded through `esti_plane` to `resple::geom::fitPlane`'s
+    rank-revealing-QR pivot-ratio test (the §3.2 hook landed with the
+    geometry core, unit-tested there). Rejects collinear / rank-deficient
+    neighbor patches that lie on infinitely many planes. Deliberately OFF by
+    default — turning it on changes which correspondences feed the IEKF, so
+    it stays a tuning decision gated on a known-good-bag benchmark.
+- **Per-update funnel counters** (`Association::CorrespStats`, accumulated by
+  the worker into cumulative atomics): `candidates → passed_window →
+  passed_distance (full k-NN within gate) → passed_plane (esti_plane) →
+  used_in_IEKF`. Published as per-window deltas in diagnostics ("Corresp
+  …(last window)"). Stage-to-stage drops localize losses: out-of-window vs
+  sparse map vs degenerate/noisy patch vs association outlier.
 
-**Complexity: low-medium.** Numerical impact depends on parameter choices;
-benchmark against a known-good bag.
+**Verification:** colcon build + full test suites green (defaults are
+bit-for-bit the legacy values: same gate constants, min_cond_ratio off);
+live TSan data-path sweep clean with the counters active in the OpenMP
+parallel region (thread-local tallies, one atomic merge per thread).
+
+**Remaining (tuning, needs bags):** choose a production `plane_min_cond_ratio`
+(and revisit `nn_max_sq_dist` per sensor) by benchmarking trajectory error on
+a known-good bag, watching the new funnel counters.
 
 ### 3.3 Divergence detection and recovery — **DETECTION DONE**
 

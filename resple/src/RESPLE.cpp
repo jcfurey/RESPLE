@@ -729,6 +729,17 @@ public:
                     }
                 }
                 {
+                    // HARDENING §3.2: accumulate this update's correspondence
+                    // funnel into the cumulative atomics consumed by
+                    // updateDiagnostics (executor thread).
+                    const Association::CorrespStats& cs = if_lidar_only
+                        ? estimator_lo.corresp_stats : estimator_lio.corresp_stats;
+                    corresp_candidates_.fetch_add(cs.candidates, std::memory_order_relaxed);
+                    corresp_passed_knn_.fetch_add(cs.passed_knn, std::memory_order_relaxed);
+                    corresp_passed_plane_.fetch_add(cs.passed_plane, std::memory_order_relaxed);
+                    corresp_used_.fetch_add(cs.used, std::memory_order_relaxed);
+                }
+                {
                     // HARDENING §3.3: feed the windowed NIS consistency
                     // detector with the final IEKF iteration's innovation
                     // statistic (NaN when the update was skipped — counted as
@@ -1008,6 +1019,17 @@ private:
     // active, "Spline Knots" plateaus at the retention window; this one keeps
     // the original unbounded-growth signal visible in diagnostics.
     std::atomic<int64_t> cached_spline_total_knots_{0};
+    // HARDENING §3.2 correspondence funnel (cumulative; worker adds each IEKF
+    // update's CorrespStats, updateDiagnostics publishes per-window deltas).
+    std::atomic<uint64_t> corresp_candidates_{0};
+    std::atomic<uint64_t> corresp_passed_knn_{0};
+    std::atomic<uint64_t> corresp_passed_plane_{0};
+    std::atomic<uint64_t> corresp_used_{0};
+    // Previous-window snapshots, touched only inside updateDiagnostics.
+    uint64_t last_corresp_candidates_ = 0;
+    uint64_t last_corresp_passed_knn_ = 0;
+    uint64_t last_corresp_passed_plane_ = 0;
+    uint64_t last_corresp_used_ = 0;
     // Diagnostic buffer depths. Refreshed by the worker each loop iteration and
     // read by updateDiagnostics, which can run on the executor thread via the
     // Updater's internal 1 Hz timer. Atomic so the cross-thread read is not a
@@ -1330,6 +1352,29 @@ private:
             RCLCPP_WARN(this->get_logger(), 
                 "nn_thresh value %.3f outside recommended range [0.1, 5.0]", param.nn_thresh);
         }
+        // HARDENING §3.2 correspondence thresholds. Defaults reproduce the
+        // previously hardcoded values exactly; plane_min_cond_ratio > 0
+        // additionally rejects degenerate (collinear / rank-deficient)
+        // neighbor patches — off by default until tuned against a known-good
+        // bag (see HARDENING.md §3.2 for the benchmark requirement).
+        {
+            Association::CorrespConfig ccfg;
+            ccfg.max_neighbor_sq_dist = static_cast<float>(
+                CommonUtils::readParam<double>(this->get_node_parameters_interface(), "nn_max_sq_dist", 5.0));
+            ccfg.plane_fit_thresh = static_cast<float>(
+                CommonUtils::readParam<double>(this->get_node_parameters_interface(), "plane_fit_thresh", 0.1));
+            ccfg.plane_min_cond_ratio = static_cast<float>(
+                CommonUtils::readParam<double>(this->get_node_parameters_interface(), "plane_min_cond_ratio", 0.0));
+            if (ccfg.max_neighbor_sq_dist <= 0.0f || ccfg.plane_fit_thresh <= 0.0f) {
+                RCLCPP_WARN(this->get_logger(),
+                    "nn_max_sq_dist=%.3f / plane_fit_thresh=%.3f must be > 0; using defaults 5.0 / 0.1",
+                    ccfg.max_neighbor_sq_dist, ccfg.plane_fit_thresh);
+                ccfg = Association::CorrespConfig{};
+            }
+            estimator_lo.corresp_cfg = ccfg;
+            estimator_lio.corresp_cfg = ccfg;
+        }
+
         // HARDENING §3.1 sliding-window knot pruning. Default 600 knots
         // (6 s at the canonical knot_hz=100) bounds spline memory while
         // staying far wider than any backward-looking consumer. 0 disables.
@@ -1731,6 +1776,26 @@ private:
         stat.add("IEKF Numerical Failures (LIO, cumulative)", static_cast<int>(fails_lio));
         stat.add("IEKF Numerical Failures (LO, last window)",  static_cast<int>(dfails_lo));
         stat.add("IEKF Numerical Failures (LIO, last window)", static_cast<int>(dfails_lio));
+
+        // HARDENING §3.2 correspondence funnel, per diagnostics window.
+        // candidates → passed_distance (full k-NN within gate) → passed_plane
+        // (esti_plane accepted) → used (point-to-plane range gate, fed to the
+        // IEKF). Stage-to-stage drops localize where matches are lost: sparse
+        // map vs degenerate/noisy patches vs association outliers.
+        {
+            const uint64_t cand  = corresp_candidates_.load(std::memory_order_relaxed);
+            const uint64_t knn   = corresp_passed_knn_.load(std::memory_order_relaxed);
+            const uint64_t plane = corresp_passed_plane_.load(std::memory_order_relaxed);
+            const uint64_t used  = corresp_used_.load(std::memory_order_relaxed);
+            stat.add("Corresp Candidates (last window)",     static_cast<int>(cand  - last_corresp_candidates_));
+            stat.add("Corresp Passed Distance (last window)", static_cast<int>(knn   - last_corresp_passed_knn_));
+            stat.add("Corresp Passed Plane (last window)",    static_cast<int>(plane - last_corresp_passed_plane_));
+            stat.add("Corresp Used in IEKF (last window)",    static_cast<int>(used  - last_corresp_used_));
+            last_corresp_candidates_   = cand;
+            last_corresp_passed_knn_   = knn;
+            last_corresp_passed_plane_ = plane;
+            last_corresp_used_         = used;
+        }
 
         // Out-of-spline-range query counter from Association::pointBodyToWorld.
         // Signals that the deskew loop saw a scan timestamp outside the current

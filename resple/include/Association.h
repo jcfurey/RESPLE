@@ -27,6 +27,42 @@ public:
     // across TUs (C++17).
     inline static std::atomic<uint64_t> out_of_range_queries_{0};
 
+    // HARDENING §3.2: correspondence thresholds, previously hardcoded in
+    // findCorresp. Defaults reproduce the legacy values bit-for-bit
+    // (max_neighbor_sq_dist 5 == the old Nearest_Search 2.236² gate,
+    // plane_fit_thresh 0.1, no degeneracy guard).
+    struct CorrespConfig {
+        // Reject a candidate unless all k neighbors lie within this squared
+        // distance (m²) of the query point. NOTE: the CUDA k-NN's voxel-shell
+        // early termination (gpu/cuda_knn) covers 2.4 m and was validated
+        // against the default 2.236 m (= sqrt 5) gate — raising this above
+        // ~5.76 m² under ENABLE_CUDA requires widening that scan first.
+        float max_neighbor_sq_dist = 5.0f;
+        // esti_plane residual threshold (m): every neighbor must lie within
+        // this distance of the fitted plane.
+        float plane_fit_thresh = 0.1f;
+        // Rank-conditioning guard forwarded to resple::geom::fitPlane: relative
+        // QR pivot threshold rejecting degenerate (collinear / rank-deficient)
+        // neighbor patches that lie on infinitely many planes. 0 disables
+        // (legacy behaviour); see geometry_core.h for semantics.
+        float plane_min_cond_ratio = 0.0f;
+    };
+
+    // HARDENING §3.2: per-update correspondence funnel. Each stage counts
+    // points surviving the previous gate, so stage-to-stage drops show WHERE
+    // candidates are lost (out of window / sparse map / degenerate or noisy
+    // patch / far from plane). Accumulated across the IEKF's inner iterations
+    // of one update (n_iter is 1 in the shipping config, so per-scan in
+    // practice).
+    struct CorrespStats {
+        uint32_t candidates = 0;     // points fed to findCorresp
+        uint32_t passed_window = 0;  // inside the active 4-knot window (k-NN ran)
+        uint32_t passed_knn = 0;     // full k neighbors within max_neighbor_sq_dist
+        uint32_t passed_plane = 0;   // esti_plane accepted the neighbor patch
+        uint32_t used = 0;           // final if_valid (point-to-plane range gate)
+        void reset() { *this = CorrespStats{}; }
+    };
+
     template<class PointType>
     static void pointBodyToWorld(int64_t t_ns, const SplineState* spline, const PointType& pi, PointType& po, const Eigen::Vector3d& t_bl, const Eigen::Quaterniond& q_bl)
     {
@@ -68,15 +104,21 @@ public:
     static void findCorresp(int& effect_num_k, const SplineState* spline, KD_TREE<pcl::PointXYZINormal>* ikdtree,
                             Eigen::aligned_deque<PointData>& pt_meas,
                             std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>>& pt_neighbors,
+                            const CorrespConfig& cfg, CorrespStats* stats,
                             int num_threads = 5, int num_match_points = 5)
     {
         int num_pt = pt_meas.size();
+        const float max_nn_dist = std::sqrt(cfg.max_neighbor_sq_dist);
+        if (stats) stats->candidates += num_pt;
         // schedule(static): each thread writes only to its own pt_meas[i] / pt_neighbors[i], no synchronization needed.
         #pragma omp parallel num_threads(num_threads)
         {
         // Thread-local scratch buffer reused across iterations to avoid per-point heap allocation.
         std::vector<float> pointSearchSqDis;
         pointSearchSqDis.reserve(num_match_points);
+        // Thread-local stage counters, merged once per thread below — no
+        // per-point synchronization on the hot path.
+        uint32_t n_window = 0, n_knn = 0, n_plane = 0;
         #pragma omp for schedule(static) nowait
         for (int i = 0; i < num_pt; i++) {
             PointData& pt_data = pt_meas[i];
@@ -89,13 +131,16 @@ public:
                 pt_neighbors[i].clear();
                 continue;
             }
+            n_window++;
             Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
             pt_neighbors[i].clear();
-            ikdtree->Nearest_Search(pt_data.pt_w, num_match_points, pt_neighbors[i], pointSearchSqDis, 2.236);
-            if (pt_neighbors[i].size() >= (size_t)num_match_points && pointSearchSqDis[num_match_points - 1] < 5) {
+            ikdtree->Nearest_Search(pt_data.pt_w, num_match_points, pt_neighbors[i], pointSearchSqDis, max_nn_dist);
+            if (pt_neighbors[i].size() >= (size_t)num_match_points && pointSearchSqDis[num_match_points - 1] < cfg.max_neighbor_sq_dist) {
+                n_knn++;
                 Eigen::Vector4f pabcd;
                 pabcd.setZero();
-                if (CommonUtils::esti_plane(pabcd, pt_neighbors[i], 0.1f)) {
+                if (CommonUtils::esti_plane(pabcd, pt_neighbors[i], cfg.plane_fit_thresh, cfg.plane_min_cond_ratio)) {
+                    n_plane++;
                     float pd2 = pabcd(0) * pt_data.pt_w.x + pabcd(1) * pt_data.pt_w.y + pabcd(2) * pt_data.pt_w.z + pabcd(3);
                     if (pt_data.range_sensor > 81.0 * pd2 * pd2) {
                         pt_data.if_valid = true;
@@ -105,10 +150,19 @@ public:
                 }
             }
         }
+        if (stats) {
+            #pragma omp atomic
+            stats->passed_window += n_window;
+            #pragma omp atomic
+            stats->passed_knn += n_knn;
+            #pragma omp atomic
+            stats->passed_plane += n_plane;
+        }
         }  // end omp parallel
         for (int i = 0; i < num_pt; i++) {
             if (pt_meas[i].if_valid) {
                 effect_num_k++;
+                if (stats) stats->used++;
             }
         }
     }
@@ -122,9 +176,11 @@ public:
                             resple_gpu::CudaMap* cuda_map,
                             Eigen::aligned_deque<PointData>& pt_meas,
                             std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>>& pt_neighbors,
+                            const CorrespConfig& cfg, CorrespStats* stats,
                             int num_threads = 5, int num_match_points = 5)
     {
         const int num_pt = static_cast<int>(pt_meas.size());
+        if (stats) stats->candidates += num_pt;
 
         // Phase 1: body→world + active-window mask.
         // Use a sentinel point (NaN) for inactive queries so the GPU still
@@ -158,7 +214,10 @@ public:
                                num_match_points, nbrs, dist_sq);
 
         // Phase 3: parallel plane fit + validation.
-        #pragma omp parallel for num_threads(num_threads) schedule(static)
+        #pragma omp parallel num_threads(num_threads)
+        {
+        uint32_t n_knn = 0, n_plane = 0;
+        #pragma omp for schedule(static) nowait
         for (int i = 0; i < num_pt; i++) {
             if (!active[i]) continue;
             PointData& pt_data = pt_meas[i];
@@ -175,11 +234,13 @@ public:
                 pt_neighbors[i].push_back(nbrs[i * num_match_points + j]);
             }
             if (!ok || pt_neighbors[i].size() < (size_t)num_match_points) continue;
-            if (dist_sq[i * num_match_points + num_match_points - 1] >= 5) continue;
+            if (dist_sq[i * num_match_points + num_match_points - 1] >= cfg.max_neighbor_sq_dist) continue;
+            n_knn++;
 
             Eigen::Vector4f pabcd;
             pabcd.setZero();
-            if (CommonUtils::esti_plane(pabcd, pt_neighbors[i], 0.1f)) {
+            if (CommonUtils::esti_plane(pabcd, pt_neighbors[i], cfg.plane_fit_thresh, cfg.plane_min_cond_ratio)) {
+                n_plane++;
                 float pd2 = pabcd(0) * pt_data.pt_w.x + pabcd(1) * pt_data.pt_w.y
                           + pabcd(2) * pt_data.pt_w.z + pabcd(3);
                 if (pt_data.range_sensor > 81.0 * pd2 * pd2) {
@@ -189,9 +250,20 @@ public:
                 }
             }
         }
+        if (stats) {
+            #pragma omp atomic
+            stats->passed_knn += n_knn;
+            #pragma omp atomic
+            stats->passed_plane += n_plane;
+        }
+        }  // end omp parallel
 
         for (int i = 0; i < num_pt; i++) {
-            if (pt_meas[i].if_valid) effect_num_k++;
+            if (stats && active[i]) stats->passed_window++;
+            if (pt_meas[i].if_valid) {
+                effect_num_k++;
+                if (stats) stats->used++;
+            }
         }
     }
 #endif  // RESPLE_USE_CUDA
