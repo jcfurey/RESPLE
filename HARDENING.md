@@ -947,7 +947,26 @@ deferred, as originally planned).
 
 ## Phase 4 — Diagnostics publisher
 
-**Status: can start after Phase 3 begins.**
+**Status: IMPLEMENTED (this commit).**
+
+`estimate_msgs/msg/Diagnostics` — typed fields (plottable directly in
+Foxglove / PlotJuggler, unlike the string-keyed `diagnostic_updater` output,
+which remains on `/diagnostics` for aggregation). Published by the RESPLE
+node on the relative topic **`resple_diagnostics`** (the production namespace
+yields `/localization/resple/resple_diagnostics` — the proposal's
+`…/diagnostics` literal would collide with the global `diagnostic_updater`
+topic on an un-namespaced node), once per processed worker frame (~20 Hz),
+best-effort QoS.
+
+Carries everything from the proposal table below: knot count + monotonic
+total, the three input-buffer depths, IEKF failures / NIS / dof / filter
+state, the §3.3 recovery state, pose-covariance trace + λ_min (6×6 at
+`maxTimeNs`), the §3.2 correspondence funnel, deskew out-of-range count,
+ikd-tree size, §3.4 prune count, and per-stage timings for the last frame
+(drain / IEKF / deskew / frame total / async map update — measured live, the
+map-update duration from inside the async lambda via a relaxed atomic).
+
+Original proposal kept below for reference.
 
 Today, diagnostics scatter across `diagnostic_updater` fields and ROS logger
 output. Consolidate into a single topic for easier monitoring.

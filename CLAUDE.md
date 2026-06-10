@@ -321,7 +321,7 @@ directory). Summary:
 | 1.5 | Defensive crash-hardening          | complete (`14e9be8`) — 13 fixes across 3 passes |
 | 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 still pending Phase 0 data |
 | 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.2 instrumented/parameterized (tuning pending bags); 3.3 detection + recovery (off/hold/reset) done; 3.4 radius pruning done (off by default) |
-| 4   | Diagnostics publisher              | after Phase 3 begins |
+| 4   | Diagnostics publisher              | done (`estimate_msgs/Diagnostics` on `resple_diagnostics`, ~20 Hz typed; see HARDENING §4) |
 | 5   | Regression tests                   | last |
 
 ### Known hazards (compact view)

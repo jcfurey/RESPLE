@@ -68,6 +68,7 @@
 #include "estimate_msgs/msg/calib.hpp"
 #include "estimate_msgs/msg/spline.hpp"
 #include "estimate_msgs/msg/estimate.hpp"
+#include "estimate_msgs/msg/diagnostics.hpp"
 #include "estimate_msgs/action/save_map.hpp"
 #include "Estimator.h"
 #include "utils/point_cloud_ingest.h"
@@ -157,6 +158,13 @@ public:
         
         // Create publishers (inactive until activated)
         pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
+        // HARDENING Phase 4: consolidated, typed estimator diagnostics for
+        // plotting (Foxglove / PlotJuggler). Relative topic so the production
+        // namespace yields /localization/resple/resple_diagnostics; the
+        // string-keyed diagnostic_updater output on /diagnostics remains for
+        // aggregation. ~20 Hz while data flows — keep the queue shallow.
+        pub_diag_ = this->create_publisher<estimate_msgs::msg::Diagnostics>(
+            "resple_diagnostics", rclcpp::QoS(10).best_effort());
         // transient_local: start_time is published once after gravity
         // alignment; without late-joiner durability, a Mapping node that
         // subscribes after publish() never sees it and `if_init_succeed`
@@ -208,6 +216,7 @@ public:
 
         // Activate publishers
         pub_est->on_activate();
+        pub_diag_->on_activate();
         pub_start_time->on_activate();
         pub_pose->on_activate();
         pub_pose_cov->on_activate();
@@ -332,6 +341,7 @@ public:
 
         // Deactivate publishers
         pub_est->on_deactivate();
+        pub_diag_->on_deactivate();
         pub_start_time->on_deactivate();
         pub_pose->on_deactivate();
         pub_pose_cov->on_deactivate();
@@ -395,6 +405,7 @@ public:
         
         // Reset publishers
         pub_est.reset();
+        pub_diag_.reset();
         pub_start_time.reset();
         pub_pose.reset();
         pub_pose_cov.reset();
@@ -660,6 +671,10 @@ public:
             }
             bool collected_any = false;
             while (true) {
+                // Phase 4 stage timing: drain covers THIS frame's collection
+                // (captured per inner iteration — several frames can process
+                // per outer loop pass).
+                const auto drain_start = std::chrono::high_resolution_clock::now();
                 bool have_meas;
                 {
                     std::lock_guard<std::mutex> spline_lock(spline_mutex_);
@@ -674,8 +689,9 @@ public:
                         "[RESPLE] first IEKF iteration (pt_meas=%zu, spline knots=%ld)",
                         pt_meas.size(), spline->numKnots());
                 }
-                // Track computation time
+                // Track computation time (Phase 4 also splits per-stage).
                 auto frame_start = std::chrono::high_resolution_clock::now();
+                const float drain_ms = std::chrono::duration<float, std::milli>(frame_start - drain_start).count();
 
                 int64_t max_time_ns = !pt_meas.empty() ? pt_meas.back().time_ns
                                                         : imu_meas.back().time_ns;
@@ -730,6 +746,7 @@ public:
                         total_iekf_iterations_.fetch_add(estimator_lio.n_iter, std::memory_order_relaxed);
                     }
                 }
+                const auto iekf_end = std::chrono::high_resolution_clock::now();
                 {
                     // HARDENING §3.2: accumulate this update's correspondence
                     // funnel into the cumulative atomics consumed by
@@ -831,6 +848,7 @@ public:
                     accum_nearest_points.push_back(std::move(pt_neighbors_[i]));
                 }
                 pt_meas.clear();
+                const auto deskew_end = std::chrono::high_resolution_clock::now();
                 // max_spl_knots tracks totalKnots() (monotonic, includes
                 // pruned knots) so the growth gate keeps firing once Phase 3.1
                 // pruning caps numKnots() at the retention window.
@@ -981,9 +999,14 @@ public:
                             // d_buckets / d_sorted_points arrays that
                             // batch_search reads — running them concurrently
                             // produced an "illegal memory access" SIGABRT.)
+                            const auto map_upd_start = std::chrono::high_resolution_clock::now();
                             std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
                             mapIncremental(pc_world_bg_, accum_nearest_points_bg_);
                             lasermapFovSegment();
+                            last_map_update_us_.store(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::high_resolution_clock::now() - map_upd_start).count(),
+                                std::memory_order_relaxed);
 #ifdef RESPLE_USE_CUDA
                             ikdtree.PCL_Storage.clear();
                             ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
@@ -1009,6 +1032,65 @@ public:
                 total_computation_time_us_.fetch_add(
                     static_cast<uint64_t>(frame_duration.count()), std::memory_order_relaxed);
                 frame_count_.fetch_add(1, std::memory_order_relaxed);
+
+                // HARDENING Phase 4: consolidated typed diagnostics, one
+                // message per processed frame. Everything here is either a
+                // worker-local value or a relaxed atomic snapshot — no locks
+                // beyond the brief spline/cov reads below.
+                {
+                    estimate_msgs::msg::Diagnostics dmsg;
+                    dmsg.header.stamp = rclcpp::Time(max_time_ns);
+                    dmsg.header.frame_id = odom_id;
+                    {
+                        std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                        dmsg.knot_count = spline->numKnots();
+                        dmsg.knot_total = spline->totalKnots();
+                        // 6x6 pose covariance at maxTimeNs (reads the spline
+                        // for the interpolation Jacobian — hence the lock).
+                        const Eigen::Matrix<double, 6, 6> pose_cov = if_lidar_only
+                            ? estimator_lo.getLastPoseCovariance()
+                            : estimator_lio.getLastPoseCovariance();
+                        dmsg.cov_trace = pose_cov.trace();
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(pose_cov);
+                        dmsg.cov_lambda_min = (es.info() == Eigen::Success)
+                            ? es.eigenvalues().minCoeff()
+                            : std::numeric_limits<double>::quiet_NaN();
+                    }
+                    dmsg.lidar_buffer_depth = cached_lidar_buf_.load(std::memory_order_relaxed);
+                    dmsg.imu_buffer_depth = static_cast<int64_t>(imu_buff.size());
+                    {
+                        std::lock_guard<std::mutex> lock(m_buff);
+                        dmsg.imu_staging_depth = static_cast<int64_t>(imu_int_buff.size());
+                    }
+                    const Association::CorrespStats& cs = if_lidar_only
+                        ? estimator_lo.corresp_stats : estimator_lio.corresp_stats;
+                    dmsg.corresp_candidates = cs.candidates;
+                    dmsg.corresp_passed_window = cs.passed_window;
+                    dmsg.corresp_passed_knn = cs.passed_knn;
+                    dmsg.corresp_passed_plane = cs.passed_plane;
+                    dmsg.corresp_used = cs.used;
+                    if (if_lidar_only) {
+                        dmsg.iekf_numerical_failures = estimator_lo.num_numerical_failures_.load(std::memory_order_relaxed);
+                        dmsg.nis = estimator_lo.lastNis();
+                        dmsg.nis_dof = estimator_lo.lastNisDof();
+                    } else {
+                        dmsg.iekf_numerical_failures = estimator_lio.num_numerical_failures_.load(std::memory_order_relaxed);
+                        dmsg.nis = estimator_lio.lastNis();
+                        dmsg.nis_dof = estimator_lio.lastNisDof();
+                    }
+                    dmsg.filter_state = static_cast<uint8_t>(filter_health_state_.load(std::memory_order_relaxed));
+                    dmsg.recovery_hold_active = nis_hold_active_.load(std::memory_order_relaxed);
+                    dmsg.recovery_resets = nis_resets_.load(std::memory_order_relaxed);
+                    dmsg.deskew_out_of_range = Association::out_of_range_queries_.load(std::memory_order_relaxed);
+                    dmsg.map_size = ikdtree.size();
+                    dmsg.map_radius_prunes = radius_prune_ops_.load(std::memory_order_relaxed);
+                    dmsg.drain_ms = drain_ms;
+                    dmsg.iekf_ms = std::chrono::duration<float, std::milli>(iekf_end - frame_start).count();
+                    dmsg.deskew_ms = std::chrono::duration<float, std::milli>(deskew_end - iekf_end).count();
+                    dmsg.frame_total_ms = frame_duration.count() / 1000.0f;
+                    dmsg.map_update_ms = last_map_update_us_.load(std::memory_order_relaxed) / 1000.0f;
+                    pub_diag_->publish(dmsg);
+                }
 
                 // Update diagnostics at 1 Hz
                 if ((this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) >= 1000000000LL) {
@@ -1159,6 +1241,9 @@ private:
     resple::pc2::AdapterConfig generic_adapter_cfg_;
     rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan;
     rclcpp_lifecycle::LifecyclePublisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
+    rclcpp_lifecycle::LifecyclePublisher<estimate_msgs::msg::Diagnostics>::SharedPtr pub_diag_;
+    // Phase 4: duration of the last completed async map update (µs).
+    std::atomic<int64_t> last_map_update_us_{0};
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_pose_cov;
     rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;

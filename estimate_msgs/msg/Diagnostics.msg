@@ -1,0 +1,49 @@
+# Consolidated RESPLE estimator diagnostics (HARDENING Phase 4).
+#
+# Published by the RESPLE node on the relative topic "resple_diagnostics"
+# (=> /localization/resple/resple_diagnostics under the production namespace)
+# once per processed worker frame (~20 Hz while data flows). Typed fields so
+# Foxglove / PlotJuggler can plot them directly, unlike the string-keyed
+# diagnostic_updater output on /diagnostics (which remains for aggregation).
+
+std_msgs/Header header
+
+# --- B-spline state ---
+int64 knot_count            # retained knots (numKnots)
+int64 knot_total            # monotonic total incl. pruned (totalKnots)
+
+# --- input buffers ---
+int64 lidar_buffer_depth    # sum of per-LiDAR pt_buff depths after drain
+int64 imu_buffer_depth      # worker-side imu_buff depth after drain
+int64 imu_staging_depth     # imu_int_buff depth (callback staging, pre-drain)
+
+# --- IEKF health ---
+uint64 iekf_numerical_failures   # cumulative, active estimator
+float64 nis                      # last update's normalized innovation squared
+int32 nis_dof                    # its degrees of freedom
+uint8 filter_state               # resple::health::FilterState: 0 OK / 1 WARN / 2 DIVERGED
+bool recovery_hold_active        # §3.3 'hold' gate currently suspending odom/TF
+uint64 recovery_resets           # §3.3 'reset' covariance reinflations, cumulative
+
+# --- pose covariance health (6x6 pose block at maxTimeNs) ---
+float64 cov_trace
+float64 cov_lambda_min
+
+# --- correspondence funnel (§3.2, last IEKF update) ---
+uint32 corresp_candidates
+uint32 corresp_passed_window
+uint32 corresp_passed_knn
+uint32 corresp_passed_plane
+uint32 corresp_used
+
+# --- deskew / map ---
+uint64 deskew_out_of_range  # cumulative out-of-spline-range deskew queries
+int64 map_size              # ikd-tree node count
+uint64 map_radius_prunes    # §3.4 radius-prune operations, cumulative
+
+# --- worker stage timings, last frame (ms) ---
+float32 drain_ms            # buffer drain + measurement collection
+float32 iekf_ms             # propRCP + updateIEKF*
+float32 deskew_ms           # deskew transform + world-cloud accumulation
+float32 frame_total_ms      # whole frame (drain excluded; matches Avg Computation Time)
+float32 map_update_ms       # last completed async map update (incremental + FOV/radius prune)
