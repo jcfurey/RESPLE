@@ -282,9 +282,16 @@ public:
             }
         }
         
-        // Start processing thread
+        // Start processing thread. The exited-flag store is the lambda's last
+        // action so joinProcessingThreadBounded can tell "worker finished,
+        // join() will return promptly" from "worker wedged, must detach"
+        // without a second thread touching processing_thread_ (see there).
         processing_active_ = true;
-        processing_thread_ = std::thread(&RESPLE::processData, this);
+        processing_thread_exited_.store(false, std::memory_order_release);
+        processing_thread_ = std::thread([this] {
+            processData();
+            processing_thread_exited_.store(true, std::memory_order_release);
+        });
 
         RCLCPP_INFO(this->get_logger(), "RESPLE activated successfully");
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -431,24 +438,37 @@ public:
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
 
-    // Bounded join: dispatch the join() onto an async future and wait
-    // with a deadline. Used during lifecycle teardown so that a wedged
-    // ikd-Tree (rebuild thread holding internal locks) can't hold up
-    // shutdown past the launcher's 5-second SIGINT→SIGTERM grace window.
+    // Bounded join, used during lifecycle teardown so that a wedged ikd-Tree
+    // (rebuild thread holding internal locks) can't hold up shutdown past the
+    // launcher's 5-second SIGINT→SIGTERM grace window.
+    //
+    // Implementation note: this used to dispatch join() onto a std::async
+    // task and detach() from this thread on timeout. That raced two threads
+    // on the SAME std::thread object — when the worker exited just after the
+    // deadline, the async join() consumed the thread id while this thread
+    // called detach() on it (UB; TSan's runtime CHECK-aborted on it during
+    // the Phase 3.1 sweep). The async future's destructor also blocked until
+    // join() returned, so the join wasn't actually bounded. Instead, poll the
+    // worker's exited flag (its last store before returning): once set,
+    // join() is guaranteed to return promptly; until then nobody touches
+    // processing_thread_, so the timeout detach() is single-threaded.
     void joinProcessingThreadBounded(std::chrono::milliseconds timeout)
     {
         if (!processing_thread_.joinable()) return;
-        auto join_done = std::async(std::launch::async,
-            [this]{ processing_thread_.join(); });
-        if (join_done.wait_for(timeout) != std::future_status::ready) {
-            if (processing_thread_.joinable()) {
-                // processing_active_ is already false; the worker is just
-                // wedged on a third-party lock and will tear down with the
-                // process. Detach so shutdown can proceed.
-                processing_thread_.detach();
-                RCLCPP_WARN(this->get_logger(),
-                    "processing thread did not exit within timeout; detached");
-            }
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!processing_thread_exited_.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (processing_thread_exited_.load(std::memory_order_acquire)) {
+            processing_thread_.join();
+        } else {
+            // processing_active_ is already false; the worker is just
+            // wedged on a third-party lock and will tear down with the
+            // process. Detach so shutdown can proceed.
+            processing_thread_.detach();
+            RCLCPP_WARN(this->get_logger(),
+                "processing thread did not exit within timeout; detached");
         }
     }
 
@@ -746,6 +766,7 @@ public:
                     // Cache knot count for updateDiagnostics (may run on the
                     // executor thread; atomic read there is lock-free).
                     cached_spline_knots_.store(spline->numKnots(), std::memory_order_relaxed);
+                    cached_spline_total_knots_.store(spline->totalKnots(), std::memory_order_relaxed);
                 }
                 for (size_t i = 0; i < pt_meas.size(); i++) {
                     PointData& pt_data = pt_meas[i];
@@ -753,12 +774,15 @@ public:
                     accum_nearest_points.push_back(std::move(pt_neighbors_[i]));
                 }
                 pt_meas.clear();
-                if (spline->numKnots() > max_spl_knots) {
+                // max_spl_knots tracks totalKnots() (monotonic, includes
+                // pruned knots) so the growth gate keeps firing once Phase 3.1
+                // pruning caps numKnots() at the retention window.
+                if (spline->totalKnots() > max_spl_knots) {
                     estimate_msgs::msg::Spline spline_msg;
                     {
                         std::lock_guard<std::mutex> spline_lock(spline_mutex_);
-                        spline->getSplineMsg(spline_msg, std::max(int(max_spl_knots-1),0));
-                        max_spl_knots = spline->numKnots();
+                        spline->getSplineMsg(spline_msg, std::max<int64_t>(max_spl_knots - 1, 0));
+                        max_spl_knots = spline->totalKnots();
                     }
                     estimate_msgs::msg::Estimate est_msg;
                     est_msg.spline = spline_msg;
@@ -770,6 +794,18 @@ public:
                             "[RESPLE] first /est_window published (numKnots=%ld)",
                             spline->numKnots());
                     }
+                }
+                // Phase 3.1 sliding-window knot pruning (hazard 4: unbounded
+                // knot growth, measured live in the 2.6 data-path sweep).
+                // Runs AFTER the est_window publish so every knot is on the
+                // wire before it can be dropped, and under spline_mutex_ —
+                // the same lock every other spline reader/writer takes. The
+                // retention window is far wider than every backward-looking
+                // consumer (IEKF: last 4 knots; est_window: last 5; deskew:
+                // the current scan, ~10 knots at 100 Hz).
+                if (spline_prune_keep_knots_ > 0) {
+                    std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                    spline->pruneFrontKnots(spline_prune_keep_knots_);
                 }
                 // Pose/odom/TF publish is INLINE and unconditional. Keeping
                 // it out of the async-map-update lambda means the odom frame
@@ -945,6 +981,9 @@ private:
     // Performance tuning parameters (Phase 3)
     int num_threads_;
     int num_match_points_;
+    // Phase 3.1: knots retained by the sliding-window prune each cycle.
+    // 0 disables pruning (pre-3.1 unbounded-growth behaviour).
+    int spline_prune_keep_knots_ = 600;
     
     // Diagnostics
     diagnostic_updater::Updater diagnostics_;
@@ -965,6 +1004,10 @@ private:
     // timer, not just from the worker's force_update). Atomic so the read is
     // not a data race; stale-by-one-cycle is acceptable.
     std::atomic<int64_t> cached_spline_knots_{0};
+    // Total knots ever created (numKnots + pruned). With Phase 3.1 pruning
+    // active, "Spline Knots" plateaus at the retention window; this one keeps
+    // the original unbounded-growth signal visible in diagnostics.
+    std::atomic<int64_t> cached_spline_total_knots_{0};
     // Diagnostic buffer depths. Refreshed by the worker each loop iteration and
     // read by updateDiagnostics, which can run on the executor thread via the
     // Updater's internal 1 Hz timer. Atomic so the cross-thread read is not a
@@ -994,6 +1037,10 @@ private:
     // Lifecycle management
     std::atomic<bool> processing_active_;
     std::thread processing_thread_;
+    // Set by the worker lambda as its final action; consumed by
+    // joinProcessingThreadBounded to decide join-vs-detach without two
+    // threads ever touching processing_thread_ concurrently.
+    std::atomic<bool> processing_thread_exited_{false};
     
     // SaveMap action server
     using SaveMapAction = estimate_msgs::action::SaveMap;
@@ -1282,6 +1329,19 @@ private:
         if (param.nn_thresh < 0.1 || param.nn_thresh > 5.0) {
             RCLCPP_WARN(this->get_logger(), 
                 "nn_thresh value %.3f outside recommended range [0.1, 5.0]", param.nn_thresh);
+        }
+        // HARDENING §3.1 sliding-window knot pruning. Default 600 knots
+        // (6 s at the canonical knot_hz=100) bounds spline memory while
+        // staying far wider than any backward-looking consumer. 0 disables.
+        // Values below 100 keep too little margin for the startup gates
+        // (collectMeasurements treats numKnots()<10 specially) and for
+        // deskew under scan-buffer backlog, so clamp them up.
+        spline_prune_keep_knots_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "spline_prune_keep_knots", 600);
+        if (spline_prune_keep_knots_ != 0 && spline_prune_keep_knots_ < 100) {
+            RCLCPP_WARN(this->get_logger(),
+                "spline_prune_keep_knots=%d is below the safe minimum; using 100",
+                spline_prune_keep_knots_);
+            spline_prune_keep_knots_ = 100;
         }
         if_lidar_only = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "if_lidar_only", false);
         if (!if_lidar_only) {
@@ -1648,6 +1708,8 @@ private:
         // whether the unbounded-knot / unbounded-buffer / silent-failure
         // hazards listed in CLAUDE.md actually fire in practice.
         stat.add("Spline Knots", static_cast<int>(cached_spline_knots_.load(std::memory_order_relaxed)));
+        stat.add("Spline Knots (total incl. pruned)",
+                 static_cast<int>(cached_spline_total_knots_.load(std::memory_order_relaxed)));
         size_t imu_int_size = 0;
         {
             std::lock_guard<std::mutex> lock(m_buff);

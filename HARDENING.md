@@ -19,7 +19,7 @@ Companion docs:
 | 1.5 | Defensive crash-hardening (3-pass) | **Complete** | `14e9be8` |
 | 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete (this commit)** — see "Phase 1.6" below | this commit |
 | 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 Push_Down race + 2.5 #2 deadlock + 2.6 two data-path races FIXED + TSan-verified; 2.3 pending data; 2.5 #1 rebuild-vs-mutator race deferred** — see below | this commit |
-| 3   | Spline / mapping accuracy | Pending Phase 0 data | — |
+| 3   | Spline / mapping accuracy | **3.1 knot pruning IMPLEMENTED (this commit)** — gate satisfied by the 2.6 live measurement; 3.3 detection done (recovery policy pending); 3.2 / 3.4 pending | this commit |
 | 4   | Diagnostics publisher | Can start after Phase 3 begins | — |
 | 5   | Regression tests | Last | — |
 
@@ -706,6 +706,30 @@ ASan/UBSan-clean; and `Spline Knots` grows unboundedly under zero pruning
 
 ---
 
+## Phase 2.7 — Bounded-join detach race (found during the 3.1 sweep)
+
+**Status: FIXED (both nodes), found by a TSan runtime CHECK-abort at shutdown
+while verifying Phase 3.1.**
+
+`joinProcessingThreadBounded` (RESPLE + Mapping) dispatched `join()` onto a
+`std::async` task and, on timeout, called `detach()` from the lifecycle
+thread — two threads operating on the SAME `std::thread` object. When the
+worker exited right at the deadline (TSan's slowdown made this reproducible),
+the async `join()` consumed the thread id concurrently with the `detach()` →
+UB; TSan's runtime aborted with `ThreadRegistry::ConsumeThreadUserId CHECK
+failed` inside `pthread_detach`. The async future's destructor also blocks
+until `join()` returns, so on a genuinely wedged worker the "bounded" join
+was never bounded.
+
+**Fix:** the worker lambda's final action is a release-store to
+`processing_thread_exited_`; the bounded join polls that flag against the
+deadline. Flag set → plain `join()` (guaranteed prompt); deadline hit →
+`detach()` — in both cases exactly one thread ever touches
+`processing_thread_`. Verified: the Phase 3.1 TSan sweep (30 s synthetic
+injection + SIGINT shutdown) completes with zero TSan output of any kind.
+
+---
+
 ## Phase 3 — Spline / mapping accuracy
 
 **Status: pending Phase 0 data.**
@@ -713,21 +737,61 @@ ASan/UBSan-clean; and `Spline Knots` grows unboundedly under zero pruning
 Four items. Each is a distinct PR with a before/after trajectory-plot
 regression before merging.
 
-### 3.1 Sliding-window knot pruning
+### 3.1 Sliding-window knot pruning — **IMPLEMENTED**
 
-`SplineState::t_knots` / `q_knots` / `ort_delta` grow indefinitely. Define a
-retention window (something like `max(5 × spline_order, active_measurement_span)`
-knots) and prune from the front. Must guard any consumer that reads historical
-knots — notably `getSplineMsg` and any plugin that walks backward from the
-current state.
+**Status: landed this commit. The decision gate was satisfied by the Phase 2.6
+live data-path sweep, which measured `Spline Knots` growing unboundedly (one
+knot per `knot_hz` tick, no pruning) for the first time on a running node.**
 
-**Complexity: medium.** Risks invariant violations in `updateKnots`,
-`setOneStateKnot`, and the IEKF's `getRCPs()`. Write unit tests before the
-refactor.
+`SplineState::t_knots` / `q_knots` / `ort_delta` grew indefinitely in BOTH
+nodes (RESPLE's estimator spline and Mapping's `spline_active_`).
 
-**Decision gate:** only schedule if Phase 0 shows knot count growing
-unboundedly relative to wall-clock runtime. On a clean system, the growth is
-`knot_hz × seconds` = `100 × t` and pruning keeps the working set small.
+**Implementation (`SplineState.h` + both nodes):**
+- `SplineState::pruneFrontKnots(keep_knots)` drops the oldest knots and slides
+  the 3-slot idle window into their place. Key invariant that makes this safe:
+  the idles act as knots `-3..-1` (`t_idle[j]`/`q_idle[j]` hold the pose of
+  knot `j-3`, `ort_delta_idle[j]` the delta arriving at it — the convention
+  `prepareInterpolation`/`itpPose`/`itpQuaternion` read them with), so after
+  pruning K knots the old knots `[K-3..K-1]` become the new idles and
+  interpolation over the retained range is **bit-for-bit identical** (unit-
+  tested as an exact-equality property, not approximate).
+- Absolute knot indexing is preserved via `num_knots_pruned_`:
+  `totalKnots() = numKnots() + pruned` is the monotonic index space of the
+  est_window protocol. `getSplineMsg` emits absolute `start_idx`; `updateKnots`
+  translates `start_i` through the receiver's own pruned offset (a window
+  entirely before the prune point is a no-op); a hard floor of 8 retained
+  knots protects `getRCPs`/`updateRCPs` (last 4) and the message window
+  (last 5). `start_t_ns` advances in lock-step so time-based queries need no
+  translation, and the Phase 1.5 B clamps now clamp to the pruned
+  `minTimeNs()`.
+- **RESPLE node:** prunes each worker cycle, under `spline_mutex_`, AFTER the
+  est_window publish (publish-then-prune keeps every knot on the wire before
+  it can drop). The publish gate and `getSplineMsg` hint now use
+  `totalKnots()` — a `numKnots()` gate would stop firing once pruning caps
+  the retained count. Diagnostics gain `Spline Knots (total incl. pruned)` so
+  the growth signal stays observable.
+- **Mapping node:** prunes `spline_active_` on the worker after the
+  path/odom/control-point publishes; the publish gate likewise moved to
+  `totalKnots()`. `updateKnots`' idle-copy is additionally gated on
+  `num_knots_pruned_ == 0` so a stale/duplicate window can no longer clobber
+  the slid idles.
+- **Parameter:** `spline_prune_keep_knots` (both nodes, default **600** ≈ 6 s
+  at `knot_hz=100`; `0` disables; values 1–99 clamp to 100 with a WARN). 600
+  is far wider than every backward-looking consumer: IEKF last 4 knots,
+  est_window last 5, deskew ~10 (one scan), Mapping's path/scan lag.
+- **Drive-by fix:** `SplineState::init()` now clears the knot deques — a
+  re-init (Mapping consuming a RESPLE respawn) previously reset `num_knot`
+  but left the deques populated, so knot index i silently read the PREVIOUS
+  run's data once knots were re-added.
+
+**Verification:** `resple/test/test_spline_state.cpp` — 10 new ROS-free unit
+tests (exact interpolation equivalence incl. `itpPose` Jacobians, small-prune
+idle reuse, repeated-prune equivalence, floor/no-op edges, re-init reset, RCP
+round-trip, and a sender/receiver est_window protocol simulation with pruning
+on both sides plus a stale-window redelivery case). The standalone ROS-free
+build compiles `SplineState.h` against field-compatible stubs of the
+`estimate_msgs` headers (`test/stubs/`); the colcon `BUILD_TESTING` path uses
+the real generated messages.
 
 ### 3.2 Plane-fit hardening
 

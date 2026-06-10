@@ -30,6 +30,7 @@ set(RESPLE_TEST_SOURCES
   test_geometry_core.cpp
   test_point_cloud_adapter.cpp
   test_filter_health.cpp
+  test_spline_state.cpp
 )
 
 foreach(src ${RESPLE_TEST_SOURCES})
@@ -48,6 +49,15 @@ foreach(src ${RESPLE_TEST_SOURCES})
     gtest_discover_tests(${name})
   endif()
 endforeach()
+
+# test_spline_state includes SplineState.h, which pulls the estimate_msgs
+# message headers. The standalone (ROS-free) build satisfies those includes
+# with the field-compatible stubs under test/stubs/; the colcon BUILD_TESTING
+# path (resple/CMakeLists.txt) uses the real generated messages instead.
+if(TARGET test_spline_state)
+  target_include_directories(test_spline_state PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
+endif()
 
 # ikd-Tree concurrency regression (HARDENING Phase 2.4). This one DOES need PCL
 # (pcl::PointXYZINormal) and compiles the kd-tree TU directly, so it is gated on

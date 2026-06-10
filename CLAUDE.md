@@ -320,7 +320,7 @@ directory). Summary:
 | 1   | Safety fixes (initial)             | complete (`512da1d`) |
 | 1.5 | Defensive crash-hardening          | complete (`14e9be8`) — 13 fixes across 3 passes |
 | 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 still pending Phase 0 data |
-| 3   | Spline / mapping accuracy          | pending Phase 0 data |
+| 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.3 detection done; 3.2 / 3.4 pending |
 | 4   | Diagnostics publisher              | after Phase 3 begins |
 | 5   | Regression tests                   | last |
 
@@ -334,7 +334,7 @@ reference (status as of latest pass):
 | 1  | ikd-Tree `Nearest_Search` lock contract unverified | **fixed** (always-shared-lock) | 1.5 K1 |
 | 2  | Init state machine is a bool pair (fragile) | **race fixed** (atomic bools); enum refactor optional | 1.5 C / 2.2 |
 | 3  | `map_update_future_.valid()` racy read | **fixed** | 1 |
-| 4  | Unbounded knot growth | open, measuring | 3.1 |
+| 4  | Unbounded knot growth | **fixed** (sliding-window prune in both nodes: `SplineState::pruneFrontKnots` slides the idle window so retained-range interpolation is bit-identical; absolute est_window indexing kept via `totalKnots()`; param `spline_prune_keep_knots`, default 600, 0 disables) | 3.1 |
 | 5  | Unbounded input buffers | open, measuring | 2.3 |
 | 6  | `assert()` in hot paths → silent UB under `-DNDEBUG` | **fixed** | 1 |
 | 7  | No divergence detection | partial (failure counter) | 0 → 3.3 |
@@ -368,6 +368,7 @@ reference (status as of latest pass):
 | 35 | ikd-Tree background rebuild thread vs. concurrent mutator data race on `KD_TREE_NODE` fields (`father_ptr` at `multi_thread_rebuild` ~255 vs `Update` ~1564; ancestor Update-walk during swap) | **documented, deferred to Phase 2.5 #1** (pre-existing upstream HKU-MARS baseline — vanilla ikd-Tree races identically; benign in testing, `err=0`; only the aggressive focused stress triggers it, suppressed in `resple/test/tsan_suppressions.txt`) | 2.5 |
 | 36 | `processData` lidar-buffer drain checked `while (!lidar_data.t_buff.empty())` OUTSIDE `mtx_pc`, racing the sensor callback's locked `t_buff.push_back` on the deque internals | **fixed** (Phase 2.6: check emptiness under `mtx_pc` — `while(true){ lock; if(empty) break; … }`). TSan data-path sweep, real-race count 18→0 | 2.6 |
 | 37 | async map-update task read the spline (`lasermapFovSegment → getPositionLiDAR → itpPosition/itpQuaternion`) holding only `mtx_map_`, while the worker grows the spline (`collectMeasurements → addOneStateKnot`) under `spline_mutex_` ALONE (no `mtx_map_`) → race | **fixed** (Phase 2.6: take `spline_mutex_` in `lasermapFovSegment`; order `mtx_map_ → spline_mutex_` preserved). TSan-verified | 2.6 |
+| 38 | `joinProcessingThreadBounded` (both nodes) dispatched `join()` onto a `std::async` task and `detach()`ed from the lifecycle thread on timeout — two threads racing on the same `std::thread` object (UB when the worker exited at the deadline; TSan runtime CHECK-abort in `pthread_detach`), and the async future's dtor un-bounded the wait | **fixed** (worker lambda release-stores `processing_thread_exited_` as its last action; bounded join polls the flag, then join-or-detach single-threaded) | 2.7 |
 
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7
@@ -388,6 +389,7 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `nn_thresh` | point-to-plane distance threshold (m) | `0.5` |
 | `cube_len` | local map cube size (m) | `1000.0` |
 | `num_threads` | OpenMP threads | `4` |
+| `spline_prune_keep_knots` | knots retained by the Phase 3.1 sliding-window prune (both nodes; 0 disables, <100 clamps to 100) | `600` |
 
 The `cube_len` hardcoded default in code (`RESPLE.cpp:580`, value 2000) is
 overridden by the param; check the logged value on startup rather than reading
@@ -429,7 +431,11 @@ the source.
   `declare_parameter` calls must be guarded with `if (!has_parameter(...))`
   to survive lifecycle re-cycles.
 - When adding a new spline reader (anything that calls `spline->itp*` or
-  reads knot data), take `spline_mutex_` first. If you only need the
+  reads knot data), take `spline_mutex_` first. Knot DEQUE indices are local:
+  with Phase 3.1 pruning active, absolute (protocol) index = local index +
+  `numKnotsPruned()`; times never need translation (`start_t_ns` advances with
+  the prune). Anything holding knot indices across cycles must use
+  `totalKnots()` space (see the est_window publish gate in both nodes). If you only need the
   current pose at `maxTimeNs()`, prefer `getPositionLiDAR(spline->maxTimeNs(), ...)`
   which is now pure-read (Phase 1.5 Pass 3).
 - When adding state to `Mapping.cpp`'s `process()` loop, hold all per-map
