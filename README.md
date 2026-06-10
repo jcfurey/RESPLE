@@ -255,7 +255,12 @@ Operational highlights:
 The complete parameter and topic reference is
 [`doc/PARAMETERS.md`](doc/PARAMETERS.md). The live-sensor launch files accept
 `config_file:=/path/to/your.yaml`, so a copied config can be used without
-editing the installed one. The commented blocks at the bottom
+editing the installed one. All launch files start **RESPLE-only by default**:
+the Mapping node is a visualization-only consumer the odometry never depends
+on — pass `use_mapping:=true` to start it, and see
+[`doc/MAPPING_NODE.md`](doc/MAPPING_NODE.md) for why dropping it leaves the
+odometry outputs (`odom`, `current_scan`, `odom → base_link` TF) unchanged.
+The commented blocks at the bottom
 of [`config_pointcloud2.yaml`](resple/config/config_pointcloud2.yaml),
 [`config_ouster.yaml`](resple/config/config_ouster.yaml) and
 [`config_demonstrator.yaml`](resple/config/config_demonstrator.yaml) show
