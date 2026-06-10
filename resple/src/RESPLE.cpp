@@ -2247,6 +2247,9 @@ private:
         // below would be OOB. Doesn't affect Ouster (we don't take this
         // callback path), but is a real fix for the Livox variants.
         if (plsize == 0 || livox_msg_in->points.empty()) return;
+        // DDS robustness: clamp to the actual vector — a torn/corrupt message can
+        // ship point_num > points.size(), which would OOB the points[i] loop below.
+        plsize = std::min<int>(plsize, static_cast<int>(livox_msg_in->points.size()));
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
         LidarData& lidar_buffs = lidars_data.at(name);
@@ -2310,6 +2313,9 @@ private:
         // below would be OOB. Doesn't affect Ouster (we don't take this
         // callback path), but is a real fix for the Livox variants.
         if (plsize == 0 || livox_msg_in->points.empty()) return;
+        // DDS robustness: clamp to the actual vector — a torn/corrupt message can
+        // ship point_num > points.size(), which would OOB the points[i] loop below.
+        plsize = std::min<int>(plsize, static_cast<int>(livox_msg_in->points.size()));
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
         LidarData& lidar_buffs = lidars_data.at(name);
@@ -2372,6 +2378,9 @@ private:
         // below would be OOB. Doesn't affect Ouster (we don't take this
         // callback path), but is a real fix for the Livox variants.
         if (plsize == 0 || livox_msg_in->points.empty()) return;
+        // DDS robustness: clamp to the actual vector — a torn/corrupt message can
+        // ship point_num > points.size(), which would OOB the points[i] loop below.
+        plsize = std::min<int>(plsize, static_cast<int>(livox_msg_in->points.size()));
         pc_last->reserve(plsize);
         int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
         LidarData& lidar_buffs = lidars_data.at(name);

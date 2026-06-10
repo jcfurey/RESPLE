@@ -1153,8 +1153,35 @@ container/CI default RMW. Suppressed with justification in
 - **Deployment-faithful re-validation under `rmw_zenoh`** is the proper close
   (would also confirm the Fast-DDS residual vanishes). Pending
   `ros-jazzy-rmw-zenoh-cpp` in the image + a `rmw_zenohd` router.
-- §6.1 **ASan/UBSan leg** not yet run.
-- CLAUDE.md's hazard table should gain rows 39–42 (mirrors the above).
+- CLAUDE.md's hazard table should gain rows 39–43 + 44–45 (mirrors this section).
+
+#### 6.1 RESULTS — ASan/UBSan leg, 2026-06-10 (HelmDyn01, LIO)
+
+Same harness, `scripts/sanitizer_replay.sh asan` (ENABLE_ASAN = ASan+UBSan,
+`detect_leaks=1`, LIO, full bag). **RESULT: CLEAN** — zero ASan/LSan/UBSan
+reports on the real data path; node healthy (LIO gravity init, knot plateau at
+600, IEKF running, no DIVERGED, clean shutdown). Confirms the §6.1 fixes +
+the DDS-robustness hardening below compile and introduce no memory errors.
+
+#### 6.1 — DDS/RMW data-handling robustness hardening (2026-06-10)
+
+Operator requirement: the data path must tolerate DDS/RMW faults (torn /
+partial / corrupt / concurrently-delivered messages) — degrade gracefully, never
+crash or corrupt. We cannot fix races *inside* the middleware (the suppressed
+Fast-DDS payload-pool race), but we can ensure our ingest validates everything.
+Audit of all ingest paths in both nodes:
+
+| # | Gap | Fix |
+| --- | --- | --- |
+| 44 | **Mapping callbacks had no top-level try/catch** (7 lidar + `getEstCallback`) — a throw (bad_alloc, PCL/Eigen) escaped the executor → `std::terminate`. (RESPLE callbacks already wrapped, Phase 1.5 D.) | Wrapped every Mapping sensor callback + `getEstCallback` in `try { … } catch (const std::exception&) { WARN_THROTTLE }` (drop the scan, keep running). `getEstCallback` also drops an est_window with non-positive `dt`. |
+| 45 | **Livox count/size mismatch** in BOTH nodes: the 3 `livoxLidarCallback`/`*AVIA*` variants looped `points[i]` up to `point_num` and `reserve(point_num)` — a torn message with `point_num > points.size()` → OOB read (uncatchable UB) / `reserve` throw | Clamp `plsize = min(point_num, points.size())` before the loop/reserve in all 6 Livox callbacks. |
+
+Not a gap (verified): every PointCloud2 sensor (Ouster / Hesai / mid360 /
+generic, both nodes) derives its loop bound from the **deserialized vector size**
+(`fromROSMsg`/`ingestPointCloud2`), so there is no count-field-vs-size mismatch
+to exploit — their only exposure was the missing try/catch (now closed in
+Mapping; RESPLE already had it + `isfinite` filtering). Validated TSan- and
+ASan-clean on the HelmDyn01 LIO replay.
 
 ### 6.2 Bag-replay CI smoke (last open Phase 5 row)
 
