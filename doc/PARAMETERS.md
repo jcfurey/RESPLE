@@ -42,6 +42,10 @@ publication is suspended while the filter is flagged DIVERGED.
 
 ### Mapping node (visualization / map keeping)
 
+The Mapping node is optional — a downstream consumer of `est_window` that the
+odometry never depends on. Launch files start it only with `use_mapping:=true`
+(default `false`); see [`MAPPING_NODE.md`](MAPPING_NODE.md).
+
 | Topic | Type | Content |
 | --- | --- | --- |
 | `odometry` | `nav_msgs/Odometry` | Pose interpolated from the received spline window |

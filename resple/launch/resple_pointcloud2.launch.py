@@ -3,6 +3,7 @@ import launch
 import launch_ros.actions
 from ament_index_python.packages import get_package_share_directory
 from launch.actions import DeclareLaunchArgument, TimerAction, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
@@ -23,6 +24,14 @@ def generate_launch_description():
     mapping_delay_arg = DeclareLaunchArgument(
         'mapping_delay', default_value=LaunchConfiguration('start_delay'),
         description='Seconds to wait before launching Mapping (defaults to start_delay).')
+    # The Mapping node is visualization-only: it consumes RESPLE's est_window
+    # and rebuilds a global cloud for rviz/Foxglove. The odometry path
+    # (/odom, /current_scan, odom->base_link TF) lives entirely in the RESPLE
+    # node and is bit-identical without it — see doc/MAPPING_NODE.md.
+    use_mapping_arg = DeclareLaunchArgument(
+        'use_mapping', default_value='false',
+        description='Start the Mapping node (global map visualization + '
+                    'map->odom TF). Not needed for odometry.')
     lidar_frame_arg = DeclareLaunchArgument(
         'lidar_frame', default_value='lidar',
         description='The sensor frame_id stamped on the PointCloud2 messages '
@@ -45,6 +54,7 @@ def generate_launch_description():
         config_file_arg,
         start_delay_arg,
         mapping_delay_arg,
+        use_mapping_arg,
         lidar_frame_arg,
         launch_ros.actions.Node(
             package='tf2_ros',
@@ -71,6 +81,7 @@ def generate_launch_description():
             ]),
         TimerAction(
             period=_mapping_delay,
+            condition=IfCondition(LaunchConfiguration('use_mapping')),
             actions=[
                 launch_ros.actions.Node(
                 package='resple',
