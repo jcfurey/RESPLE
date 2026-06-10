@@ -200,8 +200,18 @@ was mutating `Estimator::cov_rcp` from inside the async map-update lambda,
 which holds only `mtx_map_` (unique) — not `spline_mutex_`. The mutation
 was race-free only because the IEKF needs `mtx_map_` shared and was
 blocked, but the implicit lock-coupling was fragile. The function is now
-pure-read; lock discipline matches the documented contract. If you re-add
-a mutating call here, take `spline_mutex_` first or refactor the caller.
+pure-read; if you re-add a mutating call here, take `spline_mutex_` first
+or refactor the caller.
+
+**It is pure-read but it still READS the spline** (`itpPosition` /
+`itpQuaternion`), so its single caller `lasermapFovSegment` must hold
+`spline_mutex_` around the call. The "race-free because the IEKF holds
+`mtx_map_` shared" reasoning above does NOT cover the spline *read*: the
+worker grows the spline via `collectMeasurements → addOneStateKnot` under
+`spline_mutex_` **alone** (no `mtx_map_`), so `mtx_map_` unique does not
+exclude that write. The async task reading the spline under only `mtx_map_`
+raced with it (TSan, data-path sweep). Fixed by taking `spline_mutex_` in
+`lasermapFovSegment` (order `mtx_map_ → spline_mutex_` preserved).
 
 ### ikd-Tree `Nearest_Search` always takes the shared lock
 
@@ -211,6 +221,35 @@ rebuild thread's subtree swap. `Nearest_Search` now unconditionally takes
 `search_rw_mutex_` shared. Cost: one uncontended atomic-increment per call
 (rebuild only takes unique briefly during the swap). Worth it — the racy
 fast-path was a HIGH-severity UAF window in the IEKF k-NN parallel-for.
+
+### ikd-Tree `Push_Down` per-node locking (Phase 2.4)
+
+`Push_Down(P)` propagates deletion flags to `P`'s children. Concurrent
+searchers (the IEKF runs `findCorresp` as an OpenMP parallel-for, so many
+threads call `Nearest_Search` → `Push_Down` at once) used to race on the
+child nodes' flag fields. The fix:
+- `Push_Down` takes `P`'s own `push_down_mutex_lock` for the body (serializing
+  concurrent `Push_Down(P)` and protecting `P`'s flag clears) **and** each
+  child's `push_down_mutex_lock` around that child's field writes (serializing
+  a `Push_Down(P)`-writes-`C` against a `Push_Down(C)`). Lock order is strictly
+  parent→child along tree edges → acyclic → deadlock-free; a thread holds at
+  most two node mutexes. The call sites are now bare `Push_Down(root)` — the
+  old trylock dance moved inside.
+- The mutators that SET `need_push_down_to_*` on a subtree root (`Add_by_range`,
+  `Delete_by_range`, `run_operation`'s PUSH_DOWN replay) take that node's
+  `push_down_mutex_lock` around the write, closing the set-vs-clear lost-update.
+- The racy `KD_TREE_NODE` fields (`TreeSize`, `invalid_point_num`,
+  `down_del_num`, and the six deletion/propagation bools) are `std::atomic`, so
+  the lock-free reads in `Search` / `Search_by_range` / `Search_by_radius` /
+  `Criterion_Check` / `Update` are defined behaviour.
+
+This makes multi-threaded k-NN safe by contract; the old `num_threads=1`
+mitigation is retired. Verified with `resple/test/test_ikdtree_concurrency.cpp`
+under ThreadSanitizer (reader-vs-reader `Push_Down` races 16→0). The
+`search_rw_mutex_`↔`working_flag_mutex` rebuild deadlock (hazard 34) was also
+fixed (Phase 2.5 #2); one pre-existing upstream rebuild-vs-mutator data race
+remains (hazard 35, Phase 2.5 #1), deferred and listed in
+`resple/test/tsan_suppressions.txt`.
 
 ## Build configuration
 
@@ -236,6 +275,39 @@ The library target is built once and linked by both the `RESPLE` node
 executable and the `Mapping` standalone executable. The component registration
 is `PLUGIN "RESPLE" EXECUTABLE RESPLE_node` — we launch the executable, not
 the composable node.
+
+### Building (full colcon build, incl. in a web session)
+
+One command from the repo root:
+
+```bash
+./scripts/build_workspace.sh          # build --packages-up-to resple
+./scripts/build_workspace.sh --test   # + colcon test
+```
+
+It assembles a clean workspace and builds against the real ROS 2 / PCL stack.
+The dependency-light estimator-core tests build/run without ROS at all via
+`./scripts/run_unit_tests.sh` (Eigen + GTest; the ikd-Tree concurrency test
+additionally needs PCL and is gated on it).
+
+Non-obvious things the script and the SessionStart hook handle (learned the
+hard way bringing the full build up on Claude Code on the web):
+
+- **The Livox message packages are already in this repo**, just under other
+  directory names: `AviaResple_msgs`=`livox_interfaces`,
+  `Mid70Avia_msgs`=`livox_ros_driver`, `HAP360_msgs`=`livox_ros_driver2` (plus
+  `estimate_msgs`). No external clones — the script symlinks them into the ws.
+- **ROS apt over http.** Some network policies 503 the TLS `packages.ros.org`
+  but allow plain http; apt still verifies the GPG signature, so the hook adds
+  an `http://` source as a fallback.
+- **NumPy + the right Python.** rosidl's message generator does
+  `find_package(Python3 ... NumPy)`. The image has several Pythons and
+  `/usr/local/bin/python3` may be a 3.11 with no working NumPy; the script picks
+  an interpreter that can import NumPy (prefers the ROS `python3.12`) and passes
+  it as `-DPython3_EXECUTABLE`. The hook installs `python3-numpy`/`python3-dev`.
+- **BLAS must be linked by test targets.** `-DEIGEN_USE_BLAS` is added globally,
+  so every gtest that touches Eigen matrix products links `${BLAS_LIBRARIES}`
+  (hook installs `libblas-dev`/`liblapack-dev`).
 
 ## Hardening status
 
@@ -291,7 +363,11 @@ reference (status as of latest pass):
 | 30 | `map_update_future_.wait()` had no timeout → if lambda hangs, worker permanently locks (no IEKF, no publishes, node alive but silent) | **fixed** (`wait_for(5s)` + skip cycle on timeout + ERROR log) | post-1.5 |
 | 31 | `processData` worker loop body unwrapped → throw anywhere kills worker thread silently → "alive but doing nothing" | **fixed** (try/catch around iteration body, log + 50ms sleep + continue) | post-1.5 |
 | 32 | `mapIncremental` passed NaN/Inf points straight to ikd-Tree `Add_by_point`, where `calc_dist` returns NaN, `<` comparisons all false, recursion takes wrong branch, tree state corrupts silently | **fixed** (skip non-finite points; surface counter via WARN_THROTTLE) | post-1.5 |
-| 33 | `ikd-Tree::Push_Down` writes to children's flag fields holding only the parent's per-node lock → races on overlapping subtree paths | **documented** (inherited from upstream HKU-MARS; mitigated via `num_threads=1` if symptomatic) | post-1.5 |
+| 33 | `ikd-Tree::Push_Down` writes to children's flag fields holding only the parent's per-node lock → races on overlapping subtree paths (dominant caller: findCorresp's OpenMP parallel `Nearest_Search`) | **fixed** (Phase 2.4: `Push_Down` takes the parent's *and* the child's `push_down_mutex_lock`; mutator flag-SET sites take the node's lock; the racy node fields are `std::atomic`; `num_threads=1` mitigation retired). TSan-verified reader-vs-reader races 16→0 via `test_ikdtree_concurrency` | 2.4 |
+| 34 | `working_flag_mutex`↔`search_rw_mutex_` lock-order inversion (real deadlock): Phase 1.5 K1 wrapped the *mutating* fast-path calls in `Add_Points`/`Delete_Points`/etc. in `search_rw_mutex_` shared, but those take `working_flag_mutex` at a deeper rebuild boundary — opposite order to the rebuild thread (`working_flag`→`search_rw` unique). TSan-confirmed; observed to hang | **fixed** (Phase 2.5 #2: drop the shared lock from the 5 mutating fast paths — mutators self-coordinate via `working_flag_mutex`, the upstream mechanism; K1's lock kept on the *search* fns + the genuine `Search_by_range` read). Verified deadlock-free under TSan | 2.5 |
+| 35 | ikd-Tree background rebuild thread vs. concurrent mutator data race on `KD_TREE_NODE` fields (`father_ptr` at `multi_thread_rebuild` ~255 vs `Update` ~1564; ancestor Update-walk during swap) | **documented, deferred to Phase 2.5 #1** (pre-existing upstream HKU-MARS baseline — vanilla ikd-Tree races identically; benign in testing, `err=0`; only the aggressive focused stress triggers it, suppressed in `resple/test/tsan_suppressions.txt`) | 2.5 |
+| 36 | `processData` lidar-buffer drain checked `while (!lidar_data.t_buff.empty())` OUTSIDE `mtx_pc`, racing the sensor callback's locked `t_buff.push_back` on the deque internals | **fixed** (Phase 2.6: check emptiness under `mtx_pc` — `while(true){ lock; if(empty) break; … }`). TSan data-path sweep, real-race count 18→0 | 2.6 |
+| 37 | async map-update task read the spline (`lasermapFovSegment → getPositionLiDAR → itpPosition/itpQuaternion`) holding only `mtx_map_`, while the worker grows the spline (`collectMeasurements → addOneStateKnot`) under `spline_mutex_` ALONE (no `mtx_map_`) → race | **fixed** (Phase 2.6: take `spline_mutex_` in `lasermapFovSegment`; order `mtx_map_ → spline_mutex_` preserved). TSan-verified | 2.6 |
 
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7

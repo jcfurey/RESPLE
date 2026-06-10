@@ -1,7 +1,9 @@
 # Standalone unit-test build for the dependency-light estimator cores.
 #
-# These tests intentionally avoid ROS 2 / PCL so they compile with nothing more
-# than a C++17 compiler, Eigen and GoogleTest:
+# The estimator-core tests intentionally avoid ROS 2 / PCL so they compile with
+# nothing more than a C++17 compiler, Eigen and GoogleTest. (The one exception
+# is the ikd-Tree concurrency stress test at the bottom, which needs PCL point
+# types and is gated on PCL being found.)
 #
 #     cmake -S resple/test -B build/test && cmake --build build/test
 #     ctest --test-dir build/test --output-on-failure
@@ -46,3 +48,34 @@ foreach(src ${RESPLE_TEST_SOURCES})
     gtest_discover_tests(${name})
   endif()
 endforeach()
+
+# ikd-Tree concurrency regression (HARDENING Phase 2.4). This one DOES need PCL
+# (pcl::PointXYZINormal) and compiles the kd-tree TU directly, so it is gated on
+# PCL being available — the cores above still build with only Eigen + GTest.
+# Run under ThreadSanitizer with the suppressions file for the strongest signal:
+#   cmake -S resple/test -B build/test \
+#     -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1 -fno-omit-frame-pointer"
+#   cmake --build build/test
+#   TSAN_OPTIONS="suppressions=$PWD/resple/test/tsan_suppressions.txt" \
+#     ctest --test-dir build/test --output-on-failure -R IkdTreeConcurrency
+find_package(PCL QUIET COMPONENTS common)
+find_package(Threads REQUIRED)
+if(PCL_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_ikdtree_concurrency.cpp)
+  add_executable(test_ikdtree_concurrency
+    test_ikdtree_concurrency.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/ikd-Tree/ikd_Tree.cpp)
+  target_include_directories(test_ikdtree_concurrency PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${EIGEN3_INCLUDE_DIR}
+    ${PCL_INCLUDE_DIRS})
+  target_compile_definitions(test_ikdtree_concurrency PRIVATE ${PCL_DEFINITIONS})
+  if(TARGET Eigen3::Eigen)
+    target_link_libraries(test_ikdtree_concurrency PRIVATE Eigen3::Eigen)
+  endif()
+  target_link_libraries(test_ikdtree_concurrency PRIVATE
+    GTest::gtest GTest::gtest_main Threads::Threads)
+  target_compile_options(test_ikdtree_concurrency PRIVATE -Wall -Wextra)
+  gtest_discover_tests(test_ikdtree_concurrency PROPERTIES TIMEOUT 120)
+else()
+  message(STATUS "PCL not found; skipping test_ikdtree_concurrency (ikd-Tree stress).")
+endif()

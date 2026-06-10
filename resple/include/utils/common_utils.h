@@ -10,6 +10,14 @@
 #include <geometry_msgs/msg/point32.hpp>
 #include <omp.h>
 
+// PCL_ADD_POINT4D / POINT_CLOUD_REGISTER_POINT_STRUCT (the ouster_ros::Point
+// definition below) come from these headers. Include them explicitly so this
+// header is self-contained — consumers that include it before any PCL header
+// (e.g. the esti_plane integration test) used to fail with "PCL_ADD_POINT4D
+// does not name a type".
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+
 #include "utils/eigen_utils.hpp"
 #include "utils/geometry_core.h"
 

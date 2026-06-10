@@ -18,7 +18,7 @@ Companion docs:
 | 1   | Safety fixes (initial) | **Complete** | `512da1d` |
 | 1.5 | Defensive crash-hardening (3-pass) | **Complete** | `14e9be8` |
 | 1.6 | Bug-chase session 2026-05-01: `__libc_free` SIGSEGV in `KD_TREE::Add_Points` | **Complete (this commit)** — see "Phase 1.6" below | this commit |
-| 2   | Concurrency hardening | **Largely subsumed by 1.5/1.6** — see below | — |
+| 2   | Concurrency hardening | **2.1/2.2 done (1.5); 2.4 Push_Down race + 2.5 #2 deadlock + 2.6 two data-path races FIXED + TSan-verified; 2.3 pending data; 2.5 #1 rebuild-vs-mutator race deferred** — see below | this commit |
 | 3   | Spline / mapping accuracy | Pending Phase 0 data | — |
 | 4   | Diagnostics publisher | Can start after Phase 3 begins | — |
 | 5   | Regression tests | Last | — |
@@ -394,12 +394,15 @@ standalone justification.
 ## Phase 2 — Concurrency hardening
 
 **Status: 2.1 fixed (Phase 1.5 K1); 2.2 partially fixed (Phase 1.5 Fix C);
-2.3 still pending Phase 0 data; 2.4 (Push_Down race) design ready,
-implementation pending a ROS 2 + PCL toolchain.**
+2.3 still pending Phase 0 data; 2.4 (Push_Down race) IMPLEMENTED + TSan-verified;
+2.5 #2 (rebuild lock-order deadlock) FIXED + TSan-verified; 2.5 #1
+(rebuild-vs-mutator data race) deferred.**
 
 Three independent items. 2.1 was preempted by Phase 1.5 (defensive shared
 lock); 2.2's immediate race was closed by Phase 1.5 Fix C, full state-enum
-refactor still optional; 2.3 unchanged.
+refactor still optional; 2.3 unchanged. 2.4 landed once a ROS 2 + PCL toolchain
+was available to compile- and TSan-verify it; verification surfaced two
+pre-existing rebuild-path hazards now tracked as 2.5.
 
 ### 2.1 Verify ikd-Tree `Nearest_Search` lock contract
 
@@ -466,12 +469,46 @@ worker stalls, memory grows without backpressure. Fix:
 **Decision gate:** only do this if Phase 0 shows the buffers trend up under
 normal operation. On a clean system they should empty every IEKF cycle.
 
-### 2.4 Fix the ikd-Tree `Push_Down` child-write race — **DESIGN READY, IMPLEMENTATION PENDING**
+### 2.4 Fix the ikd-Tree `Push_Down` child-write race — **IMPLEMENTED + TSan-VERIFIED**
 
-**Status: full design below; implementation deliberately deferred until a
-ROS 2 + PCL toolchain is available to compile-verify it (`ikd_Tree.cpp`
-needs PCL; the refactor touches ~140 sites). This is the last known
-ikd-Tree race and the reason the `num_threads=1` mitigation exists.**
+**Status: landed this commit. The design (below) was implemented verbatim and
+compile-/TSan-verified once a ROS 2 + PCL toolchain became available. The
+`num_threads=1` mitigation is retired.**
+
+**Implementation (files `resple/include/ikd-Tree/ikd_Tree.{h,cpp}`):**
+- `KD_TREE_NODE`: `TreeSize`, `invalid_point_num`, `down_del_num` →
+  `std::atomic<int>`; the six deletion/propagation bools → `std::atomic<bool>`
+  (`<atomic>` added). `working_flag` stays a plain bool (rebuild handshake,
+  out of scope). Same-field-type assignments (`a = b` where both are atomic)
+  use explicit `.load()` since `atomic = atomic` selects the deleted copy.
+- `Push_Down`: fast lock-free pre-check; then PARENT `push_down_mutex_lock` for
+  the body and the CHILD's lock around each child block (incl. the `*Rebuild_Ptr`
+  branch, with `working_flag_mutex`/`Rebuild_Logger` nested inside the child
+  lock → order node→working_flag, no inversion). `|=` sites became `if (x) y =
+  true;`.
+- Search call site simplified to a bare `Push_Down(root)`.
+- Mutator flag-SET blocks in `Add_by_range`, `Delete_by_range`, and
+  `run_operation`'s PUSH_DOWN replay wrapped in the node's `push_down_mutex_lock`.
+
+**Verification performed:**
+- Standalone compile of `ikd_Tree.cpp` (all three explicit instantiations:
+  `PointXYZ`, `PointXYZI`, `PointXYZINormal`) clean under `-Wall -Wextra`.
+- New gtest `resple/test/test_ikdtree_concurrency.cpp` — phased stress mirroring
+  RESPLE's `mtx_map_` discipline (single-threaded delete/add arms a
+  need_push_down frontier; a barrier then releases N readers that push it down
+  concurrently). Functional run passes; the real gate is ThreadSanitizer.
+- **Before/after under TSan** (same test, pre-2.4 tree vs this commit):
+  reader-vs-reader `Push_Down` races on the node fields **16 → 0**. My new
+  per-node mutexes appear in **no** lock-order cycle.
+- See `resple/test/tsan_suppressions.txt` — it suppresses ONLY the two
+  pre-existing, independent hazards now tracked as **2.5**, never `Search` /
+  `Push_Down`, so a 2.4 regression still fails.
+
+The full original design is retained below for reference.
+
+---
+
+**Original race (documented in the old `Push_Down` comment block):**
 
 The race (documented in the `Push_Down` comment block, ikd_Tree.cpp ~1234):
 `Push_Down(P)` writes the propagation fields of P's CHILDREN
@@ -539,6 +576,133 @@ per-node mutex in the hot search path costs one uncontended pthread lock per
 node visited only when `need_push_down_to_*` is set (the pre-check skips the
 lock otherwise) — deletions are bursty (FOV segment + downsample), so the
 common search path stays lock-free.
+
+### 2.5 Rebuild-path hazards surfaced by the 2.4 stress test — **#1 DEFERRED, #2 FIXED**
+
+**Status: found while TSan-verifying 2.4; both pre-existing (present with AND
+without the 2.4 change) and inherited from upstream HKU-MARS. #1 (rebuild-vs-
+mutator data race) remains deferred and suppressed in
+`resple/test/tsan_suppressions.txt`. #2 (the lock-order inversion / deadlock)
+is FIXED this commit.**
+
+1. **(DEFERRED) Rebuild-thread vs. mutator data race on `KD_TREE_NODE` fields.**
+   `multi_thread_rebuild` reads `(*Rebuild_Ptr)->father_ptr` (`ikd_Tree.cpp`
+   ~255) while a concurrent mutator's `Update` writes `father_ptr`/aggregate
+   fields (~1564), and the rebuild swap's ancestor `Update`-walk touches nodes
+   the mutator traverses. Vanilla ikd-Tree has no `search_rw_mutex_` and races
+   here identically, so this is the upstream baseline. Functionally benign in
+   testing (search results stay consistent, `err=0`) but a real race; the
+   production-faithful `test_ikdtree_concurrency` does not trigger it, only the
+   aggressive focused stress does. Tracked as a follow-up.
+
+2. **(FIXED) `search_rw_mutex_` ↔ `working_flag_mutex` lock-order inversion
+   (real deadlock).**
+
+   **Root cause (corrected from the first diagnosis):** the Phase 1.5 K1
+   extension wrapped the *mutating* fast-path calls in `Add_Points` /
+   `Add_Point_Boxes` / `Delete_Points` / `Delete_Point_Boxes` /
+   `Delete_by_range`-downsample in `search_rw_mutex_` (shared). Those calls take
+   `working_flag_mutex` internally when the recursion reaches a *deeper*
+   `*Rebuild_Ptr` boundary. The fast-path guard only checked the *top-level*
+   `*Rebuild_Ptr != Root_Node`, so a deeper rebuild target still led to
+   `working_flag_mutex` being taken **while holding `search_rw_mutex_` shared**.
+   The background rebuild thread holds `working_flag_mutex` and takes
+   `search_rw_mutex_` **unique** (`multi_thread_rebuild` ~258/292) — the
+   opposite order → a real cycle. TSan-confirmed; observed to actually HANG the
+   committed test under load (the original reason that test carries a `TIMEOUT`).
+   Reachable in production: `mapIncremental`/`lasermapFovSegment` mutate while
+   the kd-tree's background rebuild thread runs.
+
+   **Fix:** remove the `search_rw_mutex_` shared lock from the five *mutating*
+   fast-path blocks. This reverts the mutators to the upstream ikd-Tree
+   coordination, where a mutator self-synchronises against the rebuild thread
+   via `working_flag_mutex` at the rebuild boundary (which also protects against
+   the swap + node free) — so the extra shared lock was never needed there. K1's
+   shared lock is KEPT where it is correct and load-bearing: the *search*
+   functions (`Nearest_Search`/`Box_Search`/`Radius_Search`) and the one genuine
+   lock-free *read* in `Add_Points` (`Search_by_range(Root_Node, …)`), which have
+   no `working_flag` coordination of their own. See the rewritten lock-discipline
+   comment at the top of `Add_Points`.
+
+   **Verification:** `test_ikdtree_concurrency` under TSan — before: hangs /
+   reports the inversion; after: completes, 0 lock-order-inversions, 0 data
+   races (production-faithful discipline), test passes. The aggressive focused
+   stress still shows the #1 rebuild-vs-mutator races (suppressed), but no
+   inversion. The `deadlock:` suppressions were removed so a regression fails.
+
+   **Trade-off noted honestly:** the K1 shared lock had been incidentally
+   *masking* the #1 rebuild-vs-mutator races (by excluding the mutator from the
+   rebuild thread's `search_rw`-unique sections). Removing it re-exposes #1 under
+   aggressive stress. We accept this: a deadlock (unrecoverable hang) is a
+   strictly worse failure mode than the upstream-baseline #1 race (benign in
+   testing), and #1 was already the deferred upstream behavior. Fully suppressing
+   #1 as well would need the larger redesign below.
+
+**Remaining work on #1 (deferred):** a complete fix needs consistent lock
+ordering between the mutators and the rebuild thread — e.g. a recursive
+`working_flag_mutex` so a mutator can hold it across its whole op (excluding the
+rebuild thread's critical sections) without self-deadlocking on the internal
+boundary acquisition; or routing all rebuilds through the single background
+thread; or making the few raced `KD_TREE_NODE` pointer/aggregate fields atomic.
+Each needs bag-replay validation (no bag available yet) before landing.
+
+---
+
+## Phase 2.6 — Live data-path TSan sweep (synthetic injection) — **2 races FIXED**
+
+**Status: the Phase 0 sanitizer sweep, finally run against the LIVE data path.**
+
+The earlier lifecycle-only sanitizer runs (TSan + ASan, clean) never exercised
+the data-processing concurrency because no LiDAR/IMU data flowed. With the ROS
+Python stack unusable in the sandbox (`rclpy`'s `_rclpy_pybind11` C extension is
+absent, so `ros2`/`ros2 bag`/`launch_test` don't run), a small **C++ rclcpp
+injector** drives the node instead: it publishes static TF + stationary IMU
+(100 Hz) + a static "room" `PointCloud2` (10 Hz) with zero motion, so the
+estimator gravity-inits, tracks at the origin, and the worker runs its full
+pipeline (deskew → `findCorresp` parallel k-NN → IEKF → `mapIncremental`
+`Add_Points` → `lasermapFovSegment` `Delete_Point_Boxes` → spline growth).
+
+**Method note (important for anyone repeating this):** with the default
+`num_threads=4`, TSan reports ~253 races, but the vast majority are **GCC
+`libgomp` false positives** — TSan does not model libgomp's parallel-for
+barriers, so it flags benign accesses across the implicit barrier between IEKF
+phases. Re-running with `num_threads=1` (OpenMP serialized) collapses that to
+**18 genuine cross-thread races**, which are the real signal. (A bag replay
+should use the same `num_threads=1` trick, or a TSan-aware OpenMP runtime.)
+
+The 18 reduced to two distinct real bugs, both now fixed (TSan before/after:
+18 → 0 with `num_threads=1`, the known 2.5 #1 rebuild race suppressed):
+
+1. **Lidar input-buffer `empty()` race (`RESPLE.cpp` ~549).** `processData`
+   drained the per-LiDAR buffer with `while (!lidar_data.t_buff.empty())` — the
+   `empty()` read was OUTSIDE `mtx_pc`, racing the sensor callback's locked
+   `t_buff.push_back` on the deque internals. Exactly the bug class Phase 1.5
+   Fix C closed for the IMU `imu_int_buff`, but on the LiDAR path. **Fix:** check
+   emptiness under `mtx_pc` (`while (true) { lock; if (empty) break; … }`).
+
+2. **Spline read in the async map task without `spline_mutex_`
+   (`RESPLE.cpp` `lasermapFovSegment`).** The async map-update task read the
+   spline via `getPositionLiDAR → itpPosition/itpQuaternion` holding only
+   `mtx_map_` (unique), while the worker GROWS the spline via
+   `collectMeasurements → addOneStateKnot` under `spline_mutex_` **alone** (no
+   `mtx_map_`). So `mtx_map_` unique did NOT exclude that write — the unlocked
+   read raced with it. The `getPositionLiDAR` "race-free" comment only accounted
+   for the IEKF spline *reads* (which hold `mtx_map_` shared), not the
+   `collectMeasurements` spline *writes*. **Fix:** take `spline_mutex_` around
+   the spline reads in `lasermapFovSegment`; lock order `mtx_map_ → spline_mutex_`
+   is preserved (the async task already holds `mtx_map_` unique, and the worker's
+   spline-growth path holds `spline_mutex_` alone, so no cycle).
+
+**Verification:** `colcon build` (TSan and RelWithDebInfo) green; the synthetic
+injector reaches steady state (IEKF running, spline growing); TSan real-race
+count 18 → 0. The sweep is reproducible via `./scripts/run_data_sweep.sh`
+(injector package + config under `resple/test/tools/`). For a
+production-confidence pass, replay a real bag through the same TSan build with
+`num_threads=1`.
+
+**Also confirmed (not bugs):** the lifecycle/shutdown paths are TSan- AND
+ASan/UBSan-clean; and `Spline Knots` grows unboundedly under zero pruning
+(hazard 4 / Phase 3.1 — expected, measured live here for the first time).
 
 ---
 
