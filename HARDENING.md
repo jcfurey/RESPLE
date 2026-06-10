@@ -1261,6 +1261,72 @@ Established before any tuning, as the reference to beat. RESPLE in LIO
   identity-pose publisher polluted a first attempt). `scripts/*.sh` now direct-
   exec + `pkill -x` on teardown.
 
+#### Known characteristic — real-time map deskew uses trailing-edge spline knots (aggressive-motion azimuth smear), 2026-06-10
+
+**Observation.** On HelmDyn01 the accumulated map (`/global_map`, and equally
+`/current_scan`) smears in **azimuth/yaw** under the dataset's violent
+helmet motion — in BOTH LO and LIO. The *trajectory* (converged poses) looks
+good and APE is 4.7 cm; it's the *map* that smears, and the live `odom→base`
+TF visibly jitters in yaw.
+
+**Ruled out (in order):**
+- *Timing / deskew offset* — the Mid360 IMU+LiDAR are hardware-synced;
+  `header.stamp == timebase`, `offset_time` clean 0–50 ms, and both the RESPLE
+  and Mapping paths compute `time_ns = frame_start + ms2ns(intensity)`
+  identically. `lidar_time_offset = 0` is correct; no static sweep helped and
+  no dynamic td estimation is warranted for a synced unit.
+- *Point budget* — `num_points_upd` 100→300 made no visible difference.
+- *IMU extrinsic `q_lb`* — `config_tudorun01.yaml` (same Mid360 rig, same
+  identity `q_lb`/`t_lb`) ships as **LIO and renders crisp**, and the IMU is
+  fused directly in the body frame (`Estimator.h:448`); `q_lb` only rotates
+  LiDAR *points* (`Estimator.h:485`), so a wrong `q_lb` would *tilt* the cloud,
+  not *smear* yaw.
+- *Our pipeline* — **TudoRun01 (same sensor, same config style, smoother
+  runner motion) renders crisp** in this exact container/pipeline. So the smear
+  is HelmDyn-specific, not systemic.
+
+**Root cause.** RESPLE is a recursive sliding-window estimator. The map
+(`mapIncremental`) and `/current_scan` are deskewed **at processing time using
+the spline's freshest, trailing-edge knot(s)** — which are the *least
+converged* (only the current scan + IMU constrain them; future scans haven't
+refined them yet). Under HelmDyn's fast yaw those edge knots jitter, so each
+scan is placed with a slightly-off yaw and the accumulation smears. The
+*trajectory* you see is the refined/converged estimate, so it stays smooth.
+This is the inherent **real-time-output vs. smoothed-estimate gap**; only
+extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
+
+**Mitigations and their trade-offs:**
+- **Map lag (preferred if needed).** Build/deskew the map from poses a few
+  knots *behind* the edge — i.e., after later scans have refined them — trading
+  a small output latency for crispness. The estimate is already good there
+  (4.7 cm); we'd just stop publishing the bleeding edge into the map.
+- **Faster knot convergence — POTENTIAL ISSUES (document before attempting).**
+  Trying to make the trailing knots converge sooner (more IEKF iterations,
+  larger point budget, or tighter orientation process/measurement noise so the
+  edge is pinned harder) is tempting but risky and fundamentally limited:
+  - **Fundamentally bounded.** The newest knot is *under-observed by
+    construction* — the measurements that would refine it (subsequent scans)
+    have not arrived. No amount of edge-tuning manufactures information that
+    isn't there yet; it can only reduce, not remove, the gap.
+  - **Stability risk.** Over-trusting an under-constrained edge knot (tighter
+    measurement weight / lower process noise) makes the filter fit noise on the
+    freshest, weakest-conditioned part of the window → orientation overshoot,
+    oscillation, and in the limit NIS divergence (the very failure mode the
+    Phase 3.3 detector guards). Tighter orientation process noise also fights
+    the IMU prior and reduces responsiveness to genuine fast motion — which can
+    *worsen* fast-yaw smear.
+  - **Compute / real-time cost.** More iterations or points per cycle raises
+    per-frame cost; the worker already backlogs on denser feeds (observed
+    `pc_buff` climbing on TudoRun at ~28 Hz). Falling behind real time makes
+    the trailing-edge problem *worse*, not better.
+  - **Net:** faster convergence is a tuning lever with diminishing returns and
+    real downside; map lag addresses the actual mechanism (use refined poses)
+    without destabilising the filter.
+- **Accept (current decision).** Position is accurate (4.7 cm) and the
+  deployment sensor is an **Ouster on a rover** — motion much closer to TudoRun
+  than to a head-worn helmet — so this edge-pose smear is unlikely to manifest
+  in production. HelmDyn is effectively a worst-case stress test.
+
 Goal: decide the production `plane_min_cond_ratio` (degeneracy guard,
 currently 0 = off) and sanity-check `nn_max_sq_dist` / `plane_fit_thresh`
 per sensor.
