@@ -11,6 +11,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Knot.msg"
   "msg/Calib.msg"
   "msg/Estimate.msg"
+  "msg/Diagnostics.msg"
+  "action/SaveMap.action"
+  "srv/RecordBag.srv"
   DEPENDENCIES std_msgs geometry_msgs
   LIBRARY_NAME ${PROJECT_NAME}
  )

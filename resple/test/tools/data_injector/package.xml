@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>data_injector</name>
+  <version>0.0.1</version>
+  <description>Synthetic PointCloud2 + IMU + static TF publisher to drive RESPLE's data path under sanitizers (test harness; not part of the repo).</description>
+  <maintainer email="dev@example.com">dev</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+</package>

@@ -1,9 +1,25 @@
 #pragma once
 
-#include "utils/common_utils.h"
+#include <iostream>
+#include "utils/eigen_utils.hpp"
 #include "utils/math_tools.h"
 #include "estimate_msgs/msg/spline.hpp"
 #include "estimate_msgs/msg/knot.hpp"
+
+// Log an invariant violation at most once per (file, line) to avoid spamming.
+// The default workspace build sets -DNDEBUG, which compiles out assert(),
+// meaning the code after a failed assert would silently execute with invalid
+// state (often an out-of-bounds vector access). These helpers replace the
+// asserts with a log + early return / safe fallback.
+#define RESPLE_LOG_INVARIANT_ONCE(msg)                                         \
+    do {                                                                       \
+        static bool _respleLogged = false;                                     \
+        if (!_respleLogged) {                                                  \
+            std::cerr << "[SplineState] invariant violated (" << __FILE__      \
+                      << ":" << __LINE__ << "): " << msg << std::endl;         \
+            _respleLogged = true;                                              \
+        }                                                                      \
+    } while (0)
 
 template <class MatT>
 struct JacobianStruct {
@@ -23,13 +39,25 @@ class SplineState
 
     SplineState() {};
 
-    void init(int64_t dt_ns_, int num_knot_, int64_t start_t_ns_, int start_i_ = 0, 
+    void init(int64_t dt_ns_, int num_knot_, int64_t start_t_ns_, int start_i_ = 0,
               Eigen::Vector3d t0 = Eigen::Vector3d::Zero(), Eigen::Quaterniond q0 = Eigen::Quaterniond::Identity())
     {
-        if_first = true;
+        if (dt_ns_ <= 0) {
+            std::cerr << "[SplineState] init() called with dt_ns=" << dt_ns_ << " (must be > 0), using dt_ns=1 as placeholder\n";
+            dt_ns_ = 1;
+        }
+        // Note: the historical `if_first` flag was set true here and never
+        // set false anywhere, making the !if_first branch in minTimeNs() dead
+        // code. The flag and its branch were removed; minTimeNs() now always
+        // returns start_t_ns. If a future change needs to extend the queryable
+        // range one knot before start_t_ns (the original intent), reintroduce
+        // the flag with a clear flip site (e.g., after the first
+        // addOneStateKnot call, or when num_knot exceeds the spline order).
         dt_ns = dt_ns_;
         start_t_ns = start_t_ns_;
         num_knot = num_knot_;
+        num_knots_pruned_ = 0;
+        last_start_idx_ = 0;
         inv_dt = 1e9 / dt_ns;
         start_i = start_i_;
         pow_inv_dt[0] = 1.0;
@@ -39,6 +67,13 @@ class SplineState
         t_idle = {t0, t0, t0};
         ort_delta_idle = {Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
         q_idle = {q0, q0, q0};
+        // A re-init (e.g. Mapping consuming a RESPLE respawn) must drop the
+        // previous run's knots: num_knot restarts at num_knot_ (all callers
+        // pass 0) while the deques would otherwise keep their old elements,
+        // so knot index i would silently read the PREVIOUS run's data.
+        t_knots.clear();
+        q_knots.clear();
+        ort_delta.clear();
     }
 
     void setTimeIntervalNs(int64_t t_ns)
@@ -54,15 +89,30 @@ class SplineState
     Eigen::Matrix<double, 24, 1> getRCPs()
     {
         Eigen::Matrix<double, 24, 1> RCPs;
+        // num_knot < 4 makes (num_knot - 4 + i) negative for i=0, OOB-reading
+        // the deque. Today num_knot is monotonically growing (no pruning yet),
+        // so steady-state safe — but Phase 3.1 sliding-window pruning would
+        // make this fire. Defensive zero return matches the IEKF's behaviour
+        // when state is unavailable; the IEKF then sees no change and the
+        // numerical-failure counter eventually trips.
+        if (num_knot < 4) {
+            RESPLE_LOG_INVARIANT_ONCE("getRCPs called with num_knot=" << num_knot << " < 4; returning zero");
+            RCPs.setZero();
+            return RCPs;
+        }
         for (int i = 0; i < 4; i++) {
             RCPs.block<3, 1>(i*6, 0) = t_knots[num_knot - 4 + i];
             RCPs.block<3, 1>(i*6+3, 0) = ort_delta[num_knot - 4 + i];
-        }      
+        }
         return RCPs;
     }
 
     void updateRCPs(const Eigen::Matrix<double, 24, 1>& cp)
     {
+        if (num_knot < 4) {
+            RESPLE_LOG_INVARIANT_ONCE("updateRCPs called with num_knot < 4 (need 4 active knots); skipping");
+            return;
+        }
         for (int i = 0; i < 4; i++) {
             t_knots[num_knot - 4 + i] = cp.block<3, 1>(i*6, 0);
             ort_delta[num_knot - 4 + i] = cp.block<3, 1>(i*6 + 3, 0);
@@ -70,10 +120,10 @@ class SplineState
             Quater::exp(ort_delta[num_knot - 4 + i], q_del);
             if (int(num_knot) - 4 + i > 0) {
                 q_knots[num_knot - 4 + i] = q_knots[num_knot - 5 + i] * q_del;
-            } else if (int(num_knot) - 4 + i == 0) {
-                q_knots[num_knot - 4 + i] = q_idle[2] * q_del;
             } else {
-                assert(false && "num_knot - 4 + i  < 0");
+                // int(num_knot) - 4 + i == 0 is the only remaining case given
+                // the guard above; the previous "< 0" branch is unreachable.
+                q_knots[num_knot - 4 + i] = q_idle[2] * q_del;
             }
         }
     }    
@@ -96,12 +146,19 @@ class SplineState
 
     void setIdles(int idx, const Eigen::Vector3d& t, const Eigen::Vector3d& ort_del, const Eigen::Quaterniond& q_idle0)
     {
+        if (idx < 0 || idx > 2) {
+            RESPLE_LOG_INVARIANT_ONCE("setIdles called with idx=" << idx << " outside [0,2]");
+            return;
+        }
         t_idle[idx] = t;
         ort_delta_idle[idx] = ort_del;
         Eigen::Quaterniond q_del;
-        Quater::exp(ort_del, q_del);        
+        Quater::exp(ort_del, q_del);
         if (idx == 2) {
-            assert(num_knot > 0);
+            if (num_knot == 0) {
+                RESPLE_LOG_INVARIANT_ONCE("setIdles(idx=2) requires num_knot>0; skipping q_knots[0] write");
+                return;
+            }
             q_knots[0] = q_idle[2] * q_del;
         } else if (idx == 1) {
             q_idle[2] = q_idle[1] * q_del;
@@ -109,10 +166,17 @@ class SplineState
             q_idle[0] = q_idle0;
             q_idle[1] = q_idle[0] * q_del;
         }
-    }    
+    }
 
     void setOneStateKnot(int i, const Eigen::Vector3d& pos, const Eigen::Vector3d& ort_del)
     {
+        // Guard against out-of-bounds knot index before touching any vector.
+        // With -DNDEBUG the old assert was a no-op, so the t_knots[i] /
+        // ort_delta[i] writes below were silently UB for i<0 or i>=num_knot.
+        if (i < 0 || static_cast<int64_t>(i) >= num_knot) {
+            RESPLE_LOG_INVARIANT_ONCE("setOneStateKnot i=" << i << " out of [0," << num_knot << ")");
+            return;
+        }
         t_knots[i] = pos;
 
         ort_delta[i] = ort_del;
@@ -120,33 +184,97 @@ class SplineState
         Quater::exp(ort_del, q_del);
         if (i > 0) {
             q_knots[i] = q_knots[i - 1] * q_del;
-        } else if (i == 0) {
-            q_knots[i] = q_idle[2] * q_del;
         } else {
-            assert(false && "i  < 0");
+            // i == 0 is the only remaining case given the bounds guard above.
+            q_knots[i] = q_idle[2] * q_del;
         }
-    }    
+    }
 
     void updateKnots(SplineState* other)
     {
         int64_t num_knots_other = other->numKnots();
-        Eigen::Quaterniond ref_ort_old;
-        Eigen::Vector3d ref_trans_old;
-        Eigen::Quaterniond ref_ort_new;
-        Eigen::Vector3d ref_trans_new;
-        if (num_knot <= num_knots_other) {
+        // The incoming idles describe the spline ORIGIN (knots -3..-1 of
+        // absolute index 0); they are only valid here while our knot 0 is
+        // still the absolute origin. After pruning, our idle slots hold the
+        // slid pre-window knots and must not be clobbered.
+        if (num_knots_pruned_ == 0 && num_knot <= num_knots_other) {
             q_idle = other->q_idle;
             ort_delta_idle = other->ort_delta_idle;
             t_idle = other->t_idle;
-        }        
+        }
         for (int64_t i = 0; i < num_knots_other; i++) {
-            if (i + other->start_i < num_knot) {
-                setOneStateKnot(i + other->start_i, other->t_knots[i], other->ort_delta[i]);
+            // other->start_i carries the sender's ABSOLUTE knot index (the
+            // est_window protocol); translate to this spline's deque index,
+            // which is offset by any front-pruning done locally (Phase 3.1).
+            const int64_t target = i + other->start_i - num_knots_pruned_;
+            if (target < 0) {
+                // Window overlaps knots this spline already pruned — stale
+                // content, nothing to update.
+                continue;
+            }
+            if (target < num_knot) {
+                setOneStateKnot(static_cast<int>(target), other->t_knots[i], other->ort_delta[i]);
             } else {
                 addOneStateKnot(other->t_knots[i], other->ort_delta[i]);
             }
         }
-    }    
+    }
+
+    // Phase 3.1 (HARDENING.md): sliding-window knot pruning.
+    //
+    // Drops the oldest knots so at most `keep_knots` remain in the deques and
+    // slides the 3-slot idle window forward to take their place. The idle
+    // knots act as the knots at indices -3..-1 relative to knot 0 (t_idle[j] /
+    // q_idle[j] hold the pose of knot j-3, ort_delta_idle[j] the delta
+    // arriving at it — the same convention prepareInterpolation / itpPose /
+    // itpQuaternion read them with), so after pruning K knots the old knots
+    // [K-3 .. K-1] become the new idles and interpolation over the RETAINED
+    // time range is bit-for-bit identical to the unpruned spline.
+    //
+    // minTimeNs() advances by K*dt_ns. Absolute knot indexing — totalKnots()
+    // and the getSplineMsg start_idx contract with the Mapping node — is
+    // preserved via num_knots_pruned_. Returns the number of knots pruned.
+    int64_t pruneFrontKnots(int64_t keep_knots)
+    {
+        // Hard floor: the IEKF's recursive window reads the last 4 knots
+        // (getRCPs/updateRCPs) and the est_window message the last 5; keep a
+        // margin beyond both so a misconfigured caller cannot starve them.
+        keep_knots = std::max<int64_t>(keep_knots, 8);
+        const int64_t prune = num_knot - keep_knots;
+        if (prune <= 0) {
+            return 0;
+        }
+        // New idle slot j holds the knot at (new) index j-3 == old index
+        // prune-3+j: an old regular knot when that is >= 0, otherwise the old
+        // idle slot it maps to (only reachable for prune < 3).
+        std::array<Eigen::Vector3d, 3> t_idle_new;
+        std::array<Eigen::Vector3d, 3> ort_idle_new;
+        std::array<Eigen::Quaterniond, 3> q_idle_new;
+        for (int j = 0; j < 3; j++) {
+            const int64_t src = prune - 3 + j;
+            if (src >= 0) {
+                t_idle_new[j] = t_knots[src];
+                ort_idle_new[j] = ort_delta[src];
+                q_idle_new[j] = q_knots[src];
+            } else {
+                t_idle_new[j] = t_idle[3 + src];
+                ort_idle_new[j] = ort_delta_idle[3 + src];
+                q_idle_new[j] = q_idle[3 + src];
+            }
+        }
+        for (int j = 0; j < 3; j++) {
+            t_idle[j] = t_idle_new[j];
+            ort_delta_idle[j] = ort_idle_new[j];
+            q_idle[j] = q_idle_new[j];
+        }
+        t_knots.erase(t_knots.begin(), t_knots.begin() + prune);
+        q_knots.erase(q_knots.begin(), q_knots.begin() + prune);
+        ort_delta.erase(ort_delta.begin(), ort_delta.begin() + prune);
+        num_knot -= prune;
+        num_knots_pruned_ += prune;
+        start_t_ns += prune * dt_ns;
+        return prune;
+    }
 
     int64_t getKnotTimeNs(size_t i) const
     {
@@ -183,12 +311,30 @@ class SplineState
 
     int64_t minTimeNs() const
     {
-        return start_t_ns + dt_ns * (!if_first ?  -1 : 0);
+        // Was: start_t_ns + dt_ns * (!if_first ? -1 : 0)
+        // The `if_first` flag was always true (set in init(), never cleared
+        // anywhere). The negative-offset branch was dead. See init() for the
+        // rationale and the path to restore the original-intent behaviour.
+        return start_t_ns;
     }
 
     int64_t numKnots() const
     {
         return num_knot;
+    }
+
+    // Knots currently held PLUS knots dropped by pruneFrontKnots — i.e. the
+    // monotonic count addOneStateKnot has produced since init(). This is the
+    // index space the est_window protocol (getSplineMsg start_idx /
+    // updateKnots start_i) is expressed in.
+    int64_t totalKnots() const
+    {
+        return num_knot + num_knots_pruned_;
+    }
+
+    int64_t numKnotsPruned() const
+    {
+        return num_knots_pruned_;
     }
 
     template <int Derivative = 0>
@@ -220,7 +366,16 @@ class SplineState
         } else if (idx_r == 1) {
             cp0 = q_idle[0];
         } else {
-            assert(false);
+            // idx_r < 1 means prepareInterpolation returned a window before
+            // the first idle knot — caller queried outside the spline support.
+            // Fall back to identity and short-circuit so callers don't act on
+            // uninitialized q_out / w_out. (Previously an NDEBUG no-op assert.)
+            RESPLE_LOG_INVARIANT_ONCE("itpQuaternion idx_r=" << idx_r << " out of range; returning identity");
+            if (q_out) *q_out = Eigen::Quaterniond::Identity();
+            if (w_out) *w_out = Eigen::Vector3d::Zero();
+            if (J_q) { J_q->d_val_d_knot.clear(); J_q->start_idx = 0; }
+            if (J_w) { J_w->d_val_d_knot.clear(); J_w->start_idx = 0; }
+            return;
         }
 
         Eigen::Vector3d t_delta_scale[4];
@@ -321,14 +476,168 @@ class SplineState
         }
     }  
 
-    void getSplineMsg(estimate_msgs::msg::Spline& spline_msg, const int start_i)
+    // Combined position + quaternion interpolation at the same time.
+    // Shares prepareInterpolation and baseCoeffsWithTime work between the two.
+    // Used in prepLiDAR's hot path (one call per measurement per IEKF iteration).
+    void itpPose(int64_t t_ns,
+                 Eigen::Vector3d* p_out, Jacobian* J_p,
+                 Eigen::Quaterniond* q_out, Jacobian43* J_q) const
     {
-        static int last_start_idx = 0;
+        // Defensive clamp: callers should not query outside [minTimeNs, maxTimeNs],
+        // but if t_ns overshoots maxTimeNs() then idx_l > num_knot-2, and
+        // t_knots[idx0 + i] / ort_delta[idx0 + i] / q_knots[idx0-1] below
+        // OOB-read the deque → SIGSEGV. Clamping here yields a degraded but
+        // numerically defined boundary evaluation. Association::pointBodyToWorld
+        // is the primary upstream clamp; this one is belt-and-braces.
+        const int64_t t_min = minTimeNs();
+        const int64_t t_max = maxTimeNs();
+        if (t_ns < t_min || t_ns > t_max) {
+            RESPLE_LOG_INVARIANT_ONCE("itpPose t_ns=" << t_ns << " outside ["
+                << t_min << "," << t_max << "] (num_knot=" << num_knot
+                << "); clamping to spline range");
+            t_ns = std::max(t_min, std::min(t_max, t_ns));
+        }
+        int64_t t_ns_rel = t_ns - start_t_ns;
+        int idx_l = floor(double(t_ns_rel) / double(dt_ns));
+        int idx_r = idx_l + 1;
+        int64_t idx0 = std::max(idx_l - 2, 0);
+        double u = (t_ns - start_t_ns - idx_l * dt_ns) / double(dt_ns);
+
+        Eigen::Vector4d p;
+        baseCoeffsWithTime<0>(p, u);
+        const int size_J = std::min(idx_r + 1, 4);
+        const int idx_window = std::max(0, 2 - idx_l);
+        // Cap n_active against the deque size (mirrors prepareInterpolation's
+        // n_active_safe). The entry clamp already bounds t_ns, but this defends
+        // the t_knots / ort_delta reads below if a future knot-prune shrinks the
+        // deque under a stale idx0. All three knot deques have size == num_knot.
+        const int n_active = std::min<int>(std::min(idx_l + 2, 4),
+            std::max<int>(0, static_cast<int>(t_knots.size()) - static_cast<int>(idx0)));
+
+        // Position interpolation
+        if (p_out || J_p) {
+            std::array<Eigen::Vector3d, 4> cps;
+            for (int i = 0; i < 2 - idx_l; i++) cps[i] = t_idle[i + idx_l + 1];
+            for (int i = 0; i < n_active; i++) cps[i + idx_window] = t_knots[idx0 + i];
+
+            Eigen::Vector4d coeff_p = blending_matrix * p;
+            if (p_out) {
+                *p_out = coeff_p[0]*cps[0] + coeff_p[1]*cps[1] + coeff_p[2]*cps[2] + coeff_p[3]*cps[3];
+            }
+            if (J_p) {
+                J_p->d_val_d_knot.resize(size_J);
+                for (int i = 0; i < size_J; i++) J_p->d_val_d_knot[i] = coeff_p[4 - size_J + i];
+                J_p->start_idx = idx0;
+            }
+        }
+
+        // Quaternion interpolation (shares u, p, idx0, idx_r with above)
+        if (q_out || J_q) {
+            std::array<Eigen::Vector3d, 4> t_delta;
+            for (int i = 0; i < 2 - idx_l; i++) t_delta[i] = ort_delta_idle[i + idx_l + 1];
+            for (int i = 0; i < n_active; i++) t_delta[i + idx_window] = ort_delta[idx0 + i];
+
+            Eigen::Vector4d coeff = cumulative_blending_matrix * p;
+
+            Eigen::Quaterniond cp0;
+            if (idx_r > 3) {
+                // Guard the q_knots[idx0-1] read (same deque-shrink rationale as
+                // the n_active cap above): fall back to identity if out of range.
+                const int64_t cp0_idx = idx0 - 1;
+                if (cp0_idx < 0 || cp0_idx >= static_cast<int64_t>(q_knots.size())) {
+                    RESPLE_LOG_INVARIANT_ONCE("itpPose q_knots[idx0-1] idx=" << cp0_idx
+                        << " out of range; returning identity quaternion");
+                    if (q_out) *q_out = Eigen::Quaterniond::Identity();
+                    if (J_q) { J_q->d_val_d_knot.clear(); J_q->start_idx = 0; }
+                    return;
+                }
+                cp0 = q_knots[cp0_idx];
+            }
+            else if (idx_r == 3) cp0 = q_idle[2];
+            else if (idx_r == 2) cp0 = q_idle[1];
+            else if (idx_r == 1) cp0 = q_idle[0];
+            else {
+                // Query before the first idle knot — return identity and zero
+                // Jacobian rather than leaving q_out / J_q garbage.
+                RESPLE_LOG_INVARIANT_ONCE("itpPose idx_r=" << idx_r << " out of range; returning identity quaternion");
+                if (q_out) *q_out = Eigen::Quaterniond::Identity();
+                if (J_q) { J_q->d_val_d_knot.clear(); J_q->start_idx = 0; }
+                return;
+            }
+
+            Eigen::Vector3d t_delta_scale[4];
+            Eigen::Quaterniond q_delta_scale[4];
+            t_delta_scale[0] = t_delta[0] * coeff[0];
+            t_delta_scale[1] = t_delta[1] * coeff[1];
+            t_delta_scale[2] = t_delta[2] * coeff[2];
+            t_delta_scale[3] = t_delta[3] * coeff[3];
+
+            if (J_q) {
+                Eigen::Matrix<double, 4, 3> dexp_dt[4];
+                Quater::dexp(t_delta_scale[0], q_delta_scale[0], dexp_dt[0]);
+                Quater::dexp(t_delta_scale[1], q_delta_scale[1], dexp_dt[1]);
+                Quater::dexp(t_delta_scale[2], q_delta_scale[2], dexp_dt[2]);
+                Quater::dexp(t_delta_scale[3], q_delta_scale[3], dexp_dt[3]);
+                Eigen::Quaterniond q_r_all[4];
+                q_r_all[3] = Eigen::Quaterniond::Identity();
+                for (int i = 2; i >= 0; i--) q_r_all[i] = q_delta_scale[i+1] * q_r_all[i+1];
+
+                Eigen::Quaterniond q_itps[4];
+                q_itps[0] = cp0 * q_delta_scale[0];
+                q_itps[1] = q_itps[0] * q_delta_scale[1];
+                q_itps[2] = q_itps[1] * q_delta_scale[2];
+                q_itps[3] = q_itps[2] * q_delta_scale[3];
+                q_itps[3].normalize();
+                if (q_out) *q_out = q_itps[3];
+
+                Eigen::Matrix4d Q_l_all[4];
+                Quater::Qleft(cp0, Q_l_all[0]);
+                Quater::Qleft(q_itps[0], Q_l_all[1]);
+                Quater::Qleft(q_itps[1], Q_l_all[2]);
+                Quater::Qleft(q_itps[2], Q_l_all[3]);
+                J_q->d_val_d_knot.resize(size_J);
+                J_q->start_idx = idx0;
+                for (int i = size_J - 1; i >= 0; i--) {
+                    Eigen::Matrix4d Q_r_all;
+                    Quater::Qright(q_r_all[i], Q_r_all);
+                    J_q->d_val_d_knot[i].noalias() = coeff[i] * Q_r_all * Q_l_all[i] * dexp_dt[i];
+                }
+            } else {
+                Quater::exp(t_delta_scale[0], q_delta_scale[0]);
+                Quater::exp(t_delta_scale[1], q_delta_scale[1]);
+                Quater::exp(t_delta_scale[2], q_delta_scale[2]);
+                Quater::exp(t_delta_scale[3], q_delta_scale[3]);
+                Eigen::Quaterniond q_itp = cp0 * q_delta_scale[0] * q_delta_scale[1]
+                                              * q_delta_scale[2] * q_delta_scale[3];
+                q_itp.normalize();
+                *q_out = q_itp;
+            }
+        }
+    }
+
+    void getSplineMsg(estimate_msgs::msg::Spline& spline_msg, const int64_t start_idx_hint)
+    {
         spline_msg.dt = dt_ns;
-        int sidx = std::min(std::max((int)(num_knot - 5), 0), start_i);
-        spline_msg.start_idx = std::min(sidx, last_start_idx+1);
-        spline_msg.start_t = getKnotTimeNs(num_knot - 5);
-        for (size_t i = spline_msg.start_idx; i < (size_t) num_knot; i++) {
+        // All indices in the message are ABSOLUTE (totalKnots() space) so the
+        // receiver's window bookkeeping survives sender-side pruning; the
+        // deque is addressed via (absolute - num_knots_pruned_).
+        const int64_t total = totalKnots();
+        int64_t sidx = std::min(std::max<int64_t>(total - 5, 0), start_idx_hint);
+        int64_t start_idx = std::min(sidx, last_start_idx_ + 1);
+        if (start_idx < num_knots_pruned_) {
+            // The publish-then-prune ordering (and the >=8 retention floor)
+            // keeps published windows ahead of pruning; clamp defensively so
+            // the loop below cannot index before the first retained knot.
+            RESPLE_LOG_INVARIANT_ONCE("getSplineMsg start_idx=" << start_idx
+                << " precedes first retained knot " << num_knots_pruned_
+                << "; clamping (window content lost to pruning)");
+            start_idx = num_knots_pruned_;
+        }
+        spline_msg.start_idx = start_idx;
+        // Time of absolute knot total-5 == local knot num_knot-5 (guarded for
+        // the first cycles, where num_knot can still be < 5).
+        spline_msg.start_t = getKnotTimeNs(std::max<int64_t>(num_knot - 5, 0));
+        for (int64_t i = start_idx - num_knots_pruned_; i < num_knot; i++) {
             estimate_msgs::msg::Knot knot_msg;
             knot_msg.position.x = t_knots[i].x();
             knot_msg.position.y = t_knots[i].y();
@@ -352,19 +661,18 @@ class SplineState
         spline_msg.start_q.x = q_idle[0].x();
         spline_msg.start_q.y = q_idle[0].y();
         spline_msg.start_q.z = q_idle[0].z();        
-        if (num_knot < 5) {
+        if (total < 5) {
             spline_msg.start_idx = 0;
 
-        } 
-        last_start_idx = std::max((int)spline_msg.start_idx, (int)(num_knot - 5));
+        }
+        last_start_idx_ = std::max<int64_t>(spline_msg.start_idx, total - 5);
 
-    }    
+    }
 
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
   private:
 
-    bool if_first;
     static const Eigen::Matrix4d blending_matrix;
     static const Eigen::Matrix4d base_coefficients;
     static const Eigen::Matrix4d cumulative_blending_matrix;
@@ -372,9 +680,14 @@ class SplineState
     int64_t dt_ns;
     double inv_dt;
     std::array<double, 4> pow_inv_dt;
-    int64_t num_knot;
+    int64_t num_knot = 0;  // 0 until init(); a default-constructed spline reports no knots
+    // Knots dropped from the FRONT of the deques by pruneFrontKnots (Phase
+    // 3.1). Deque index = absolute index - num_knots_pruned_; start_t_ns is
+    // advanced in lock-step so time-based lookups need no translation.
+    int64_t num_knots_pruned_ = 0;
     int64_t start_i;
     int64_t start_t_ns;
+    int64_t last_start_idx_ = 0;
 
     std::array<Eigen::Vector3d, 3> t_idle;
     std::array<Eigen::Vector3d, 3> ort_delta_idle;
@@ -413,6 +726,17 @@ class SplineState
                               const Eigen::aligned_deque<_KnotT>& knots, int64_t& idx0, double& u,
                               std::array<_KnotT,4>& cps, int& idx_r) const
     {
+        // Defensive clamp (mirrors itpPose). Without this, an out-of-range
+        // t_ns lets idx_l + 2 exceed num_knot, OOB-reading the deque at
+        // knots[idx0 + i]. Clamping yields a boundary evaluation instead.
+        const int64_t t_min = minTimeNs();
+        const int64_t t_max = maxTimeNs();
+        if (t_ns < t_min || t_ns > t_max) {
+            RESPLE_LOG_INVARIANT_ONCE("prepareInterpolation t_ns=" << t_ns << " outside ["
+                << t_min << "," << t_max << "] (num_knot=" << num_knot
+                << "); clamping to spline range");
+            t_ns = std::max(t_min, std::min(t_max, t_ns));
+        }
         int64_t t_ns_rel = t_ns - start_t_ns;
         int idx_l = floor(double(t_ns_rel) / double(dt_ns));
         idx_r = idx_l + 1;
@@ -422,7 +746,13 @@ class SplineState
             cps[i] = knots_idle[i + idx_l + 1];
         }
         int idx_window = std::max(0, 2 - idx_l);
-        for (int i = 0; i < std::min(idx_l + 2, 4); i++) {
+        // Defensive: cap n_active so idx0 + i cannot exceed num_knot, in case
+        // the upstream clamp is bypassed (e.g. by a future caller that holds
+        // a stale t_ns across a deque shrink). knots.size() == num_knot.
+        const int n_active_safe =
+            std::min<int>(std::min(idx_l + 2, 4),
+                          std::max<int>(0, static_cast<int>(knots.size()) - static_cast<int>(idx0)));
+        for (int i = 0; i < n_active_safe; i++) {
             cps[i + idx_window] = knots[idx0 + i];
         }
         u = (t_ns - start_t_ns - idx_l * dt_ns) / double(dt_ns);
@@ -498,6 +828,6 @@ class SplineState
     }
 };
 
-const Eigen::Matrix4d SplineState::base_coefficients = SplineState::computeBaseCoefficients();
-const Eigen::Matrix4d SplineState::blending_matrix = SplineState::computeBlendingMatrix();
-const Eigen::Matrix4d SplineState::cumulative_blending_matrix = SplineState::computeBlendingMatrix<true>();
+inline const Eigen::Matrix4d SplineState::base_coefficients = SplineState::computeBaseCoefficients();
+inline const Eigen::Matrix4d SplineState::blending_matrix = SplineState::computeBlendingMatrix();
+inline const Eigen::Matrix4d SplineState::cumulative_blending_matrix = SplineState::computeBlendingMatrix<true>();

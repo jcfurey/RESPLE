@@ -6,6 +6,24 @@ Author: Yixi Cai
 email: yixicai@connect.hku.hk
 */
 
+// HARDENING Phase 2.5 #1: RAII whole-operation lock for the public mutators.
+// working_flag_mutex is recursive (see start_thread), so the internal
+// boundary acquisitions nest safely. Lock order stays consistent with the
+// rebuild thread (working_flag -> search_rw / rebuild_logger / per-node
+// push_down locks); Rebuild() only TRYlocks rebuild_ptr_mutex_lock, so the
+// opposite-order pairing with multi_thread_rebuild cannot deadlock — a
+// contended trylock just defers the rebuild request to a later mutation.
+namespace {
+struct ScopedPthreadLock
+{
+    pthread_mutex_t* m_;
+    explicit ScopedPthreadLock(pthread_mutex_t* m) : m_(m) { pthread_mutex_lock(m_); }
+    ~ScopedPthreadLock() { pthread_mutex_unlock(m_); }
+    ScopedPthreadLock(const ScopedPthreadLock&) = delete;
+    ScopedPthreadLock& operator=(const ScopedPthreadLock&) = delete;
+};
+}  // namespace
+
 template <typename PointType>
 KD_TREE<PointType>::KD_TREE(float delete_param, float balance_param, float box_length)
 {
@@ -23,6 +41,15 @@ KD_TREE<PointType>::~KD_TREE()
     stop_thread();
     Delete_Storage_Disabled = true;
     delete_tree_nodes(&Root_Node);
+    // Build() allocates STATIC_ROOT_NODE separately (Root_Node is its left
+    // son, freed above) but upstream never released it — a 1-node leak per
+    // Build()/instance, flagged by the Phase 5 LeakSanitizer CI job.
+    if (STATIC_ROOT_NODE != nullptr)
+    {
+        pthread_mutex_destroy(&(STATIC_ROOT_NODE->push_down_mutex_lock));
+        delete STATIC_ROOT_NODE;
+        STATIC_ROOT_NODE = nullptr;
+    }
     PointVector().swap(PCL_Storage);
     Rebuild_Logger.clear();
 }
@@ -69,31 +96,16 @@ void KD_TREE<PointType>::InitTreeNode(KD_TREE_NODE *root)
 template <typename PointType>
 int KD_TREE<PointType>::size()
 {
-    int s = 0;
-    if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
-    {
-        if (Root_Node != nullptr)
-        {
-            return Root_Node->TreeSize;
-        }
-        else
-        {
-            return 0;
-        }
-    }
-    else
-    {
-        if (!pthread_mutex_trylock(&working_flag_mutex))
-        {
-            s = Root_Node->TreeSize;
-            pthread_mutex_unlock(&working_flag_mutex);
-            return s;
-        }
-        else
-        {
-            return Treesize_tmp;
-        }
-    }
+    // HARDENING Phase 6.1: take search_rw_mutex_ shared, exactly like the search
+    // functions (K1 / Phase 1.5). The old lock-free fast-path read the
+    // non-atomic Root_Node pointer while the background rebuild thread swapped it
+    // (multi_thread_rebuild → search_rw_mutex_ unique at ~259/293), and the
+    // trylock branch read Root_Node->TreeSize without excluding that swap → TSan
+    // data race on the global ikdtree (size() vs Rebuild / multi_thread_rebuild,
+    // surfaced by the §6.1 LIO bag replay). The shared lock is uncontended
+    // except during the rebuild's brief unique-locked swap. TreeSize is atomic.
+    std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+    return Root_Node != nullptr ? Root_Node->TreeSize.load() : 0;
 }
 
 template <typename PointType>
@@ -196,10 +208,20 @@ void KD_TREE<PointType>::start_thread()
     pthread_mutex_init(&rebuild_ptr_mutex_lock, NULL);
     pthread_mutex_init(&rebuild_logger_mutex_lock, NULL);
     pthread_mutex_init(&points_deleted_rebuild_mutex_lock, NULL);
-    pthread_mutex_init(&working_flag_mutex, NULL);
-    pthread_mutex_init(&search_flag_mutex, NULL);
+    // HARDENING Phase 2.5 #1: working_flag_mutex is RECURSIVE so the public
+    // mutators (Add_Points / Add_Point_Boxes / Delete_Points /
+    // Delete_Point_Boxes) can hold it across their WHOLE operation while
+    // their internals re-acquire it at rebuild boundaries (the upstream
+    // handshake). This gives the mutator and the rebuild thread mutual
+    // exclusion over the shared ancestor region (father_ptr / range / alpha
+    // pull-up writes vs the rebuild's father_ptr read + swap ancestor walk)
+    // that previously raced with no common lock.
+    pthread_mutexattr_t wf_attr;
+    pthread_mutexattr_init(&wf_attr);
+    pthread_mutexattr_settype(&wf_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&working_flag_mutex, &wf_attr);
+    pthread_mutexattr_destroy(&wf_attr);
     pthread_create(&rebuild_thread, NULL, multi_thread_ptr, (void *)this);
-    printf("Multi thread started \n");
 }
 
 template <typename PointType>
@@ -215,7 +237,6 @@ void KD_TREE<PointType>::stop_thread()
     pthread_mutex_destroy(&rebuild_ptr_mutex_lock);
     pthread_mutex_destroy(&points_deleted_rebuild_mutex_lock);
     pthread_mutex_destroy(&working_flag_mutex);
-    pthread_mutex_destroy(&search_flag_mutex);
 }
 
 template <typename PointType>
@@ -244,7 +265,7 @@ void KD_TREE<PointType>::multi_thread_rebuild()
             /* Traverse and copy */
             if (!Rebuild_Logger.empty())
             {
-                printf("\n\n\n\n\n\n\n\n\n\n\n ERROR!!! \n\n\n\n\n\n\n\n\n");
+                fprintf(stderr, "[ikd-Tree] rebuild logger non-empty when Rebuild_Ptr set — concurrency invariant violated\n");
             }
             rebuild_flag = true;
             if (*Rebuild_Ptr == Root_Node)
@@ -257,25 +278,12 @@ void KD_TREE<PointType>::multi_thread_rebuild()
             KD_TREE_NODE *old_root_node = (*Rebuild_Ptr);
             father_ptr = (*Rebuild_Ptr)->father_ptr;
             PointVector().swap(Rebuild_PCL_Storage);
-            // Lock Search
-            pthread_mutex_lock(&search_flag_mutex);
-            while (search_mutex_counter != 0)
             {
-                pthread_mutex_unlock(&search_flag_mutex);
-                usleep(1);
-                pthread_mutex_lock(&search_flag_mutex);
+                std::unique_lock<std::shared_mutex> wlock(search_rw_mutex_);
+                pthread_mutex_lock(&points_deleted_rebuild_mutex_lock);
+                flatten(*Rebuild_Ptr, Rebuild_PCL_Storage, MULTI_THREAD_REC);
+                pthread_mutex_unlock(&points_deleted_rebuild_mutex_lock);
             }
-            search_mutex_counter = -1;
-            pthread_mutex_unlock(&search_flag_mutex);
-            // Lock deleted points cache
-            pthread_mutex_lock(&points_deleted_rebuild_mutex_lock);
-            flatten(*Rebuild_Ptr, Rebuild_PCL_Storage, MULTI_THREAD_REC);
-            // Unlock deleted points cache
-            pthread_mutex_unlock(&points_deleted_rebuild_mutex_lock);
-            // Unlock Search
-            pthread_mutex_lock(&search_flag_mutex);
-            search_mutex_counter = 0;
-            pthread_mutex_unlock(&search_flag_mutex);
             pthread_mutex_unlock(&working_flag_mutex);
             /* Rebuild and update missed operations*/
             Operation_Logger_Type Operation;
@@ -304,50 +312,38 @@ void KD_TREE<PointType>::multi_thread_rebuild()
                 pthread_mutex_unlock(&rebuild_logger_mutex_lock);
             }
             /* Replace to original tree*/
-            // pthread_mutex_lock(&working_flag_mutex);
-            pthread_mutex_lock(&search_flag_mutex);
-            while (search_mutex_counter != 0)
             {
-                pthread_mutex_unlock(&search_flag_mutex);
-                usleep(1);
-                pthread_mutex_lock(&search_flag_mutex);
+                std::unique_lock<std::shared_mutex> wlock(search_rw_mutex_);
+                if (father_ptr->left_son_ptr == *Rebuild_Ptr)
+                {
+                    father_ptr->left_son_ptr = new_root_node;
+                }
+                else if (father_ptr->right_son_ptr == *Rebuild_Ptr)
+                {
+                    father_ptr->right_son_ptr = new_root_node;
+                }
+                else
+                {
+                    throw "Error: Father ptr incompatible with current node\n";
+                }
+                if (new_root_node != nullptr)
+                    new_root_node->father_ptr = father_ptr;
+                (*Rebuild_Ptr) = new_root_node;
+                if (father_ptr == STATIC_ROOT_NODE)
+                    Root_Node = STATIC_ROOT_NODE->left_son_ptr;
+                KD_TREE_NODE *update_root = *Rebuild_Ptr;
+                while (update_root != nullptr && update_root != Root_Node)
+                {
+                    update_root = update_root->father_ptr;
+                    if (update_root->working_flag)
+                        break;
+                    if (update_root == update_root->father_ptr->left_son_ptr && update_root->father_ptr->need_push_down_to_left)
+                        break;
+                    if (update_root == update_root->father_ptr->right_son_ptr && update_root->father_ptr->need_push_down_to_right)
+                        break;
+                    Update(update_root);
+                }
             }
-            search_mutex_counter = -1;
-            pthread_mutex_unlock(&search_flag_mutex);
-            if (father_ptr->left_son_ptr == *Rebuild_Ptr)
-            {
-                father_ptr->left_son_ptr = new_root_node;
-            }
-            else if (father_ptr->right_son_ptr == *Rebuild_Ptr)
-            {
-                father_ptr->right_son_ptr = new_root_node;
-            }
-            else
-            {
-                throw "Error: Father ptr incompatible with current node\n";
-            }
-            if (new_root_node != nullptr)
-                new_root_node->father_ptr = father_ptr;
-            (*Rebuild_Ptr) = new_root_node;
-            // int valid_old = old_root_node->TreeSize - old_root_node->invalid_point_num;
-            // int valid_new = new_root_node->TreeSize - new_root_node->invalid_point_num;
-            if (father_ptr == STATIC_ROOT_NODE)
-                Root_Node = STATIC_ROOT_NODE->left_son_ptr;
-            KD_TREE_NODE *update_root = *Rebuild_Ptr;
-            while (update_root != nullptr && update_root != Root_Node)
-            {
-                update_root = update_root->father_ptr;
-                if (update_root->working_flag)
-                    break;
-                if (update_root == update_root->father_ptr->left_son_ptr && update_root->father_ptr->need_push_down_to_left)
-                    break;
-                if (update_root == update_root->father_ptr->right_son_ptr && update_root->father_ptr->need_push_down_to_right)
-                    break;
-                Update(update_root);
-            }
-            pthread_mutex_lock(&search_flag_mutex);
-            search_mutex_counter = 0;
-            pthread_mutex_unlock(&search_flag_mutex);
             Rebuild_Ptr = nullptr;
             pthread_mutex_unlock(&working_flag_mutex);
             rebuild_flag = false;
@@ -364,7 +360,6 @@ void KD_TREE<PointType>::multi_thread_rebuild()
         pthread_mutex_unlock(&termination_flag_mutex_lock);
         usleep(100);
     }
-    printf("Rebuild thread terminated normally\n");
 }
 
 template <typename PointType>
@@ -388,18 +383,27 @@ void KD_TREE<PointType>::run_operation(KD_TREE_NODE **root, Operation_Logger_Typ
         Delete_by_range(root, operation.boxpoint, false, true);
         break;
     case PUSH_DOWN:
-        (*root)->tree_downsample_deleted |= operation.tree_downsample_deleted;
-        (*root)->point_downsample_deleted |= operation.tree_downsample_deleted;
+        // Phase 2.4: deletion-propagation fields (incl. the need_push_down_to_*
+        // SET) are written only while holding the node's push_down_mutex_lock.
+        // This runs on the private rebuild tree (uncontended), but the lock
+        // keeps the write-side contract uniform across all mutator sites.
+        pthread_mutex_lock(&((*root)->push_down_mutex_lock));
+        if (operation.tree_downsample_deleted)
+        {
+            (*root)->tree_downsample_deleted = true;
+            (*root)->point_downsample_deleted = true;
+        }
         (*root)->tree_deleted = operation.tree_deleted || (*root)->tree_downsample_deleted;
         (*root)->point_deleted = (*root)->tree_deleted || (*root)->point_downsample_deleted;
         if (operation.tree_downsample_deleted)
-            (*root)->down_del_num = (*root)->TreeSize;
+            (*root)->down_del_num = (*root)->TreeSize.load();
         if (operation.tree_deleted)
-            (*root)->invalid_point_num = (*root)->TreeSize;
+            (*root)->invalid_point_num = (*root)->TreeSize.load();
         else
-            (*root)->invalid_point_num = (*root)->down_del_num;
+            (*root)->invalid_point_num = (*root)->down_del_num.load();
         (*root)->need_push_down_to_left = true;
         (*root)->need_push_down_to_right = true;
+        pthread_mutex_unlock(&((*root)->push_down_mutex_lock));
         break;
     default:
         break;
@@ -412,6 +416,14 @@ void KD_TREE<PointType>::Build(PointVector point_cloud)
     if (Root_Node != nullptr)
     {
         delete_tree_nodes(&Root_Node);
+    }
+    // Same leak shape as the destructor fix: a re-Build() would otherwise
+    // orphan the previous STATIC_ROOT_NODE (Root_Node above is its left son).
+    if (STATIC_ROOT_NODE != nullptr)
+    {
+        pthread_mutex_destroy(&(STATIC_ROOT_NODE->push_down_mutex_lock));
+        delete STATIC_ROOT_NODE;
+        STATIC_ROOT_NODE = nullptr;
     }
     if (point_cloud.size() == 0)
         return;
@@ -428,34 +440,25 @@ void KD_TREE<PointType>::Nearest_Search(PointType point, int k_nearest, PointVec
 {
     MANUAL_HEAP q(2 * k_nearest);
     q.clear();
-    vector<float>().swap(Point_Distance);
-    if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
+    // Always take search_rw_mutex_ shared. The previous fast-path checked
+    // `Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node` lock-free, but the
+    // background rebuild thread can NULL Rebuild_Ptr and swap a subtree
+    // (multi_thread_rebuild → unique_lock at lines 259/293) at any instant —
+    // a Search that started after the racy check sees freed nodes → UAF →
+    // SIGSEGV. The shared lock is uncontended unless the rebuild thread is
+    // actively holding the unique lock (only briefly during the swap), so
+    // this costs a relaxed atomic increment per call. Worth it.
     {
+        std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
         Search(Root_Node, k_nearest, point, q, max_dist);
-    }
-    else
-    {
-        pthread_mutex_lock(&search_flag_mutex);
-        while (search_mutex_counter == -1)
-        {
-            pthread_mutex_unlock(&search_flag_mutex);
-            usleep(1);
-            pthread_mutex_lock(&search_flag_mutex);
-        }
-        search_mutex_counter += 1;
-        pthread_mutex_unlock(&search_flag_mutex);
-        Search(Root_Node, k_nearest, point, q, max_dist);
-        pthread_mutex_lock(&search_flag_mutex);
-        search_mutex_counter -= 1;
-        pthread_mutex_unlock(&search_flag_mutex);
     }
     int k_found = min(k_nearest, int(q.size()));
-    PointVector().swap(Nearest_Points);
-    vector<float>().swap(Point_Distance);
-    for (int i = 0; i < k_found; i++)
+    Nearest_Points.resize(k_found);
+    Point_Distance.resize(k_found);
+    for (int i = k_found - 1; i >= 0; i--)
     {
-        Nearest_Points.insert(Nearest_Points.begin(), q.top().point);
-        Point_Distance.insert(Point_Distance.begin(), q.top().dist);
+        Nearest_Points[i] = q.top().point;
+        Point_Distance[i] = q.top().dist;
         q.pop();
     }
     return;
@@ -465,6 +468,12 @@ template <typename PointType>
 void KD_TREE<PointType>::Box_Search(const BoxPointType &Box_of_Point, PointVector &Storage)
 {
     Storage.clear();
+    // Same UAF race as Nearest_Search (Phase 1.5 K1): the rebuild thread can
+    // free old subtree nodes via delete_tree_nodes() while we recurse through
+    // them. Always take search_rw_mutex_ shared. Cost: one uncontended atomic
+    // increment per call; rebuild thread only contends briefly during its
+    // unique-locked subtree swap.
+    std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
     Search_by_range(Root_Node, Box_of_Point, Storage);
 }
 
@@ -472,14 +481,37 @@ template <typename PointType>
 void KD_TREE<PointType>::Radius_Search(PointType point, const float radius, PointVector &Storage)
 {
     Storage.clear();
+    // Same race / fix as Box_Search above.
+    std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
     Search_by_radius(Root_Node, point, radius, Storage);
 }
 
 template <typename PointType>
 int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
 {
-    // int NewPointSize = PointToAdd.size();
-    // int tree_size = size();
+    // Phase 2.5 #1: exclude the rebuild thread's ancestor reads/writes for
+    // the whole operation (see ScopedPthreadLock comment at the top of file).
+    ScopedPthreadLock whole_op_lock(&working_flag_mutex);
+    // Lock discipline (Phase 1.5 K1, corrected in Phase 2.5).
+    //
+    // The rebuild thread holds working_flag_mutex while taking search_rw_mutex_
+    // UNIQUE (multi_thread_rebuild lines 239→325). Therefore any thread that
+    // holds search_rw_mutex_ (shared) while taking working_flag_mutex inverts
+    // that order → deadlock.
+    //
+    // The MUTATING calls (Add_by_point / Delete_by_range) take working_flag_mutex
+    // internally at a rebuild boundary, so they must NOT be wrapped in
+    // search_rw_mutex_. They don't need it anyway: the same working_flag_mutex
+    // coordination (the upstream ikd-Tree mechanism) already serializes them
+    // against the rebuild thread's subtree swap + free. Phase 1.5 K1 originally
+    // wrapped them in the shared lock too — that was the deadlock (TSan-confirmed;
+    // observed to hang) and is removed here.
+    //
+    // What DOES keep the shared lock is the genuine lock-free READ below —
+    // Search_by_range(Root_Node, ...) — which has no working_flag coordination
+    // of its own and so needs search_rw_mutex_ to be safe against the rebuild
+    // thread swapping a subtree mid-walk. (Nearest_Search / Box_Search /
+    // Radius_Search keep theirs for the same reason.)
     BoxPointType Box_of_Point;
     PointType downsample_result, mid_point;
     bool downsample_switch = downsample_on && DOWNSAMPLE_SWITCH;
@@ -499,7 +531,12 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
             mid_point.y = Box_of_Point.vertex_min[1] + (Box_of_Point.vertex_max[1] - Box_of_Point.vertex_min[1]) / 2.0;
             mid_point.z = Box_of_Point.vertex_min[2] + (Box_of_Point.vertex_max[2] - Box_of_Point.vertex_min[2]) / 2.0;
             PointVector().swap(Downsample_Storage);
-            Search_by_range(Root_Node, Box_of_Point, Downsample_Storage);
+            {
+                // Race-protect the unconditional read; rebuild thread can swap
+                // Root_Node's subtree at any instant.
+                std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+                Search_by_range(Root_Node, Box_of_Point, Downsample_Storage);
+            }
             min_dist = calc_dist(PointToAdd[i], mid_point);
             downsample_result = PointToAdd[i];
             for (int index = 0; index < (int)Downsample_Storage.size(); index++)
@@ -511,6 +548,26 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
                     downsample_result = Downsample_Storage[index];
                 }
             }
+            // Fast vs slow path (HARDENING Phase 2.5 — rebuild deadlock fix).
+            //
+            // Fast path = Root_Node is NOT the rebuild target. The mutating
+            // Delete_by_range/Add_by_point self-coordinate with the background
+            // rebuild thread via working_flag_mutex at any DEEPER rebuild
+            // boundary (the upstream ikd-Tree mechanism: they take
+            // working_flag_mutex when about to descend into *Rebuild_Ptr, which
+            // serializes against the rebuild thread's subtree swap + free).
+            //
+            // They must NOT run under search_rw_mutex_. Phase 1.5 K1 correctly
+            // added the shared lock to the SEARCH functions and to the genuine
+            // read above (Search_by_range), but wrapping these MUTATING calls in
+            // it was the bug: they take working_flag_mutex internally, and
+            // holding search_rw (shared) while doing so inverts against the
+            // rebuild thread (which holds working_flag and takes search_rw
+            // UNIQUE) → real deadlock (TSan-confirmed; observed to hang).
+            //
+            // If Root_Node IS the rebuild target, the slow path below takes
+            // working_flag_mutex itself (not under search_rw) and logs the op.
+            bool fast_path_taken = false;
             if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
             {
                 if (Downsample_Storage.size() > 1 || same_point(PointToAdd[i], downsample_result))
@@ -520,8 +577,9 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
                     Add_by_point(&Root_Node, downsample_result, true, Root_Node->division_axis);
                     tmp_counter++;
                 }
+                fast_path_taken = true;
             }
-            else
+            if (!fast_path_taken)
             {
                 if (Downsample_Storage.size() > 1 || same_point(PointToAdd[i], downsample_result))
                 {
@@ -549,11 +607,16 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
         }
         else
         {
+            // Same fast/slow split as the downsample branch above (Phase 2.5):
+            // the mutating call self-coordinates via working_flag_mutex; do NOT
+            // hold search_rw_mutex_ here (would invert with the rebuild thread).
+            bool fast_path_taken = false;
             if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
             {
                 Add_by_point(&Root_Node, PointToAdd[i], true, Root_Node->division_axis);
+                fast_path_taken = true;
             }
-            else
+            if (!fast_path_taken)
             {
                 Operation_Logger_Type operation;
                 operation.point = PointToAdd[i];
@@ -576,13 +639,22 @@ int KD_TREE<PointType>::Add_Points(PointVector &PointToAdd, bool downsample_on)
 template <typename PointType>
 void KD_TREE<PointType>::Add_Point_Boxes(vector<BoxPointType> &BoxPoints)
 {
+    // Phase 2.5 #1: exclude the rebuild thread's ancestor reads/writes for
+    // the whole operation (see ScopedPthreadLock comment at the top of file).
+    ScopedPthreadLock whole_op_lock(&working_flag_mutex);
+    // Same fast/slow split + Phase 2.5 deadlock fix as Add_Points: the mutating
+    // call self-coordinates with the rebuild thread via working_flag_mutex, so
+    // it must NOT be wrapped in search_rw_mutex_ (that inverts against the
+    // rebuild thread's working_flag → search_rw-unique order → deadlock).
     for (int i = 0; i < (int)BoxPoints.size(); i++)
     {
+        bool fast_path_taken = false;
         if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
         {
             Add_by_range(&Root_Node, BoxPoints[i], true);
+            fast_path_taken = true;
         }
-        else
+        if (!fast_path_taken)
         {
             Operation_Logger_Type operation;
             operation.boxpoint = BoxPoints[i];
@@ -604,13 +676,21 @@ void KD_TREE<PointType>::Add_Point_Boxes(vector<BoxPointType> &BoxPoints)
 template <typename PointType>
 void KD_TREE<PointType>::Delete_Points(PointVector &PointToDel)
 {
+    // Phase 2.5 #1: exclude the rebuild thread's ancestor reads/writes for
+    // the whole operation (see ScopedPthreadLock comment at the top of file).
+    ScopedPthreadLock whole_op_lock(&working_flag_mutex);
+    // Same fast/slow split + Phase 2.5 deadlock fix as Add_Points: the mutating
+    // call self-coordinates via working_flag_mutex; do NOT wrap it in
+    // search_rw_mutex_ (inverts with the rebuild thread → deadlock).
     for (int i = 0; i < (int)PointToDel.size(); i++)
     {
+        bool fast_path_taken = false;
         if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
         {
             Delete_by_point(&Root_Node, PointToDel[i], true);
+            fast_path_taken = true;
         }
-        else
+        if (!fast_path_taken)
         {
             Operation_Logger_Type operation;
             operation.point = PointToDel[i];
@@ -632,14 +712,26 @@ void KD_TREE<PointType>::Delete_Points(PointVector &PointToDel)
 template <typename PointType>
 int KD_TREE<PointType>::Delete_Point_Boxes(vector<BoxPointType> &BoxPoints)
 {
+    // Phase 2.5 #1: exclude the rebuild thread's ancestor reads/writes for
+    // the whole operation (see ScopedPthreadLock comment at the top of file).
+    ScopedPthreadLock whole_op_lock(&working_flag_mutex);
+    // Called from RESPLE.cpp's lasermapFovSegment in the async map-update lambda
+    // — fires every time the LiDAR moves past the local-map edge. Same fast/slow
+    // split + Phase 2.5 deadlock fix as Add_Points: the mutating Delete_by_range
+    // self-coordinates with the rebuild thread via working_flag_mutex at any
+    // deeper rebuild boundary, so it must NOT be wrapped in search_rw_mutex_
+    // (holding it shared while taking working_flag inverts against the rebuild
+    // thread's working_flag → search_rw-unique order → deadlock).
     int tmp_counter = 0;
     for (int i = 0; i < (int)BoxPoints.size(); i++)
     {
+        bool fast_path_taken = false;
         if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != Root_Node)
         {
             tmp_counter += Delete_by_range(&Root_Node, BoxPoints[i], true, false);
+            fast_path_taken = true;
         }
-        else
+        if (!fast_path_taken)
         {
             Operation_Logger_Type operation;
             operation.boxpoint = BoxPoints[i];
@@ -737,6 +829,12 @@ template <typename PointType>
 void KD_TREE<PointType>::Rebuild(KD_TREE_NODE **root)
 {
     KD_TREE_NODE *father_ptr;
+    // 2026-05-01 diagnostic (force always-multi-thread) reverted: did NOT
+    // eliminate the production SIGSEGV. The crash now appears in BOTH the
+    // worker (Add_Points → __libc_free) and the rebuild thread
+    // (multi_thread_rebuild → __libc_free) simultaneously. That signature
+    // points at upstream heap corruption surfacing on the first free that
+    // happens to fire — not at the inline rebuild path itself.
     if ((*root)->TreeSize >= Multi_Thread_Rebuild_Point_Num)
     {
         if (!pthread_mutex_trylock(&rebuild_ptr_mutex_lock))
@@ -780,18 +878,23 @@ int KD_TREE<PointType>::Delete_by_range(KD_TREE_NODE **root, BoxPointType boxpoi
         return 0;
     if (boxpoint.vertex_min[0] <= (*root)->node_range_x[0] && boxpoint.vertex_max[0] > (*root)->node_range_x[1] && boxpoint.vertex_min[1] <= (*root)->node_range_y[0] && boxpoint.vertex_max[1] > (*root)->node_range_y[1] && boxpoint.vertex_min[2] <= (*root)->node_range_z[0] && boxpoint.vertex_max[2] > (*root)->node_range_z[1])
     {
+        // Phase 2.4: write this node's deletion-propagation fields (incl. the
+        // need_push_down_to_* SET) under its push_down_mutex_lock so the set
+        // cannot be lost against a concurrent Push_Down(node) clearing them.
+        pthread_mutex_lock(&((*root)->push_down_mutex_lock));
         (*root)->tree_deleted = true;
         (*root)->point_deleted = true;
         (*root)->need_push_down_to_left = true;
         (*root)->need_push_down_to_right = true;
         tmp_counter = (*root)->TreeSize - (*root)->invalid_point_num;
-        (*root)->invalid_point_num = (*root)->TreeSize;
+        (*root)->invalid_point_num = (*root)->TreeSize.load();
         if (is_downsample)
         {
             (*root)->tree_downsample_deleted = true;
             (*root)->point_downsample_deleted = true;
-            (*root)->down_del_num = (*root)->TreeSize;
+            (*root)->down_del_num = (*root)->TreeSize.load();
         }
+        pthread_mutex_unlock(&((*root)->push_down_mutex_lock));
         return tmp_counter;
     }
     if (!(*root)->point_deleted && boxpoint.vertex_min[0] <= (*root)->point.x && boxpoint.vertex_max[0] > (*root)->point.x && boxpoint.vertex_min[1] <= (*root)->point.y && boxpoint.vertex_max[1] > (*root)->point.y && boxpoint.vertex_min[2] <= (*root)->point.z && boxpoint.vertex_max[2] > (*root)->point.z)
@@ -934,16 +1037,21 @@ void KD_TREE<PointType>::Add_by_range(KD_TREE_NODE **root, BoxPointType boxpoint
         return;
     if (boxpoint.vertex_min[0] <= (*root)->node_range_x[0] && boxpoint.vertex_max[0] > (*root)->node_range_x[1] && boxpoint.vertex_min[1] <= (*root)->node_range_y[0] && boxpoint.vertex_max[1] > (*root)->node_range_y[1] && boxpoint.vertex_min[2] <= (*root)->node_range_z[0] && boxpoint.vertex_max[2] > (*root)->node_range_z[1])
     {
+        // Phase 2.4: write this node's deletion-propagation fields (incl. the
+        // need_push_down_to_* SET) under its push_down_mutex_lock so the set
+        // cannot be lost against a concurrent Push_Down(node) clearing them.
+        pthread_mutex_lock(&((*root)->push_down_mutex_lock));
         (*root)->tree_deleted = false || (*root)->tree_downsample_deleted;
         (*root)->point_deleted = false || (*root)->point_downsample_deleted;
         (*root)->need_push_down_to_left = true;
         (*root)->need_push_down_to_right = true;
-        (*root)->invalid_point_num = (*root)->down_del_num;
+        (*root)->invalid_point_num = (*root)->down_del_num.load();
+        pthread_mutex_unlock(&((*root)->push_down_mutex_lock));
         return;
     }
     if (boxpoint.vertex_min[0] <= (*root)->point.x && boxpoint.vertex_max[0] > (*root)->point.x && boxpoint.vertex_min[1] <= (*root)->point.y && boxpoint.vertex_max[1] > (*root)->point.y && boxpoint.vertex_min[2] <= (*root)->point.z && boxpoint.vertex_max[2] > (*root)->point.z)
     {
-        (*root)->point_deleted = (*root)->point_downsample_deleted;
+        (*root)->point_deleted = (*root)->point_downsample_deleted.load();
     }
     Operation_Logger_Type add_box_log;
     // struct timespec Timeout;
@@ -1068,21 +1176,11 @@ void KD_TREE<PointType>::Search(KD_TREE_NODE *root, int k_nearest, PointType poi
     float max_dist_sqr = max_dist * max_dist;
     if (cur_dist > max_dist_sqr)
         return;
-    int retval;
-    if (root->need_push_down_to_left || root->need_push_down_to_right)
-    {
-        retval = pthread_mutex_trylock(&(root->push_down_mutex_lock));
-        if (retval == 0)
-        {
-            Push_Down(root);
-            pthread_mutex_unlock(&(root->push_down_mutex_lock));
-        }
-        else
-        {
-            pthread_mutex_lock(&(root->push_down_mutex_lock));
-            pthread_mutex_unlock(&(root->push_down_mutex_lock));
-        }
-    }
+    // Phase 2.4: Push_Down now does its own fast lock-free pre-check and takes
+    // the node's push_down_mutex_lock internally (parent lock for this node's
+    // flag clears, child lock for the child-field writes), so the call site is
+    // a bare call. The old trylock-or-wait dance here is no longer needed.
+    Push_Down(root);
     if (!root->point_deleted)
     {
         float dist = calc_dist(point, root->point);
@@ -1097,149 +1195,27 @@ void KD_TREE<PointType>::Search(KD_TREE_NODE *root, int k_nearest, PointType poi
     // int cur_search_counter;
     float dist_left_node = calc_box_dist(root->left_son_ptr, point);
     float dist_right_node = calc_box_dist(root->right_son_ptr, point);
-    if (q.size() < k_nearest || (dist_left_node < q.top().dist && dist_right_node < q.top().dist)) // !!!
+    if (q.size() < k_nearest || (dist_left_node < q.top().dist && dist_right_node < q.top().dist))
     {
         if (dist_left_node <= dist_right_node)
         {
-            if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->left_son_ptr)
-            {
-                Search(root->left_son_ptr, k_nearest, point, q, max_dist);
-            }
-            else
-            {
-                pthread_mutex_lock(&search_flag_mutex);
-                while (search_mutex_counter == -1)
-                {
-                    pthread_mutex_unlock(&search_flag_mutex);
-                    usleep(1);
-                    pthread_mutex_lock(&search_flag_mutex);
-                }
-                search_mutex_counter += 1;
-                pthread_mutex_unlock(&search_flag_mutex);
-                Search(root->left_son_ptr, k_nearest, point, q, max_dist);
-                pthread_mutex_lock(&search_flag_mutex);
-                search_mutex_counter -= 1;
-                pthread_mutex_unlock(&search_flag_mutex);
-            }
+            Search(root->left_son_ptr, k_nearest, point, q, max_dist);
             if (q.size() < k_nearest || dist_right_node < q.top().dist)
-            {
-                if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->right_son_ptr)
-                {
-                    Search(root->right_son_ptr, k_nearest, point, q, max_dist);
-                }
-                else
-                {
-                    pthread_mutex_lock(&search_flag_mutex);
-                    while (search_mutex_counter == -1)
-                    {
-                        pthread_mutex_unlock(&search_flag_mutex);
-                        usleep(1);
-                        pthread_mutex_lock(&search_flag_mutex);
-                    }
-                    search_mutex_counter += 1;
-                    pthread_mutex_unlock(&search_flag_mutex);
-                    Search(root->right_son_ptr, k_nearest, point, q, max_dist);
-                    pthread_mutex_lock(&search_flag_mutex);
-                    search_mutex_counter -= 1;
-                    pthread_mutex_unlock(&search_flag_mutex);
-                }
-            }
+                Search(root->right_son_ptr, k_nearest, point, q, max_dist);
         }
         else
         {
-            if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->right_son_ptr)
-            {
-                Search(root->right_son_ptr, k_nearest, point, q, max_dist);
-            }
-            else
-            {
-                pthread_mutex_lock(&search_flag_mutex);
-                while (search_mutex_counter == -1)
-                {
-                    pthread_mutex_unlock(&search_flag_mutex);
-                    usleep(1);
-                    pthread_mutex_lock(&search_flag_mutex);
-                }
-                search_mutex_counter += 1;
-                pthread_mutex_unlock(&search_flag_mutex);
-                Search(root->right_son_ptr, k_nearest, point, q, max_dist);
-                pthread_mutex_lock(&search_flag_mutex);
-                search_mutex_counter -= 1;
-                pthread_mutex_unlock(&search_flag_mutex);
-            }
+            Search(root->right_son_ptr, k_nearest, point, q, max_dist);
             if (q.size() < k_nearest || dist_left_node < q.top().dist)
-            {
-                if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->left_son_ptr)
-                {
-                    Search(root->left_son_ptr, k_nearest, point, q, max_dist);
-                }
-                else
-                {
-                    pthread_mutex_lock(&search_flag_mutex);
-                    while (search_mutex_counter == -1)
-                    {
-                        pthread_mutex_unlock(&search_flag_mutex);
-                        usleep(1);
-                        pthread_mutex_lock(&search_flag_mutex);
-                    }
-                    search_mutex_counter += 1;
-                    pthread_mutex_unlock(&search_flag_mutex);
-                    Search(root->left_son_ptr, k_nearest, point, q, max_dist);
-                    pthread_mutex_lock(&search_flag_mutex);
-                    search_mutex_counter -= 1;
-                    pthread_mutex_unlock(&search_flag_mutex);
-                }
-            }
+                Search(root->left_son_ptr, k_nearest, point, q, max_dist);
         }
     }
     else
     {
         if (dist_left_node < q.top().dist)
-        {
-            if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->left_son_ptr)
-            {
-                Search(root->left_son_ptr, k_nearest, point, q, max_dist);
-            }
-            else
-            {
-                pthread_mutex_lock(&search_flag_mutex);
-                while (search_mutex_counter == -1)
-                {
-                    pthread_mutex_unlock(&search_flag_mutex);
-                    usleep(1);
-                    pthread_mutex_lock(&search_flag_mutex);
-                }
-                search_mutex_counter += 1;
-                pthread_mutex_unlock(&search_flag_mutex);
-                Search(root->left_son_ptr, k_nearest, point, q, max_dist);
-                pthread_mutex_lock(&search_flag_mutex);
-                search_mutex_counter -= 1;
-                pthread_mutex_unlock(&search_flag_mutex);
-            }
-        }
+            Search(root->left_son_ptr, k_nearest, point, q, max_dist);
         if (dist_right_node < q.top().dist)
-        {
-            if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->right_son_ptr)
-            {
-                Search(root->right_son_ptr, k_nearest, point, q, max_dist);
-            }
-            else
-            {
-                pthread_mutex_lock(&search_flag_mutex);
-                while (search_mutex_counter == -1)
-                {
-                    pthread_mutex_unlock(&search_flag_mutex);
-                    usleep(1);
-                    pthread_mutex_lock(&search_flag_mutex);
-                }
-                search_mutex_counter += 1;
-                pthread_mutex_unlock(&search_flag_mutex);
-                Search(root->right_son_ptr, k_nearest, point, q, max_dist);
-                pthread_mutex_lock(&search_flag_mutex);
-                search_mutex_counter -= 1;
-                pthread_mutex_unlock(&search_flag_mutex);
-            }
-        }
+            Search(root->right_son_ptr, k_nearest, point, q, max_dist);
     }
     return;
 }
@@ -1266,26 +1242,8 @@ void KD_TREE<PointType>::Search_by_range(KD_TREE_NODE *root, BoxPointType boxpoi
         if (!root->point_deleted)
             Storage.push_back(root->point);
     }
-    if ((Rebuild_Ptr == nullptr) || root->left_son_ptr != *Rebuild_Ptr)
-    {
-        Search_by_range(root->left_son_ptr, boxpoint, Storage);
-    }
-    else
-    {
-        pthread_mutex_lock(&search_flag_mutex);
-        Search_by_range(root->left_son_ptr, boxpoint, Storage);
-        pthread_mutex_unlock(&search_flag_mutex);
-    }
-    if ((Rebuild_Ptr == nullptr) || root->right_son_ptr != *Rebuild_Ptr)
-    {
-        Search_by_range(root->right_son_ptr, boxpoint, Storage);
-    }
-    else
-    {
-        pthread_mutex_lock(&search_flag_mutex);
-        Search_by_range(root->right_son_ptr, boxpoint, Storage);
-        pthread_mutex_unlock(&search_flag_mutex);
-    }
+    Search_by_range(root->left_son_ptr, boxpoint, Storage);
+    Search_by_range(root->right_son_ptr, boxpoint, Storage);
     return;
 }
 
@@ -1309,26 +1267,8 @@ void KD_TREE<PointType>::Search_by_radius(KD_TREE_NODE *root, PointType point, f
     if (!root->point_deleted && calc_dist(root->point, point) <= radius * radius){
         Storage.push_back(root->point);
     }
-    if ((Rebuild_Ptr == nullptr) || root->left_son_ptr != *Rebuild_Ptr)
-    {
-        Search_by_radius(root->left_son_ptr, point, radius, Storage);
-    }
-    else
-    {
-        pthread_mutex_lock(&search_flag_mutex);
-        Search_by_radius(root->left_son_ptr, point, radius, Storage);
-        pthread_mutex_unlock(&search_flag_mutex);
-    }
-    if ((Rebuild_Ptr == nullptr) || root->right_son_ptr != *Rebuild_Ptr)
-    {
-        Search_by_radius(root->right_son_ptr, point, radius, Storage);
-    }
-    else
-    {
-        pthread_mutex_lock(&search_flag_mutex);
-        Search_by_radius(root->right_son_ptr, point, radius, Storage);
-        pthread_mutex_unlock(&search_flag_mutex);
-    }    
+    Search_by_radius(root->left_son_ptr, point, radius, Storage);
+    Search_by_radius(root->right_son_ptr, point, radius, Storage);
     return;
 }
 
@@ -1357,48 +1297,104 @@ bool KD_TREE<PointType>::Criterion_Check(KD_TREE_NODE *root)
     return false;
 }
 
+// Push_Down: propagates 'tree_deleted' / 'point_deleted' / downsample flags from
+// `root` to its immediate children, then marks the children as needing further
+// push-down. Called from Search and from every kd-tree mutator before they
+// proceed past `root`.
+//
+// CONCURRENCY (HARDENING Phase 2.4 — race FIXED; previously inherited from the
+// upstream HKU-MARS ikd-Tree). Push_Down(P) writes P's CHILDREN's
+// deletion-propagation fields (tree_downsample_deleted, point_downsample_deleted,
+// tree_deleted, point_deleted, down_del_num, invalid_point_num,
+// need_push_down_to_left, need_push_down_to_right) and clears P's own
+// need_push_down_to_{left,right}. Two threads descending overlapping paths (the
+// dominant case is findCorresp's OpenMP-parallel Nearest_Search) used to race
+// on those child fields. The fix has three parts:
+//
+//   1. WRITE-SIDE MUTUAL EXCLUSION. The body runs under root's own
+//      push_down_mutex_lock (taken here, not at the call sites), which
+//      serializes concurrent Push_Down(root) instances and protects root's
+//      flag clears. Each child block additionally takes the CHILD's
+//      push_down_mutex_lock around the child-field writes, which serializes a
+//      Push_Down(P) writing child C against a Push_Down(C) (where C is treated
+//      as the parent and holds the same mutex). Lock order is strictly
+//      parent->child along tree edges, so the order is acyclic, a thread holds
+//      at most two node mutexes, and it cannot deadlock. The internal
+//      working_flag_mutex / Rebuild_Logger handling in the rebuild branch is
+//      preserved, nested INSIDE the child lock (order: node -> working_flag).
+//
+//   2. The mutators that SET need_push_down_to_* on a subtree root
+//      (Add_by_range / Delete_by_range / the run_operation PUSH_DOWN replay)
+//      take that node's push_down_mutex_lock around the write, closing the
+//      set-vs-clear lost-update window.
+//
+//   3. The racy fields are std::atomic, so the lock-free reads in Search /
+//      Search_by_range / Search_by_radius / Criterion_Check / Update are
+//      defined behaviour (TSan-clean).
+//
+// Net effect: multi-threaded k-NN is safe by contract, so the old
+// num_threads=1 mitigation is retired.
 template <typename PointType>
 void KD_TREE<PointType>::Push_Down(KD_TREE_NODE *root)
 {
     if (root == nullptr)
         return;
+    // Fast lock-free pre-check (atomic loads): nothing to propagate -> return
+    // without touching any mutex. Keeps the common search path lock-free.
+    if (!root->need_push_down_to_left && !root->need_push_down_to_right)
+        return;
     Operation_Logger_Type operation;
     operation.op = PUSH_DOWN;
     operation.tree_deleted = root->tree_deleted;
     operation.tree_downsample_deleted = root->tree_downsample_deleted;
+    // Parent lock: serializes concurrent Push_Down(root) and protects the
+    // need_push_down_to_* clears below.
+    pthread_mutex_lock(&(root->push_down_mutex_lock));
     if (root->need_push_down_to_left && root->left_son_ptr != nullptr)
     {
-        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->left_son_ptr)
+        KD_TREE_NODE *child = root->left_son_ptr;
+        const bool tds = root->tree_downsample_deleted;
+        const bool td = root->tree_deleted;
+        // Child lock: serializes these child-field writes against a concurrent
+        // Push_Down(child).
+        pthread_mutex_lock(&(child->push_down_mutex_lock));
+        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != child)
         {
-            root->left_son_ptr->tree_downsample_deleted |= root->tree_downsample_deleted;
-            root->left_son_ptr->point_downsample_deleted |= root->tree_downsample_deleted;
-            root->left_son_ptr->tree_deleted = root->tree_deleted || root->left_son_ptr->tree_downsample_deleted;
-            root->left_son_ptr->point_deleted = root->left_son_ptr->tree_deleted || root->left_son_ptr->point_downsample_deleted;
-            if (root->tree_downsample_deleted)
-                root->left_son_ptr->down_del_num = root->left_son_ptr->TreeSize;
-            if (root->tree_deleted)
-                root->left_son_ptr->invalid_point_num = root->left_son_ptr->TreeSize;
+            if (tds)
+            {
+                child->tree_downsample_deleted = true;
+                child->point_downsample_deleted = true;
+            }
+            child->tree_deleted = td || child->tree_downsample_deleted;
+            child->point_deleted = child->tree_deleted || child->point_downsample_deleted;
+            if (tds)
+                child->down_del_num = child->TreeSize.load();
+            if (td)
+                child->invalid_point_num = child->TreeSize.load();
             else
-                root->left_son_ptr->invalid_point_num = root->left_son_ptr->down_del_num;
-            root->left_son_ptr->need_push_down_to_left = true;
-            root->left_son_ptr->need_push_down_to_right = true;
+                child->invalid_point_num = child->down_del_num.load();
+            child->need_push_down_to_left = true;
+            child->need_push_down_to_right = true;
             root->need_push_down_to_left = false;
         }
         else
         {
             pthread_mutex_lock(&working_flag_mutex);
-            root->left_son_ptr->tree_downsample_deleted |= root->tree_downsample_deleted;
-            root->left_son_ptr->point_downsample_deleted |= root->tree_downsample_deleted;
-            root->left_son_ptr->tree_deleted = root->tree_deleted || root->left_son_ptr->tree_downsample_deleted;
-            root->left_son_ptr->point_deleted = root->left_son_ptr->tree_deleted || root->left_son_ptr->point_downsample_deleted;
-            if (root->tree_downsample_deleted)
-                root->left_son_ptr->down_del_num = root->left_son_ptr->TreeSize;
-            if (root->tree_deleted)
-                root->left_son_ptr->invalid_point_num = root->left_son_ptr->TreeSize;
+            if (tds)
+            {
+                child->tree_downsample_deleted = true;
+                child->point_downsample_deleted = true;
+            }
+            child->tree_deleted = td || child->tree_downsample_deleted;
+            child->point_deleted = child->tree_deleted || child->point_downsample_deleted;
+            if (tds)
+                child->down_del_num = child->TreeSize.load();
+            if (td)
+                child->invalid_point_num = child->TreeSize.load();
             else
-                root->left_son_ptr->invalid_point_num = root->left_son_ptr->down_del_num;
-            root->left_son_ptr->need_push_down_to_left = true;
-            root->left_son_ptr->need_push_down_to_right = true;
+                child->invalid_point_num = child->down_del_num.load();
+            child->need_push_down_to_left = true;
+            child->need_push_down_to_right = true;
             if (rebuild_flag)
             {
                 pthread_mutex_lock(&rebuild_logger_mutex_lock);
@@ -1408,40 +1404,51 @@ void KD_TREE<PointType>::Push_Down(KD_TREE_NODE *root)
             root->need_push_down_to_left = false;
             pthread_mutex_unlock(&working_flag_mutex);
         }
+        pthread_mutex_unlock(&(child->push_down_mutex_lock));
     }
     if (root->need_push_down_to_right && root->right_son_ptr != nullptr)
     {
-        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != root->right_son_ptr)
+        KD_TREE_NODE *child = root->right_son_ptr;
+        const bool tds = root->tree_downsample_deleted;
+        const bool td = root->tree_deleted;
+        pthread_mutex_lock(&(child->push_down_mutex_lock));
+        if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != child)
         {
-            root->right_son_ptr->tree_downsample_deleted |= root->tree_downsample_deleted;
-            root->right_son_ptr->point_downsample_deleted |= root->tree_downsample_deleted;
-            root->right_son_ptr->tree_deleted = root->tree_deleted || root->right_son_ptr->tree_downsample_deleted;
-            root->right_son_ptr->point_deleted = root->right_son_ptr->tree_deleted || root->right_son_ptr->point_downsample_deleted;
-            if (root->tree_downsample_deleted)
-                root->right_son_ptr->down_del_num = root->right_son_ptr->TreeSize;
-            if (root->tree_deleted)
-                root->right_son_ptr->invalid_point_num = root->right_son_ptr->TreeSize;
+            if (tds)
+            {
+                child->tree_downsample_deleted = true;
+                child->point_downsample_deleted = true;
+            }
+            child->tree_deleted = td || child->tree_downsample_deleted;
+            child->point_deleted = child->tree_deleted || child->point_downsample_deleted;
+            if (tds)
+                child->down_del_num = child->TreeSize.load();
+            if (td)
+                child->invalid_point_num = child->TreeSize.load();
             else
-                root->right_son_ptr->invalid_point_num = root->right_son_ptr->down_del_num;
-            root->right_son_ptr->need_push_down_to_left = true;
-            root->right_son_ptr->need_push_down_to_right = true;
+                child->invalid_point_num = child->down_del_num.load();
+            child->need_push_down_to_left = true;
+            child->need_push_down_to_right = true;
             root->need_push_down_to_right = false;
         }
         else
         {
             pthread_mutex_lock(&working_flag_mutex);
-            root->right_son_ptr->tree_downsample_deleted |= root->tree_downsample_deleted;
-            root->right_son_ptr->point_downsample_deleted |= root->tree_downsample_deleted;
-            root->right_son_ptr->tree_deleted = root->tree_deleted || root->right_son_ptr->tree_downsample_deleted;
-            root->right_son_ptr->point_deleted = root->right_son_ptr->tree_deleted || root->right_son_ptr->point_downsample_deleted;
-            if (root->tree_downsample_deleted)
-                root->right_son_ptr->down_del_num = root->right_son_ptr->TreeSize;
-            if (root->tree_deleted)
-                root->right_son_ptr->invalid_point_num = root->right_son_ptr->TreeSize;
+            if (tds)
+            {
+                child->tree_downsample_deleted = true;
+                child->point_downsample_deleted = true;
+            }
+            child->tree_deleted = td || child->tree_downsample_deleted;
+            child->point_deleted = child->tree_deleted || child->point_downsample_deleted;
+            if (tds)
+                child->down_del_num = child->TreeSize.load();
+            if (td)
+                child->invalid_point_num = child->TreeSize.load();
             else
-                root->right_son_ptr->invalid_point_num = root->right_son_ptr->down_del_num;
-            root->right_son_ptr->need_push_down_to_left = true;
-            root->right_son_ptr->need_push_down_to_right = true;
+                child->invalid_point_num = child->down_del_num.load();
+            child->need_push_down_to_left = true;
+            child->need_push_down_to_right = true;
             if (rebuild_flag)
             {
                 pthread_mutex_lock(&rebuild_logger_mutex_lock);
@@ -1451,7 +1458,9 @@ void KD_TREE<PointType>::Push_Down(KD_TREE_NODE *root)
             root->need_push_down_to_right = false;
             pthread_mutex_unlock(&working_flag_mutex);
         }
+        pthread_mutex_unlock(&(child->push_down_mutex_lock));
     }
+    pthread_mutex_unlock(&(root->push_down_mutex_lock));
     return;
 }
 
@@ -1592,8 +1601,8 @@ void KD_TREE<PointType>::Update(KD_TREE_NODE *root)
         root->TreeSize = 1;
         root->invalid_point_num = (root->point_deleted ? 1 : 0);
         root->down_del_num = (root->point_downsample_deleted ? 1 : 0);
-        root->tree_downsample_deleted = root->point_downsample_deleted;
-        root->tree_deleted = root->point_deleted;
+        root->tree_downsample_deleted = root->point_downsample_deleted.load();
+        root->tree_deleted = root->point_deleted.load();
         tmp_range_x[0] = root->point.x;
         tmp_range_x[1] = root->point.x;
         tmp_range_y[0] = root->point.y;

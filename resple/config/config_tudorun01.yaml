@@ -1,5 +1,19 @@
 /**:
   ros__parameters:
+    # Frame IDs for TF tree
+    odom/frame_id: odom              # Odom (odometry frame_id) frame
+    map/frame_id: map                # Odom (odometry frame_id) frame    
+    frame_id: base_link              # Robot (odometry child_frame_id) frame
+
+    odom/publish_tf: True
+    odom/invert_tf: False
+    map/publish_tf: True
+    map/invert_tf: False
+
+    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]     # diagonal of covariance published in odom msgs
+    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
+    publish_tf: true    
+
     topic_imu: /robot1/livox/imu
     acc_ratio: true 
     lidars: ["livox"]
@@ -18,9 +32,10 @@
     
     ds_scan_voxel: 0.2
     point_filter_num: 1
+    num_threads: 8
     nn_thresh: 0.5
     coeff_cov: 5.0
-    num_nn: 8
+    num_match_points: 8    # k-NN for plane fit
 
     ds_lm_voxel: 0.2
     cube_len: 1000.0
@@ -38,3 +53,10 @@
     cov_bg: [0.2, 0.2, 0.2]       
     n_iter: 3   
     num_points_upd: 100
+
+    imu_init_num_samples: 50     # IMU samples averaged during stationary init
+    imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+
+    # Robustness/diagnostics parameters (knot pruning, NIS recovery, map
+    # radius pruning, bounded buffers, ...) keep their defaults here —
+    # see doc/PARAMETERS.md for the full reference.

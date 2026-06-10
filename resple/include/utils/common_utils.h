@@ -5,13 +5,26 @@
 #include <fstream>
 #include <filesystem>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/point32.hpp>
 #include <omp.h>
 
-#include "utils/eigen_utils.hpp"
+// PCL_ADD_POINT4D / POINT_CLOUD_REGISTER_POINT_STRUCT (the ouster_ros::Point
+// definition below) come from these headers. Include them explicitly so this
+// header is self-contained — consumers that include it before any PCL header
+// (e.g. the esti_plane integration test) used to fail with "PCL_ADD_POINT4D
+// does not name a type".
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
 
-int NUM_OF_THREAD = 5;
-int NUM_MATCH_POINTS = 5;
+#include "utils/eigen_utils.hpp"
+#include "utils/geometry_core.h"
+
+// NOTE: NUM_OF_THREAD and NUM_MATCH_POINTS are now ROS parameters in RESPLE node
+// They were previously global variables but are now configurable per-node instance
+// int NUM_OF_THREAD = 5;
+// int NUM_MATCH_POINTS = 5;
 
 struct ImuData {
     int64_t time_ns;
@@ -21,7 +34,7 @@ struct ImuData {
     Eigen::Matrix<double, 6, 1> imu_itp;
     ImuData(){}
     ImuData(const int64_t s, const Eigen::Vector3d& w, const Eigen::Vector3d& a)
-      : time_ns(s), gyro(w), accel(a) {}
+      : time_ns(s), gyro(w), accel(a), H(Eigen::Matrix<double, 6, 24>::Zero()), imu_itp(Eigen::Matrix<double, 6, 1>::Zero()) {}
 
     ImuData(const ImuData& other) : time_ns(other.time_ns), gyro(other.gyro), accel(other.accel),
     H(other.H), imu_itp(other.imu_itp) {
@@ -92,12 +105,25 @@ namespace livox_mid360_boxi {
       (uint8_t, line, line)
       (double, timestamp, timestamp)
   )
-  
+
 class CommonUtils
 {
 public:
     template <typename T>
-    static T readParam(rclcpp::Node::SharedPtr &n, std::string name)
+    static T readParam(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_params, const std::string& name, const T& alternative)
+    {
+        T ans;
+        if (!node_params->has_parameter(name)) {
+            rclcpp::ParameterValue default_parameter_value(alternative);  
+            rcl_interfaces::msg::ParameterDescriptor descriptor;          
+            node_params->declare_parameter(name, default_parameter_value, descriptor, false);
+        }
+        ans = node_params->get_parameter(name).get_parameter_value().get<T>();
+        return ans;
+    }
+
+    template <typename T>
+    static T readParam(const rclcpp::Node::SharedPtr &n, std::string name)
     {
         T ans;
         if (!n->has_parameter(name)) {
@@ -111,7 +137,7 @@ public:
     }
 
     template <typename T>
-    static T readParam(rclcpp::Node::SharedPtr &n, std::string name, const T& alternative)
+    static T readParam(const rclcpp::Node::SharedPtr &n, std::string name, const T& alternative)
     {
         T ans;
         if (!n->has_parameter(name)) {
@@ -121,6 +147,12 @@ public:
         return ans;
     }
     
+    static Eigen::Vector3d readVector3d(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_params, const std::string& name)
+    {
+        std::vector<double> v = CommonUtils::readParam<std::vector<double>>(node_params, name, {0.0, 0.0, 0.0});
+        return Eigen::Vector3d(v[0], v[1], v[2]);
+    } 
+
     static Eigen::Vector3d readVector3d(rclcpp::Node::SharedPtr &n, const std::string& name)
     {
         std::vector<double> v = CommonUtils::readParam<std::vector<double>>(n, name);
@@ -183,23 +215,61 @@ public:
     }    
 
     static int64_t ms2ns(const float t_ms) {
-        return (t_ms * float(1e6));
+        return static_cast<int64_t>(static_cast<double>(t_ms) * 1e6);
     }    
 
+    // Per-scan time-order comparator for deskew. The `.intensity` field is
+    // overloaded to carry the per-point time offset (ms) — every sensor
+    // callback writes time-since-scan-start into `.intensity` and moves the
+    // real reflectivity into `.curvature` (see the Ouster/Livox/Hesai loaders).
+    // So this sorts by time, not reflectivity. If a future sensor path leaves
+    // genuine intensity in this field, deskew ordering breaks silently.
     static bool time_list(pcl::PointXYZINormal &x, pcl::PointXYZINormal &y) {return (x.intensity < y.intensity);};
 
-    static geometry_msgs::msg::PoseStamped pose2msg(const int64_t t, const Eigen::Vector3d& pos,
-                                              const Eigen::Quaterniond& orient)
+    // Create Pose
+    static geometry_msgs::msg::Pose pose2msg(const Eigen::Vector3d& pos,
+                                             const Eigen::Quaterniond& orient)
+    {
+        geometry_msgs::msg::Pose msg;
+        msg.position.x = pos.x();
+        msg.position.y = pos.y();
+        msg.position.z = pos.z();
+        msg.orientation.w = orient.w();
+        msg.orientation.x = orient.x();
+        msg.orientation.y = orient.y();
+        msg.orientation.z = orient.z();
+        return msg;
+    }
+
+    // Create PoseStamped for path messages (nav_msgs::msg::Path)
+    static geometry_msgs::msg::PoseStamped pose2msg(const std::string& frame_id, 
+                                                    const int64_t t, const Eigen::Vector3d& pos,
+                                                    const Eigen::Quaterniond& orient)
     {
         geometry_msgs::msg::PoseStamped msg;
+        msg.header.frame_id = frame_id, 
         msg.header.stamp = rclcpp::Time(t);
-        msg.pose.position.x = pos.x();
-        msg.pose.position.y = pos.y();
-        msg.pose.position.z = pos.z();
-        msg.pose.orientation.w = orient.w();
-        msg.pose.orientation.x = orient.x();
-        msg.pose.orientation.y = orient.y();
-        msg.pose.orientation.z = orient.z();
+        msg.pose = pose2msg(pos, orient);
+        
+        return msg;
+    }
+
+    // Create PoseWithCovarianceStamped for pose topics (for Nav2 compatibility)
+    static geometry_msgs::msg::PoseWithCovarianceStamped pose2msg(const std::string& frame_id, 
+                                                                  const int64_t t, const Eigen::Vector3d& pos,
+                                                                  const Eigen::Quaterniond& orient, Eigen::Vector<double, 6>& cov)
+    {
+        geometry_msgs::msg::PoseWithCovarianceStamped msg;
+        msg.header.frame_id = frame_id;
+        msg.header.stamp = rclcpp::Time(t);
+        msg.pose.pose = pose2msg(pos, orient);
+
+        msg.pose.covariance[0] = cov[0];
+        msg.pose.covariance[7] = cov[1];
+        msg.pose.covariance[14]= cov[2];
+        msg.pose.covariance[21]= cov[3];
+        msg.pose.covariance[28]= cov[4];
+        msg.pose.covariance[35]= cov[5];
         return msg;
     }    
 
@@ -213,34 +283,24 @@ public:
     }    
 
     template<typename T>
-    static bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const Eigen::aligned_vector<pcl::PointXYZINormal> &point, const T &threshold)
+    static bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const Eigen::aligned_vector<pcl::PointXYZINormal> &point, const T &threshold,
+                           const T min_cond_ratio = static_cast<T>(0))
     {
-        Eigen::Matrix<T, 5, 3> A;
-        Eigen::Matrix<T, 5, 1> b;
-        A.setZero();
-        b.setOnes();
-        b *= -1.0f;
-        for (int j = 0; j < 5; j++)
-        {
-            A(j,0) = point[j].x;
-            A(j,1) = point[j].y;
-            A(j,2) = point[j].z;
-        }
-        Eigen::Matrix<T, 3, 1> normvec = A.colPivHouseholderQr().solve(b);
-        T n = normvec.norm();
-        pca_result(0) = normvec(0) / n;
-        pca_result(1) = normvec(1) / n;
-        pca_result(2) = normvec(2) / n;
-        pca_result(3) = 1.0 / n;
-        for (int j = 0; j < 5; j++)
-        {
-            if (fabs(pca_result(0) * point[j].x + pca_result(1) * point[j].y + pca_result(2) * point[j].z + pca_result(3)) > threshold)
-            {
-                return false;
-            }
-        }
-        return true;
-    }            
+        // Delegate to the Eigen-only, unit-tested core (resple::geom::fitPlane,
+        // see utils/geometry_core.h + test/test_geometry_core.cpp). The
+        // accessor reads the PCL points in place — no intermediate copy — and
+        // min_cond_ratio defaults to 0 (HARDENING §3.2 degeneracy guard off)
+        // so behaviour is bit-for-bit identical to the previous inline
+        // normal-equation fit unless a caller opts in.
+        return resple::geom::fitPlane<T>(
+            static_cast<int>(point.size()),
+            [&point](int j, T& x, T& y, T& z) {
+                x = static_cast<T>(point[j].x);
+                y = static_cast<T>(point[j].y);
+                z = static_cast<T>(point[j].z);
+            },
+            threshold, pca_result, min_cond_ratio);
+    }
 };
 
 struct LidarConfig {
@@ -253,21 +313,32 @@ struct LidarConfig {
     Eigen::Quaterniond q_bl;
     Eigen::Vector3d t_bl;
     double w_pt;
+    // Generic "PointCloud2" ingestion options (utils/point_cloud_adapter.h).
+    // All optional: empty/auto means "use the built-in candidate names and
+    // unit conventions" (Ouster 't', Velodyne 'time', Hesai 'timestamp', ...).
+    std::string time_field;       // override per-point time field name
+    std::string time_unit = "auto"; // auto | s | ms | us | ns
+    std::string intensity_field;  // override reflectivity field name
+    // Sensor origin in body (base_link) frame — populated from TF at runtime,
+    // NOT from YAML.  Used to compute true sensor-frame range for outlier gating.
+    Eigen::Vector3d sensor_origin_body = Eigen::Vector3d::Zero();
 
     LidarConfig() = default;
 
-    LidarConfig(rclcpp::Node::SharedPtr& nh, const std::string& prefix) {
-        std::cout << "Creating LidarConfig with prefix: \"" << prefix << "\"" << std::endl;
-        topic = CommonUtils::readParam<std::string>(nh, prefix + "topic_lidar");
-        type = CommonUtils::readParam<std::string>(nh, prefix + "lidar_type");
-        scan_line = CommonUtils::readParam<int>(nh, prefix + "scan_line");
-        blind = CommonUtils::readParam<float>(nh, prefix + "blind", 0.5f);
-        std::vector<double> q_lb_v = CommonUtils::readParam<std::vector<double>>(nh, prefix + "q_lb");
+    LidarConfig(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_params, const std::string& prefix) {
+        topic = CommonUtils::readParam<std::string>(node_params, prefix + "topic_lidar", "");
+        type = CommonUtils::readParam<std::string>(node_params, prefix + "lidar_type", "");
+        scan_line = CommonUtils::readParam<int>(node_params, prefix + "scan_line", 0);
+        blind = CommonUtils::readParam<float>(node_params, prefix + "blind", 0.5f);
+        std::vector<double> q_lb_v = CommonUtils::readParam<std::vector<double>>(node_params, prefix + "q_lb", {1.0, 0.0, 0.0, 0.0});
         q_lb = Eigen::Quaterniond(q_lb_v.at(0), q_lb_v.at(1), q_lb_v.at(2), q_lb_v.at(3));
-        t_lb = CommonUtils::readVector3d(nh, prefix + "t_lb");
+        t_lb = CommonUtils::readVector3d(node_params, prefix + "t_lb");
         q_bl = q_lb.inverse();
         t_bl = q_lb.inverse() * (- t_lb);
-        w_pt = CommonUtils::readParam<double>(nh, prefix + "w_pt");
+        w_pt = CommonUtils::readParam<double>(node_params, prefix + "w_pt", 0.0);
+        time_field = CommonUtils::readParam<std::string>(node_params, prefix + "time_field", "");
+        time_unit = CommonUtils::readParam<std::string>(node_params, prefix + "time_unit", "auto");
+        intensity_field = CommonUtils::readParam<std::string>(node_params, prefix + "intensity_field", "");
     }
 };
 
@@ -283,6 +354,12 @@ struct Parameters {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
+// Forward-declared static_assert helpers (definitions after the structs):
+// guarantee that sizeof is a multiple of alignof, so std::deque /
+// Eigen::aligned_deque chunk storage places every element at a properly
+// aligned address. Required for SIMD-correct operations on Eigen members.
+// If a future field breaks the invariant, the build fails here rather than
+// emitting silent UB at runtime.
 struct PointData {
     int64_t time_ns;
     pcl::PointXYZINormal pt;
@@ -291,48 +368,45 @@ struct PointData {
     Eigen::Vector3d normvec;
     bool if_valid;
     double dist;
-    Eigen::aligned_vector<pcl::PointXYZINormal> nearest_points;
     double zp = 0;
     Eigen::Matrix<double, 1, 24> H = Eigen::Matrix<double, 1, 24>::Zero();
     Eigen::Quaterniond q_bl;
-    Eigen::Vector3d t_bl;    
+    Eigen::Vector3d t_bl;
     double var_pt;
+    // True sensor-frame range: distance from the LiDAR origin, NOT from base_link.
+    // pt_b is stored in base_link frame (after the PCL extrinsic transform), so
+    // pt_b.norm() would give the distance from base_link — wrong for the outlier
+    // gate which scales with actual measurement range.
+    float range_sensor = 0.f;
 
     PointData() {};
     PointData(const pcl::PointXYZINormal& pt_in, int64_t fr_start_time, const Eigen::Quaterniond& q_bl_in,
-        const Eigen::Vector3d& t_bl_in, double w_pt) : pt(pt_in), pt_b(Eigen::Vector3d(pt_in.x, pt_in.y, pt_in.z)), 
+        const Eigen::Vector3d& t_bl_in, double w_pt,
+        const Eigen::Vector3d& sensor_origin_body = Eigen::Vector3d::Zero())
+        : pt(pt_in), pt_b(Eigen::Vector3d(pt_in.x, pt_in.y, pt_in.z)),
         q_bl(q_bl_in), t_bl(t_bl_in) {
         time_ns = fr_start_time + CommonUtils::ms2ns(pt_in.intensity);
         if_valid = false;
         dist = 0;
-        var_pt = w_pt;
+        // Guard against w_pt == 0: var_pt feeds 1/(var_pt*scale) in the IEKF,
+        // so a zero weight yields +inf measurement information and a degenerate
+        // update. Floor it to a tiny positive value.
+        var_pt = (w_pt > 0.0) ? w_pt : 1e-9;
+        normvec = Eigen::Vector3d::Zero();
+        range_sensor = static_cast<float>((pt_b - sensor_origin_body).norm());
     }
 
-    PointData(const PointData& other) : time_ns(other.time_ns), pt(other.pt), 
-        pt_b(other.pt_b), pt_w(other.pt_w), 
-        if_valid(other.if_valid), dist(other.dist), 
-        nearest_points(other.nearest_points), 
-        zp(other.zp), H(other.H), q_bl(other.q_bl), t_bl(other.t_bl), var_pt(other.var_pt) {
-    }        
-
-    PointData& operator=(const PointData& other) {
-        if (this != &other) { 
-            this->time_ns = other.time_ns;
-            this->pt = other.pt;
-            this->pt_b = other.pt_b;
-            this->pt_w = other.pt_w;
-            this->if_valid = other.if_valid;
-            this->nearest_points = other.nearest_points;
-            this->dist = other.dist;
-            this->zp = other.zp;
-            this->H = other.H;
-            this->q_bl = other.q_bl;
-            this->t_bl = other.t_bl;   
-            this->var_pt = other.var_pt;         
-        }
-        return *this;
-    }    
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
+// Alignment invariants: see forward note above struct PointData. These hold
+// for any well-formed C++ type (the standard requires sizeof to be a multiple
+// of alignof so arrays work), but writing them down catches accidental
+// non-aligned attribute use or future packed-struct changes that would
+// silently misalign deque/vector elements.
+static_assert(sizeof(PointData) % alignof(PointData) == 0,
+    "PointData must satisfy sizeof%alignof==0 so deque chunk storage is "
+    "16-aligned per element (required by Eigen members in OpenMP loops)");
+static_assert(sizeof(ImuData) % alignof(ImuData) == 0,
+    "ImuData must satisfy sizeof%alignof==0 (same reason as PointData)");
 

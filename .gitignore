@@ -232,6 +232,8 @@ CMakeLists.txt.user
 build/
 devel/
 logs/
+log/
+install/
 .catkin_tools/
 matlab_msg_gen_ros1/
 results/
@@ -240,3 +242,7 @@ align_est_gt/
 # CLion build files
 cmake-build-*
 .idea
+
+# Python bytecode caches (e.g. from launch_test importing the integration tests)
+__pycache__/
+*.pyc

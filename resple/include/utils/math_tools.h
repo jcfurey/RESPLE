@@ -49,7 +49,9 @@ public:
     static void dexp(const Eigen::Vector3d& v, Eigen::Quaterniond& q, Eigen::Matrix<double,4,3>& J)
     {
         double v_norm = v.norm();
-        if (v_norm == 0.0) {
+        if (v_norm < 1e-10) {
+            // Taylor expansion: cos(x) ≈ 1-x²/2, sinc(x) ≈ 1-x²/6
+            // ⇒ (cos(x)-sinc(x))/x² → -1/3 as x → 0
             J.row(0).setZero();
             J.bottomRows<3>().setIdentity();
             q.setIdentity();

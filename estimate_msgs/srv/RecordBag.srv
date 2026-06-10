@@ -1,0 +1,10 @@
+# Request: Control bag recording
+bool start              # True to start recording, False to stop
+string output_path      # Directory to save the bag (e.g., "/tmp/bags/")
+string[] topics         # Topics to record (empty = record all active topics)
+int32 max_duration_sec  # Maximum recording duration in seconds (0 = unlimited)
+---
+# Response: Recording status
+bool success            # True if operation succeeded
+string message          # Status message or error description
+string bag_path         # Full path to the bag file (if recording started)

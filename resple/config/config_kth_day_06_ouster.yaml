@@ -1,7 +1,21 @@
 /**:
   ros__parameters:
+    # Frame IDs for TF tree
+    odom/frame_id: odom              # Odom (odometry frame_id) frame
+    map/frame_id: map                # Odom (odometry frame_id) frame
+    frame_id: base_link              # Robot (odometry child_frame_id) frame
+
+    odom/publish_tf: True
+    odom/invert_tf: False
+    map/publish_tf: True
+    map/invert_tf: False
+
+    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
+    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
+    publish_tf: true
+
     topic_imu: /vn200/imu
-    acc_ratio: false  
+    acc_ratio: false
     lidars: ["Ouster"]
     Ouster:
       topic_lidar: /os_cloud_node/points
@@ -15,12 +29,13 @@
 
     knot_hz: 100
     if_lidar_only: false
-    
+
     ds_scan_voxel: 0.5
     point_filter_num: 2
+    num_threads: 8
     nn_thresh: 0.5
     coeff_cov: 2.0
-    num_nn: 5
+    num_match_points: 5    # k-NN for plane fit
 
     ds_lm_voxel: 0.5
     cube_len: 2000.0
@@ -33,8 +48,15 @@
     std_sys_pos: 0.2
     std_sys_ort: 0.1
     cov_acc: [1.0,1.0,1.0]
-    cov_gyro: [0.1,0.1,0.1]     
+    cov_gyro: [0.1,0.1,0.1]
     cov_ba: [0.2, 0.2, 0.2]
-    cov_bg: [0.2, 0.2, 0.2]      
+    cov_bg: [0.2, 0.2, 0.2]
     n_iter: 1
     num_points_upd: 500
+
+    imu_init_num_samples: 50     # IMU samples averaged during stationary init
+    imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+
+    # Robustness/diagnostics parameters (knot pruning, NIS recovery, map
+    # radius pruning, bounded buffers, ...) keep their defaults here —
+    # see doc/PARAMETERS.md for the full reference.

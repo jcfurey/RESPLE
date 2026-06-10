@@ -1,0 +1,11 @@
+# Goal: Save the map to a file
+string filename    # Path to save the map (e.g., "/path/to/map.pcd")
+---
+# Result: Operation outcome
+bool success       # True if map was saved successfully
+string message     # Status message or error description
+uint32 points_saved  # Number of points saved to file
+---
+# Feedback: Progress during save operation
+float32 progress   # Progress percentage (0.0 to 100.0)
+string status      # Current operation status

@@ -1,4 +1,44 @@
 #pragma once
+
+// 2026-05-01 Eigen aligned-allocator ABI fix.
+//
+// The kd-tree's PointVector (defined below) is std::vector<PointType, Eigen::aligned_allocator>.
+// Eigen's aligned_malloc/aligned_free dispatch on EIGEN_MALLOC_ALREADY_ALIGNED, which Eigen
+// auto-detects in Memory.h:
+//   - If EIGEN_DEFAULT_ALIGN_BYTES == 16 AND glibc 64-bit AND no ASan → MALLOC_ALREADY_ALIGNED=1
+//     → both malloc/free use std::malloc/std::free directly (matched, ABI-stable)
+//   - Otherwise → MALLOC_ALREADY_ALIGNED=0 → both go through handmade_aligned_malloc/free
+//
+// With -march=native enabling AVX, Eigen sets EIGEN_DEFAULT_ALIGN_BYTES=32, which fails the
+// auto-detect's `==16` check, so MALLOC_ALREADY_ALIGNED stays 0 and BOTH alloc/free dispatch
+// to the handmade path. handmade_aligned_malloc stores the original malloc'd address at
+// `ptr - sizeof(void*)` and handmade_aligned_free reads it back. They should match.
+//
+// The production SIGSEGV (Add_Points line 485 → ~vector → handmade_aligned_free → __libc_free)
+// is consistent with cross-TU inconsistency: SOME TU sees MALLOC_ALREADY_ALIGNED=1 (and
+// allocates via std::malloc), another TU sees =0 (and frees via handmade_aligned_free, which
+// reads garbage at ptr-8). The linker picks one TU's instantiation per template, mismatched.
+//
+// Forcing the macros HERE — before any other include — guarantees that every TU pulling in
+// this header (which is every TU that touches the kd-tree) sees the same Eigen allocator
+// dispatch. The same defines exist in CMakeLists.txt as `target_compile_definitions PUBLIC`,
+// but PUBLIC propagation can fail to reach all TUs (e.g., when included transitively via
+// PCL or another header before the consumer applies our compile flags).
+//
+// EIGEN_MALLOC_ALREADY_ALIGNED=1 forces aligned_malloc/free to be std::malloc/free.
+// EIGEN_DEFAULT_ALIGN_BYTES=16 caps Eigen's alignment to what std::malloc actually delivers
+// on x86_64 glibc, preventing AVX-promoted 32-byte alignment expectations from being violated
+// when std::malloc returns 16-byte-aligned storage.
+#ifndef EIGEN_MALLOC_ALREADY_ALIGNED
+#define EIGEN_MALLOC_ALREADY_ALIGNED 1
+#endif
+#ifndef EIGEN_DEFAULT_ALIGN_BYTES
+#define EIGEN_DEFAULT_ALIGN_BYTES 16
+#endif
+#ifndef EIGEN_MAX_ALIGN_BYTES
+#define EIGEN_MAX_ALIGN_BYTES 16
+#endif
+
 #include <stdio.h>
 #include <queue>
 #include <pthread.h>
@@ -8,6 +48,9 @@
 #include <math.h>
 #include <algorithm>
 #include <memory.h>
+#include <atomic>
+#include <mutex>
+#include <shared_mutex>
 #include <pcl/point_types.h>
 
 #define EPSS 1e-6
@@ -60,15 +103,27 @@ public:
     {
         PointType point;
         int division_axis;
-        int TreeSize = 1;
-        int invalid_point_num = 0;
-        int down_del_num = 0;
-        bool point_deleted = false;
-        bool tree_deleted = false;
-        bool point_downsample_deleted = false;
-        bool tree_downsample_deleted = false;
-        bool need_push_down_to_left = false;
-        bool need_push_down_to_right = false;
+        // Deletion-propagation counters and flags (HARDENING Phase 2.4).
+        //
+        // These are written by Push_Down (which now holds the writer node's
+        // push_down_mutex_lock — the PARENT's lock for its own flag clears, the
+        // CHILD's lock for the child-field writes) and by the Add_/Delete_
+        // mutators (under that node's push_down_mutex_lock). They are read
+        // lock-free from the search hot paths (Search / Search_by_range /
+        // Search_by_radius / Criterion_Check / Update). Making them atomic is
+        // what makes those lock-free reads defined behaviour (TSan-clean); the
+        // per-node mutex provides the write-side mutual exclusion that closes
+        // the lost-update window on the bool flags. See ikd_Tree.cpp's Push_Down
+        // comment block for the full contract.
+        std::atomic<int> TreeSize{1};
+        std::atomic<int> invalid_point_num{0};
+        std::atomic<int> down_del_num{0};
+        std::atomic<bool> point_deleted{false};
+        std::atomic<bool> tree_deleted{false};
+        std::atomic<bool> point_downsample_deleted{false};
+        std::atomic<bool> tree_downsample_deleted{false};
+        std::atomic<bool> need_push_down_to_left{false};
+        std::atomic<bool> need_push_down_to_right{false};
         bool working_flag = false;
         pthread_mutex_t push_down_mutex_lock;
         float node_range_x[2], node_range_y[2], node_range_z[2];
@@ -259,13 +314,13 @@ private:
     bool termination_flag = false;
     bool rebuild_flag = false;
     pthread_t rebuild_thread;
-    pthread_mutex_t termination_flag_mutex_lock, rebuild_ptr_mutex_lock, working_flag_mutex, search_flag_mutex;
+    pthread_mutex_t termination_flag_mutex_lock, rebuild_ptr_mutex_lock, working_flag_mutex;
     pthread_mutex_t rebuild_logger_mutex_lock, points_deleted_rebuild_mutex_lock;
     // queue<Operation_Logger_Type> Rebuild_Logger;
     MANUAL_Q Rebuild_Logger;
     PointVector Rebuild_PCL_Storage;
     KD_TREE_NODE **Rebuild_Ptr = nullptr;
-    int search_mutex_counter = 0;
+    std::shared_mutex search_rw_mutex_;
     static void *multi_thread_ptr(void *arg);
     void multi_thread_rebuild();
     void start_thread();
@@ -333,6 +388,18 @@ public:
     void Delete_Points(PointVector &PointToDel);
     int Delete_Point_Boxes(vector<BoxPointType> &BoxPoints);
     void flatten(KD_TREE_NODE *root, PointVector &Storage, delete_point_storage_set storage_type);
+    // Thread-safe flatten over Root_Node. Acquires search_rw_mutex_ (shared),
+    // which coordinates with multi_thread_rebuild's subtree-swap critical
+    // section at ikd_Tree.cpp:259 and ikd_Tree.cpp:293. Callers that run
+    // concurrently with the internal rebuild thread (the async map-update
+    // lambda, the SaveMap action) MUST use this instead of calling
+    // flatten(Root_Node, ...) directly — the raw flatten traverses
+    // left_son_ptr/right_son_ptr with no synchronization against the rebuild
+    // thread swapping a subtree, which races to UAF.
+    void flatten_safe(PointVector &Storage, delete_point_storage_set storage_type) {
+        std::shared_lock<std::shared_mutex> rlock(search_rw_mutex_);
+        flatten(Root_Node, Storage, storage_type);
+    }
     void acquire_removed_points(PointVector &removed_points);
     BoxPointType tree_range();
     PointVector PCL_Storage;

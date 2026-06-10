@@ -1,0 +1,106 @@
+/**:
+  ros__parameters:
+    # ------------------------------------------------------------------
+    # Generic PointCloud2 template.
+    #
+    # Uses the "PointCloud2" lidar type: RESPLE introspects the cloud's
+    # PointField list at runtime, so ANY sensor_msgs/PointCloud2 works —
+    # no per-sensor point struct needed. Field names are auto-resolved
+    # from common conventions (time: t/time/timestamp/offset_time/...,
+    # intensity: intensity/reflectivity); override below only if your
+    # driver is unusual. Copy this file and adjust topics/extrinsics.
+    # ------------------------------------------------------------------
+
+    # Frame IDs for TF tree
+    odom/frame_id: odom              # Odom (odometry frame_id) frame
+    map/frame_id: map                # Map frame
+    frame_id: base_link              # Robot (odometry child_frame_id) frame
+
+    odom/publish_tf: True
+    odom/invert_tf: False
+    map/publish_tf: True
+    map/invert_tf: False
+
+    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
+    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
+    publish_tf: true
+
+    topic_imu: /imu/data
+    acc_ratio: false
+    lidars: ["Generic"]
+    Generic:
+      topic_lidar: /points
+      lidar_type: PointCloud2     # <- the generic, field-introspecting path
+      scan_line: 0                # unused by the generic path
+      blind: 0.5                  # drop points within this radius (m)
+      q_lb: [1.0, 0.0, 0.0, 0.0]  # lidar->body extrinsic rotation (w,x,y,z)
+      t_lb: [0.0, 0.0, 0.0]       # lidar->body extrinsic translation
+      w_pt: 0.01
+      # Optional overrides for unusual drivers (leave defaults otherwise):
+      time_field: ""              # per-point time field name ("" = auto)
+      time_unit: auto             # auto | s | ms | us | ns
+                                  #   auto: float fields = seconds,
+                                  #         integer fields = nanoseconds
+      intensity_field: ""         # reflectivity field name ("" = auto)
+    lidar_time_offset: 0.0
+
+    knot_hz: 100
+    if_lidar_only: false
+
+    ds_scan_voxel: 0.2
+    point_filter_num: 3
+    num_threads: 8
+    nn_thresh: 0.5
+    coeff_cov: 3.0
+    num_match_points: 8    # k-NN for plane fit
+
+    ds_lm_voxel: 0.2
+    cube_len: 1000.0
+
+    cov_P0: 0.02
+    cov_RCP_pos_old: 0.1
+    cov_RCP_ort_old: 0.1
+    cov_RCP_pos_new: 1.0
+    cov_RCP_ort_new: 1.0
+    std_sys_pos: 0.2
+    std_sys_ort: 0.1
+    cov_acc: [1.0,1.0,1.0]
+    cov_gyro: [0.1,0.1,0.1]
+    cov_ba: [0.2, 0.2, 0.2]
+    cov_bg: [0.2, 0.2, 0.2]
+    n_iter: 1
+    num_points_upd: 500
+
+    imu_init_num_samples: 50     # IMU samples averaged during stationary init
+    imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+
+    # ------------------------------------------------------------------
+    # Robustness & diagnostics (see doc/PARAMETERS.md and HARDENING.md).
+    # Everything below is optional; the values shown are the built-in
+    # defaults, which preserve the estimator's historical behaviour.
+    # Typed runtime health is published on `resple_diagnostics`
+    # (estimate_msgs/Diagnostics, ~20 Hz, plottable in Foxglove/PlotJuggler).
+    # ------------------------------------------------------------------
+    spline_prune_keep_knots: 600   # knots kept in memory (~6 s @ knot_hz 100);
+                                   # retained-window interpolation is identical
+                                   # to the unpruned spline. 0 = unbounded.
+    nn_max_sq_dist: 5.0            # k-th-neighbor max squared distance (m^2);
+                                   # k-NN search radius = sqrt of this
+    plane_fit_thresh: 0.1          # plane-fit residual threshold (m)
+    plane_min_cond_ratio: 0.0      # plane degeneracy guard (QR pivot ratio);
+                                   # 0 = off. Benchmark before enabling — it
+                                   # changes which matches feed the filter.
+    nis_window: 32                 # filter-consistency (NIS) window, IEKF cycles
+    nis_warn_ratio: 2.0            # WARN when NIS mean > ratio x dof
+    nis_diverged_ratio: 4.0        # DIVERGED threshold
+    nis_breach_limit: 3            # consecutive breaches before DIVERGED
+    nis_recovery_mode: "off"       # "off" = log+diagnostics only
+                                   # "hold" = suspend odom/TF while DIVERGED
+                                   # "reset" = reinflate filter covariance
+                                   # (keep quotes: bare off is YAML false)
+    map_prune_radius: 0.0          # keep only map points within this radius (m)
+                                   # of the pose (floored at 2x det range);
+                                   # 0 = cube-only (cube_len)
+    max_scan_buffer: 0             # per-LiDAR raw-scan cap (scans, drop-oldest);
+                                   # 0 = unbounded
+    max_imu_staging: 2000          # IMU staging cap (samples, drop-oldest)
