@@ -1381,6 +1381,38 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
     est window, WARNs + counts in `/diagnostics` when the motion exceeds what
     `knot_hz` resolves — so bag runs now measure under-resolution directly
     instead of inferring it from smear renders.
+  - *Spline theory + lineage:* the ETH continuous-time estimation survey
+    (arXiv:2411.03951) is the canonical reference for the knot-count/order
+    vs accuracy/cost trade-off; Cioffi et al. (RA-L 2021, CT-vs-DT SLAM)
+    formalize when continuous-time wins. SFUISE (arXiv:2301.09033) is this
+    group's own predecessor (recursive sliding-window spline fusion) —
+    consult it before touching the RCP recursion.
+  - *Degeneracy detection (feeds the open §3.2 `plane_min_cond_ratio`
+    decision):* the literature gates the OPTIMIZATION, not the per-plane
+    fit — X-ICP projects normalized Jacobians onto the Hessian eigenspace
+    for per-axis NONE/PARTIAL/FULL localizability; LION/others threshold
+    the Hessian condition number; GenZ-ICP (arXiv:2411.06766) adaptively
+    reweights instead of gating; "Informed, Constrained, Aligned"
+    (arXiv:2408.11809) is a field comparison of these methods. Our QR
+    pivot-ratio gate is per-correspondence — a cheap per-update diagnostic
+    on the stacked LiDAR Jacobian's eigenspectrum (the H rows already
+    exist in pt_meas) would match the literature-standard signal and could
+    decide §3.2 with better evidence than the plane-fit-level gate alone.
+  - *Map data structure:* Faster-LIO's iVox (parallel sparse incremental
+    voxels) trades slower per-query k-NN (~2.76 vs ~1.42 µs/point) for
+    O(1) insertion and NO REBUILD THREAD. Note well: the ikd-Tree rebuild
+    thread is the root of hazards 33–35 (Phases 2.4/2.5, the costliest
+    concurrency work in this package) — an iVox-class structure would
+    delete that hazard class outright, which is a stronger motive here
+    than raw speed. Surfel-LIO (arXiv:2512.03397, Z-order voxel hashing +
+    precomputed surfels) is the newer same-family option.
+  - *Validation datasets beyond the current bags:* the Hilti SLAM
+    Challenge / Hilti-Oxford datasets (arXiv:2208.09825; 2021–2023
+    editions, handheld + robot-mounted, deliberate shaking/swinging,
+    narrow stairs, dark corners) provide MILLIMETER-accurate control-point
+    ground truth — directly useful because HelmDyn's mocap orientation GT
+    is unreliable (§6.3 baseline note), so Hilti sequences can quantify
+    orientation accuracy under aggressive motion where HelmDyn cannot.
 
   *Main-vs-lyrical logic audit (2026-06-11):* before trusting the
   "inherent real-time gap" framing, the map path was diffed against upstream
