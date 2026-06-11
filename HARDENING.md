@@ -1328,6 +1328,20 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
   through an `origin/main` build vs a parity-configured current build
   (`doc/PARAMETERS.md` § "Reproducing the original (`main`) behavior"),
   compare `evo_ape` + map renders.
+
+  *Operator report (2026-06-11):* smearing was observed on the **hardened
+  build** on HelmDyn01 AND **R_Campus** (LIO, Livox Avia, handheld-grade
+  motion), among other datasets, while the operator's recollection is that
+  upstream `main` rendered these crisp. Two implications: (1) the smear is
+  NOT confined to HelmDyn-grade violent motion — ordinary walking/handheld
+  yaw oscillation suffices, so the original "only extreme motion exposes
+  it" framing above is too narrow and the map-lag default matters in
+  normal operation; (2) the regression hypothesis (estimator numeric-path
+  deltas, previous paragraph) is strengthened and the main-parity A/B is
+  promoted to the highest-priority bag-gated experiment. Suggested order:
+  first re-render R_Campus on the current build with `map_deskew_lag_knots`
+  ∈ {0, 4, 8} (cheap, isolates the edge-deskew mechanism), then the
+  main-vs-parity A/B (isolates the numeric regression).
 - **Faster knot convergence — POTENTIAL ISSUES (document before attempting).**
   Trying to make the trailing knots converge sooner (more IEKF iterations,
   larger point budget, or tighter orientation process/measurement noise so the
