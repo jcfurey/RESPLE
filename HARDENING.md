@@ -1347,6 +1347,35 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
   `map_insert_lag_knots` ∈ {0, 8}, after the display-lag sweep isolates the
   display-side effect.
 
+  **Related work map (2026-06-11 survey)** — where each thread of the smear
+  problem sits in the literature, for designing follow-ups after the bag
+  experiments:
+  - *Lagged/converged map admission (what we shipped):* retrospective map
+    refinement (arXiv:2503.21293) — lag queue, promote to map after pose
+    convergence; SLICT (arXiv:2211.03900) — scans enter the map only at
+    sliding-window marginalization. Both validate the
+    `map_deskew_lag_knots` / `map_insert_lag_knots` design.
+  - *Uncertainty-weighted maps (the alternative to binary lag):* VoxelMap
+    (arXiv:2109.07082) propagates BOTH LiDAR noise and POSE-ESTIMATE
+    covariance into per-plane uncertainty, then weights matching by it —
+    instead of delaying insertion, insert immediately but downweight
+    edge-pose points until "empirical convergence of plane uncertainty".
+    Candidate future capability: covariance-gated insertion (gate/weight by
+    the IEKF's edge-knot covariance rather than a fixed knot count) — lighter
+    than adopting VoxelMap wholesale, subsumes the fixed lag as a special
+    case.
+  - *Estimate-side fixes for aggressive motion (the part lag cannot fix):*
+    Point-LIO (10.1002/aisy.202200459) updates per-point at 4–8 kHz, removes
+    in-frame distortion by construction, and survives IMU saturation at
+    75 rad/s — the benchmark for HelmDyn-class motion. Coco-LIC
+    (arXiv:2309.09808) places B-spline knots NON-UNIFORMLY by motion
+    intensity; ATI-CTLO (arXiv:2407.20619) adapts the temporal interval
+    likewise; FR-LIO (arXiv:2302.04031) splits scans into sub-frames by
+    motion intensity and smooths within an iterated Kalman smoother window.
+    Shared lesson: a fixed `knot_hz` under-fits violent yaw — adaptive knot
+    density is the principled estimate-side remedy if the lag sweep + parity
+    A/B leave residual smear on HelmDyn01.
+
   *Main-vs-lyrical logic audit (2026-06-11):* before trusting the
   "inherent real-time gap" framing, the map path was diffed against upstream
   `main`. The Mapping node is logic-equivalent (same `t_end <= maxTimeNs`
