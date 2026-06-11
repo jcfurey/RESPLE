@@ -1731,6 +1731,39 @@ private:
             estimator_lio.corresp_cfg = ccfg;
         }
 
+        // HARDENING §3.2 robust kernel on the point-to-plane residuals
+        // (M-estimator IRLS weight on each point's information; softens the
+        // binary accept-reject cliff). "none" preserves legacy weighting
+        // exactly; off by default pending bag A/B via the funnel +
+        // localizability diagnostics.
+        {
+            const std::string kernel = CommonUtils::readParam<std::string>(
+                this->get_node_parameters_interface(), "robust_kernel", std::string("none"));
+            double kernel_delta = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "robust_kernel_delta", 0.1);
+            int kernel_id = 0;
+            if (kernel == "huber") kernel_id = 1;
+            else if (kernel == "cauchy") kernel_id = 2;
+            else if (kernel != "none") {
+                RCLCPP_WARN(this->get_logger(),
+                    "robust_kernel='%s' unknown (none|huber|cauchy); using none", kernel.c_str());
+            }
+            if (kernel_delta <= 0.0) {
+                RCLCPP_WARN(this->get_logger(),
+                    "robust_kernel_delta=%.3f must be > 0; using 0.1", kernel_delta);
+                kernel_delta = 0.1;
+            }
+            estimator_lo.robust_kernel = kernel_id;
+            estimator_lio.robust_kernel = kernel_id;
+            estimator_lo.robust_delta = kernel_delta;
+            estimator_lio.robust_delta = kernel_delta;
+            if (kernel_id != 0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] robust_kernel=%s (delta=%.3f m) on LiDAR residuals.",
+                    kernel.c_str(), kernel_delta);
+            }
+        }
+
         // HARDENING §3.1 sliding-window knot pruning. Default 600 knots
         // (6 s at the canonical knot_hz=100) bounds spline memory while
         // staying far wider than any backward-looking consumer. 0 disables.

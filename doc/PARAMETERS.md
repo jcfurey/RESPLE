@@ -132,6 +132,8 @@ All behaviour-preserving or opt-in by default. Section references are to
 | `nn_max_sq_dist` | `5.0` | §3.2 correspondence gate: max squared distance (m²) of the k-th nearest neighbor; the k-NN search radius is its square root. |
 | `plane_fit_thresh` | `0.1` | §3.2 plane-fit residual threshold (m): every neighbor must lie within this distance of the fitted plane. |
 | `plane_min_cond_ratio` | `0.0` | §3.2 degeneracy guard (rank-revealing-QR pivot ratio): rejects collinear / rank-deficient neighbor patches. `0` = off. Enabling changes which correspondences feed the filter — benchmark against a known-good dataset first; watch the funnel counters. |
+| `robust_kernel` | `"none"` | §3.2 M-estimator on the point-to-plane residuals: `"none"` (legacy weighting, bit-exact), `"huber"`, or `"cauchy"`. The IRLS weight `w(zp)` scales each point's information in the IEKF, smoothly downweighting outliers; the legacy `pt_thresh`/`cov_thresh` accept-reject gate is kept — the kernel softens what survives it (adaptive kernels: arXiv:2004.14938). Off pending bag A/B against the funnel + localizability diagnostics. |
+| `robust_kernel_delta` | `0.1` | §3.2 kernel scale (m, residual units): the soft threshold where the loss transitions from quadratic to robust. Matches `plane_fit_thresh` scale by default. |
 | `nis_window` | `32` | §3.3 NIS consistency window (IEKF cycles). |
 | `nis_warn_ratio` | `2.0` | WARN when windowed NIS mean exceeds ratio × dof. |
 | `nis_diverged_ratio` | `4.0` | DIVERGED threshold (same form). |

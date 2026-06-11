@@ -1461,11 +1461,26 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
     outlier handling is binary gates (`nn_thresh`, `plane_fit_thresh`);
     the literature standard is an M-estimator weight (Huber/Cauchy) on
     each point-to-plane residual, and adaptive kernels (Barron's loss,
-    arXiv:2004.14938) self-tune the shape online. A per-point weight in
-    `updateIEKF*` (scale the H row + residual, or equivalently inflate R)
-    is a small, well-understood change — the most implementable
-    remediation candidate if the localizability/funnel diagnostics show
-    outlier-driven inconsistency in the bags.
+    arXiv:2004.14938) self-tune the shape online. IMPLEMENTED
+    (2026-06-11, fixed kernels, off by default): `robust_kernel`
+    none|huber|cauchy + `robust_kernel_delta`, applied as an IRLS weight
+    on each point's information (`cov_inv_buf_`) in both updateLiDAR
+    paths; "none" is bit-exact legacy. Barron's adaptive α deferred —
+    fixed kernels first, A/B on bags via the funnel + localizability
+    diagnostics, then decide if adaptivity earns its complexity.
+  - *Deep-read outcomes (2026-06-11):* Kinematic-ICP's own Palace
+    ablation shows the unicycle subspace UNDERPERFORMS the baseline on
+    uneven terrain → do not adopt the constraint for the rover; its
+    no-tuning adaptive regularization (β = ICP cost at the wheel-odom
+    prediction) is the reusable idea if wheel fusion ever moves into
+    RESPLE. SE(2)-LIO's perturbation-as-noise (σz, Σθxy) is the correct
+    soft formulation if/when the downstream double-counting question is
+    settled. The spatio-temporal-normal dynamic-LIO paper's math is not
+    accessible (abstract + compressed PDF only) — dynamic screening at
+    staging-release stays DEFERRED rather than implemented from a
+    paraphrase. ERASOR on SaveMap exports needs per-scan poses + scans,
+    which production bags already contain — run ERASOR offline from a
+    bag + /odom, no SaveMap extension required.
 
   *Main-vs-lyrical logic audit (2026-06-11):* before trusting the
   "inherent real-time gap" framing, the map path was diffed against upstream
