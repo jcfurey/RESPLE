@@ -1429,6 +1429,43 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
     ground truth — directly useful because HelmDyn's mocap orientation GT
     is unreliable (§6.3 baseline note), so Hilti sequences can quantify
     orientation accuracy under aggressive motion where HelmDyn cannot.
+  - *Ground-vehicle priors (production-deployment relevant — Rover MAX):*
+    Kinematic-ICP (arXiv:2410.10277) and SE(2)-constrained LIO
+    (arXiv:2404.01584) add planar/kinematic soft constraints; LIWO
+    (arXiv:2302.14298) adds wheel-encoder velocity observations. RESPLE
+    estimates unconstrained 6-DoF; a soft planar prior or wheel-velocity
+    pseudo-measurement in the IEKF could cut z/pitch/roll drift on the
+    rover. CAUTION: production already fuses RESPLE into the
+    robot_localization EKF alongside wheel odom — a native constraint
+    would double-count unless the downstream fusion is rebalanced, and
+    hard SE(2) breaks on rough terrain. Soft-constraint-with-honest-
+    covariance only, and only after the A/B campaign settles the baseline.
+  - *Dynamic-object-aware mapping (production-relevant):* moving
+    people/vehicles insert ghost points into the ikd-Tree reference map —
+    the same corrupt-the-reference feedback loop as the smear, different
+    cause. ERASOR family (pseudo-occupancy, offline map cleaning —
+    applicable to SaveMap exports today), ID-LIO (delayed removal — note:
+    our `map_insert_lag_knots` staging is a natural host for a future
+    cheap dynamic filter at release time), and spatio-temporal normal
+    analysis LIO (arXiv:2510.22313) for the online case.
+  - *Filter-consistency theory (the WHY behind §3.3 NIS):* FEJ-EKF (Huang
+    et al.) and observability-based consistency rules show Jacobians
+    re-evaluated at updated estimates inflate the observable subspace →
+    spurious information gain → overconfidence — and explicitly note the
+    ITERATED EKF does not fix this. RESPLE's IEKF relinearizes each
+    iteration; the §3.3 NIS detector catches exactly this symptom class.
+    If bags show systematic NIS divergence (not just under degeneracy),
+    FEJ-style pinned linearization for the older RCPs is the literature
+    direction — research-grade for a spline filter, record only.
+  - *Robust kernels (cheap, concrete §3.2 upgrade path):* RESPLE's
+    outlier handling is binary gates (`nn_thresh`, `plane_fit_thresh`);
+    the literature standard is an M-estimator weight (Huber/Cauchy) on
+    each point-to-plane residual, and adaptive kernels (Barron's loss,
+    arXiv:2004.14938) self-tune the shape online. A per-point weight in
+    `updateIEKF*` (scale the H row + residual, or equivalently inflate R)
+    is a small, well-understood change — the most implementable
+    remediation candidate if the localizability/funnel diagnostics show
+    outlier-driven inconsistency in the bags.
 
   *Main-vs-lyrical logic audit (2026-06-11):* before trusting the
   "inherent real-time gap" framing, the map path was diffed against upstream
