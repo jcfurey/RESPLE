@@ -1398,6 +1398,16 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
     on the stacked LiDAR Jacobian's eigenspectrum (the H rows already
     exist in pt_meas) would match the literature-standard signal and could
     decide §3.2 with better evidence than the plane-fit-level gate alone.
+    DETECTION IMPLEMENTED (2026-06-11), report-only: per update, the
+    per-point-normalized constraint information matrices E_tt = Σnnᵀ/N and
+    E_rr = Σ(p×n)(p×n)ᵀ/N as SEPARATE 3×3 blocks (a joint 6×6 mixes
+    meter-scaled rotation rows with unit normals → scale-dependent
+    condition number, the field-analysis pitfall), min-eig + condition for
+    each in `/diagnostics` ("Localizability ..."). Hard gating deliberately
+    NOT implemented: arXiv:2408.11809's own conclusion is that eigenvalue
+    thresholds are brittle across environments — collect bag distributions
+    first, then decide §3.2 remediation (GenZ-ICP-style reweighting being
+    the literature favorite over hard gates).
   - *Map data structure:* Faster-LIO's iVox (parallel sparse incremental
     voxels) trades slower per-query k-NN (~2.76 vs ~1.42 µs/point) for
     O(1) insertion and NO REBUILD THREAD. Note well: the ikd-Tree rebuild
@@ -1405,7 +1415,13 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
     concurrency work in this package) — an iVox-class structure would
     delete that hazard class outright, which is a stronger motive here
     than raw speed. Surfel-LIO (arXiv:2512.03397, Z-order voxel hashing +
-    precomputed surfels) is the newer same-family option.
+    precomputed surfels) is the newer same-family option. DELIBERATELY NOT
+    implemented as a drive-by (2026-06-11): Faster-LIO's own numbers show
+    per-query k-NN ~2× SLOWER than ikd-Tree (≈2.76 vs ≈1.42 µs/point — its
+    wins are insertion + parallelism), and RESPLE's hot loop is
+    k-NN-dominated (num_match_points plane fits per point), so a naive swap
+    risks a net regression. If attempted: own project, benchmarked on our
+    bags, justified by the hazard-class deletion.
   - *Validation datasets beyond the current bags:* the Hilti SLAM
     Challenge / Hilti-Oxford datasets (arXiv:2208.09825; 2021–2023
     editions, handheld + robot-mounted, deliberate shaking/swinging,

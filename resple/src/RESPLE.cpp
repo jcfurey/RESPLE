@@ -832,10 +832,16 @@ public:
                     }
                 }
                 size_t n_release = 0;
+                Eigen::Quaterniond q_edge = Eigen::Quaterniond::Identity();
                 {
                     // pointBodyToWorld reads spline; keep serialized with
                     // IEKF writes via spline_mutex_.
                     std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                    // Edge orientation for the localizability diagnostic below
+                    // (rotates world-frame plane normals into the body frame;
+                    // one rotation for the whole update is adequate for a
+                    // diagnostic over a ≤100 ms point window).
+                    spline->itpQuaternion(spline->maxTimeNs(), &q_edge);
                     if (map_insert_lag_knots_ == 0) {
                         // Upstream behavior: world-fix at IEKF time (edge knots).
                         #pragma omp parallel for num_threads(num_threads_)
@@ -915,6 +921,35 @@ public:
                     // executor thread; atomic read there is lock-free).
                     cached_spline_knots_.store(spline->numKnots(), std::memory_order_relaxed);
                     cached_spline_total_knots_.store(spline->totalKnots(), std::memory_order_relaxed);
+                }
+                // §3.2/§6.3 localizability diagnostic from this update's valid
+                // point-to-plane constraints (rationale at the member decls:
+                // separate 3×3 blocks, per-point normalized, report-only).
+                {
+                    Eigen::Matrix3d E_tt = Eigen::Matrix3d::Zero();
+                    Eigen::Matrix3d E_rr = Eigen::Matrix3d::Zero();
+                    size_t n_valid = 0;
+                    for (size_t i = 0; i < pt_meas.size(); i++) {
+                        const PointData& pt_data = pt_meas[i];
+                        if (!pt_data.if_valid) continue;
+                        const Eigen::Vector3d n_b = q_edge.conjugate() * pt_data.normvec;
+                        const Eigen::Vector3d rxn = pt_data.pt_b.cross(n_b);
+                        E_tt.noalias() += n_b * n_b.transpose();
+                        E_rr.noalias() += rxn * rxn.transpose();
+                        n_valid++;
+                    }
+                    if (n_valid >= 6) {
+                        E_tt /= static_cast<double>(n_valid);
+                        E_rr /= static_cast<double>(n_valid);
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_t(E_tt);
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_r(E_rr);
+                        const Eigen::Vector3d lt = es_t.eigenvalues();  // ascending
+                        const Eigen::Vector3d lr = es_r.eigenvalues();
+                        degen_min_eig_trans_.store(static_cast<float>(lt(0)), std::memory_order_relaxed);
+                        degen_min_eig_rot_.store(static_cast<float>(lr(0)), std::memory_order_relaxed);
+                        degen_cond_trans_.store(static_cast<float>(lt(0) > 0.0 ? lt(2) / lt(0) : 0.0), std::memory_order_relaxed);
+                        degen_cond_rot_.store(static_cast<float>(lr(0) > 0.0 ? lr(2) / lr(0) : 0.0), std::memory_order_relaxed);
+                    }
                 }
                 if (map_insert_lag_knots_ == 0) {
                     for (size_t i = 0; i < pt_meas.size(); i++) {
@@ -1402,6 +1437,21 @@ private:
     int64_t knot_rot_checked_ = 0;
     std::atomic<uint64_t> knot_rot_warn_count_{0};
     std::atomic<uint32_t> knot_rot_max_mrad_{0};
+    // §6.3 / §3.2 LiDAR localizability diagnostic (X-ICP family, report-only).
+    // Per update, the information matrices of the point-to-plane constraints:
+    //   E_tt = (1/N) Σ n nᵀ        (translation, world-frame-invariant scale)
+    //   E_rr = (1/N) Σ (p×n)(p×n)ᵀ (rotation, body-frame lever arms)
+    // kept as SEPARATE 3×3 blocks — a joint 6×6 mixes meter-scaled rotation
+    // rows with unit normals and its condition number becomes
+    // scale-dependent (the arXiv:2408.11809 field-analysis pitfall). Min
+    // eigenvalue ≈ how constrained the weakest axis is; condition number ≈
+    // anisotropy. Report-only by design: hard eigenvalue gates are brittle
+    // across environments (same field analysis); these fields exist to
+    // decide §3.2 (plane_min_cond_ratio) from bag evidence.
+    std::atomic<float> degen_min_eig_trans_{0.f};
+    std::atomic<float> degen_min_eig_rot_{0.f};
+    std::atomic<float> degen_cond_trans_{0.f};
+    std::atomic<float> degen_cond_rot_{0.f};
     double cube_len = 2000; 
     const float MOV_THRESHOLD = 1.5f;
     float det_range = 100.0;
@@ -2113,6 +2163,13 @@ private:
                  knot_rot_max_mrad_.load(std::memory_order_relaxed) / 1000.0);
         stat.add("Knot Rotation Warnings",
                  static_cast<int>(knot_rot_warn_count_.load(std::memory_order_relaxed)));
+        // §3.2 localizability (per-point-normalized constraint information;
+        // min eigenvalue = weakest axis, condition = anisotropy; 0 until the
+        // first update with >= 6 valid correspondences).
+        stat.add("Localizability Min Eig (trans)", degen_min_eig_trans_.load(std::memory_order_relaxed));
+        stat.add("Localizability Min Eig (rot)", degen_min_eig_rot_.load(std::memory_order_relaxed));
+        stat.add("Localizability Cond (trans)", degen_cond_trans_.load(std::memory_order_relaxed));
+        stat.add("Localizability Cond (rot)", degen_cond_rot_.load(std::memory_order_relaxed));
         stat.add("Num Match Points", num_match_points_);
 
         // Buffer sizes: read the worker-maintained atomic caches instead of the
