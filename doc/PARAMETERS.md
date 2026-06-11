@@ -159,7 +159,7 @@ Runtime parameters:
 | `num_threads: 1` | Serial k-NN / transforms (original FP evaluation order) |
 | `num_match_points: 5` | Already the default (upstream constant) |
 | `nis_recovery_mode: "off"` | Already the default |
-| `max_scan_buffer: 0`, `max_imu_staging: 0` | Unbounded ingest buffers (`max_scan_buffer` already default) |
+| `max_scan_buffer: 0`, `max_imu_staging: 2000` | Already the defaults: unbounded scan buffer; `main` hardcoded the 2000-sample IMU staging cap |
 
 Build flags (numeric path — parameters cannot toggle these):
 
