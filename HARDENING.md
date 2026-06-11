@@ -1636,6 +1636,74 @@ it does NOT translate into code changes here.
   measure the sensor→/odom chain end-to-end instead of ad-hoc timers if
   the deskew/processing-time diagnostics ever implicate transport.
 
+### 6.6 Dynamic-aware mapping (BTSA) — implementation-ready design
+
+Unblocks the §6.3 deferral: the paper's math was recovered from the HTML
+version and the released code (github.com/thisparticle/btsa, RA-L 2025,
+arXiv:2510.22313) was read. Mechanism, from source:
+
+- **Time channel:** every point in a short-lived temporal map carries its
+  timestamp in `curvature` (ms; `/1000` → seconds in the fit). The
+  temporal map retains ~2 s of scans (`time_slice: 20` at 10 Hz).
+- **Detection (`esti_stPlane`, common_lib.h:231):** per query point, k-NN
+  (k=`neighborhood_size: 15`) in the temporal map → 4×4 covariance of
+  (x, y, z, t) → smallest eigenvector ñ=(a,b,c,d). |d| is surface
+  velocity projected on the spatial normal; `|d| ≥ vel_thre (0.2)` ⇒
+  dynamic ⇒ excluded from registration (`point_selected_surf_=false`).
+  Static surfaces give d≈0 because their 4D neighborhood is flat in t.
+- **False-positive rescue (before global map insertion):** upsample
+  flagged points to full resolution (kNN/radius), DBSCAN-cluster,
+  bounding-box, then volumetric-overlap test against a short-term static
+  voxel map — high-overlap clusters are newly-visible STATIC area and are
+  kept.
+- **Cost & results:** ~49.7 ms/scan on an i5-12490 (the whole real-time
+  budget of our worker on embedded hardware); ablation APE 35.84 m →
+  0.46 m in dynamic + geometrically-degenerate scenes — the gain is
+  existential there, marginal in static scenes.
+
+**RESPLE adaptation (when a dynamic-objects bag exists):**
+1. Stamp absolute insertion time (s) into the `curvature` field of map
+   copies (currently carries reflectivity, unused by matching; SaveMap
+   would inherit the channel).
+2. Maintain a second, small temporal kd-tree (~2 s retention) alongside
+   the main ikd-Tree — BTSA's detection NEVER queries the long-lived
+   registration map, and neither should ours (mixed-age static points
+   would dilute d).
+3. Cheapest integration first: score points at `map_insert_staging_`
+   RELEASE time (the hook recorded in §6.3) and drop |d|-flagged points
+   from map insertion only. Registration gating (BTSA's bigger win, but
+   also its bigger cost/risk) second, only if the bag shows registration
+   itself is corrupted by dynamics.
+4. Start params: `vel_thre 0.2`, k=15, 2 s window; expose all three.
+
+Decision gate: requires a bag with actual moving objects + ground truth
+(or at least map renders); none of the current bags qualifies. Until
+then this stays a design.
+
+### 6.7 Pending capabilities & decision queue (consolidated)
+
+Single place to find every shipped-but-off capability and deferred
+design, what evidence flips it, and where it is documented.
+
+| Capability | Param / location | Default | Decision gate | Ref |
+| --- | --- | --- | --- | --- |
+| Display-map deskew lag | `map_deskew_lag_knots` | **8 (ON)** | Lag sweep {0,4,8} on R_Campus/HelmDyn01 confirms horizon | §6.3 |
+| Internal-map insertion lag | `map_insert_lag_knots` | 0 (off) | APE A/B {0,8} after display sweep | §6.3 |
+| Covariance-gated early release | `map_insert_cov_gate_deg` | 0 (off) | Enable with insertion lag; watch NIS + funnel | §6.3 |
+| Robust kernel (Huber/Cauchy) | `robust_kernel`, `robust_kernel_delta` | none (off) | Funnel + localizability show outlier-driven inconsistency | §6.3 |
+| map→odom future-dating | `map/transform_tolerance` | 0 (off) | A downstream consumer needs exact-time map-frame lookups | doc/PARAMETERS.md |
+| Main-parity numeric path | `-DENABLE_EIGEN_BLAS=OFF` + recipe | BLAS on | Main-vs-parity A/B (the regression question) | doc/PARAMETERS.md |
+| Knot under-resolution warn | `knot_rotation_warn_rad` | **0.05 (ON)** | Tune threshold per deployment if noisy | §6.3 |
+| Localizability diagnostics | (always on, report-only) | — | Feeds the §3.2 `plane_min_cond_ratio` decision | §6.3 |
+| Plane-fit degeneracy gate | `plane_min_cond_ratio` | 0 (off) | Localizability distributions from bags | §6.3 / §3.2 |
+| Dynamic-aware mapping (BTSA) | design only | — | Bag with moving objects | §6.6 |
+| Barron adaptive kernel α | design only | — | Fixed kernels A/B first | §6.3 |
+| SE(2)/wheel soft prior | design only | — | Downstream fusion rebalance decision | §6.3 |
+| iVox/ikd-Tree replacement | design only | — | Own benchmarked project (hazard-class motive) | §6.3 |
+| EventsExecutor | noted only | — | ros2_tracing shows callback-dispatch latency | §6.5 |
+| zenoh SHM transport | ops config | — | On-host transport cost shows up in tracing | §6.5 |
+| ERASOR map cleaning | ops workflow (bag + /odom) | — | Whenever a clean static map export is wanted | §6.3 |
+
 ## Open questions for future work
 
 Out of scope of this plan but worth noting:
