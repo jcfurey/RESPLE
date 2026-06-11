@@ -1360,10 +1360,11 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
     covariance into per-plane uncertainty, then weights matching by it —
     instead of delaying insertion, insert immediately but downweight
     edge-pose points until "empirical convergence of plane uncertainty".
-    Candidate future capability: covariance-gated insertion (gate/weight by
-    the IEKF's edge-knot covariance rather than a fixed knot count) — lighter
-    than adopting VoxelMap wholesale, subsumes the fixed lag as a special
-    case.
+    IMPLEMENTED in cheap form (2026-06-11): `map_insert_cov_gate_deg` —
+    staged points release early when the edge-pose orientation std (from
+    `getLastPoseCovariance`, the proper spline-Jacobian propagation) drops
+    below the gate; the fixed-knot hold remains the aggressive-motion
+    ceiling. Full VoxelMap-style per-plane uncertainty remains future work.
   - *Estimate-side fixes for aggressive motion (the part lag cannot fix):*
     Point-LIO (10.1002/aisy.202200459) updates per-point at 4–8 kHz, removes
     in-frame distortion by construction, and survives IMU saturation at
@@ -1374,7 +1375,12 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
     motion intensity and smooths within an iterated Kalman smoother window.
     Shared lesson: a fixed `knot_hz` under-fits violent yaw — adaptive knot
     density is the principled estimate-side remedy if the lag sweep + parity
-    A/B leave residual smear on HelmDyn01.
+    A/B leave residual smear on HelmDyn01. The DETECTION side is implemented
+    (2026-06-11): `knot_rotation_warn_rad` checks each knot's final
+    `ort_delta` norm (= rotation absorbed per knot interval) as it leaves the
+    est window, WARNs + counts in `/diagnostics` when the motion exceeds what
+    `knot_hz` resolves — so bag runs now measure under-resolution directly
+    instead of inferring it from smear renders.
 
   *Main-vs-lyrical logic audit (2026-06-11):* before trusting the
   "inherent real-time gap" framing, the map path was diffed against upstream

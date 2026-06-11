@@ -393,6 +393,7 @@ public:
         accum_nearest_points.clear();
         map_insert_staging_.clear();
         released_w_.clear();
+        knot_rot_checked_ = 0;
         if_init_filter = false;
         if_init_map = false;
         localmap_initialized_ = false;
@@ -855,8 +856,22 @@ public:
                                 pt_data.time_ns, pt_data.pt, pt_data.q_bl,
                                 pt_data.t_bl, std::move(pt_neighbors_[i])});
                         }
-                        const int64_t release_horizon_ns = spline->maxTimeNs() -
+                        int64_t release_horizon_ns = spline->maxTimeNs() -
                             map_insert_lag_knots_ * spline->getKnotTimeIntervalNs();
+                        if (map_insert_cov_gate_deg_ > 0.0) {
+                            // VoxelMap-style uncertainty convergence: if the
+                            // edge pose is already tight, the hold buys
+                            // nothing — release everything staged.
+                            const double ori_var_tr = (if_lidar_only
+                                ? estimator_lo.getLastPoseCovariance()
+                                : estimator_lio.getLastPoseCovariance())
+                                    .block<3, 3>(3, 3).trace();
+                            const double ori_std_deg =
+                                std::sqrt(std::max(ori_var_tr, 0.0)) * 180.0 / M_PI;
+                            if (ori_std_deg < map_insert_cov_gate_deg_) {
+                                release_horizon_ns = spline->maxTimeNs();
+                            }
+                        }
                         while (n_release < map_insert_staging_.size() &&
                                map_insert_staging_[n_release].time_ns <= release_horizon_ns) {
                             n_release++;
@@ -866,6 +881,34 @@ public:
                         for (size_t i = 0; i < n_release; i++) {
                             StagedMapPoint& s = map_insert_staging_[i];
                             Association::pointBodyToWorld(s.time_ns, spline, s.pt, released_w_[i], s.t_bl, s.q_bl);
+                        }
+                    }
+                    // §6.3 knot under-resolution check: each knot's FINAL
+                    // ort_delta norm is the rotation absorbed in one knot
+                    // interval; values near/above the threshold mean knot_hz
+                    // under-fits the motion (Coco-LIC lesson) and trailing-
+                    // edge jitter is expected. Checked once per knot as it
+                    // leaves the est window (>= 5 behind the edge => final).
+                    if (knot_rotation_warn_rad_ > 0.0) {
+                        const int64_t total_k = spline->totalKnots();
+                        const int64_t pruned_k = spline->numKnotsPruned();
+                        if (knot_rot_checked_ < pruned_k) knot_rot_checked_ = pruned_k;
+                        for (; knot_rot_checked_ < total_k - 5; ++knot_rot_checked_) {
+                            const double rot = spline->getKnotOrtDel(
+                                static_cast<size_t>(knot_rot_checked_ - pruned_k)).norm();
+                            const uint32_t mrad = static_cast<uint32_t>(rot * 1000.0);
+                            uint32_t prev = knot_rot_max_mrad_.load(std::memory_order_relaxed);
+                            while (mrad > prev &&
+                                   !knot_rot_max_mrad_.compare_exchange_weak(prev, mrad)) {}
+                            if (rot > knot_rotation_warn_rad_) {
+                                knot_rot_warn_count_.fetch_add(1, std::memory_order_relaxed);
+                                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                    "[RESPLE] rotation per knot %.3f rad exceeds %.3f (knot #%ld): "
+                                    "knot_hz under-resolves this motion — expect trailing-edge "
+                                    "jitter; consider a higher knot_hz.",
+                                    rot, knot_rotation_warn_rad_,
+                                    static_cast<long>(knot_rot_checked_));
+                            }
                         }
                     }
                     // Cache knot count for updateDiagnostics (may run on the
@@ -1343,6 +1386,22 @@ private:
     Eigen::aligned_deque<StagedMapPoint> map_insert_staging_;
     Eigen::aligned_vector<pcl::PointXYZINormal> released_w_;  // per-cycle scratch
     int map_insert_lag_knots_ = 0;
+    // §6.3 covariance gate (VoxelMap's uncertainty-convergence criterion in
+    // cheap form, arXiv:2109.07082): when > 0, staged points are released
+    // EARLY whenever the edge-pose orientation std (sqrt of the rotational
+    // covariance trace via getLastPoseCovariance) is below this many degrees.
+    // Gentle motion gets a fresh reference map; aggressive motion gets the
+    // full fixed-knot hold. Only meaningful with map_insert_lag_knots > 0.
+    double map_insert_cov_gate_deg_ = 0.0;
+    // §6.3 knot under-resolution diagnostic (Coco-LIC / ATI-CTLO lesson:
+    // fixed knot_hz under-fits violent rotation). Each knot's FINAL ort_delta
+    // norm — the rotation the spline must absorb in one knot interval — is
+    // checked once when the knot leaves the est window. Worker-only cursor;
+    // atomics for the executor-thread diagnostics reader.
+    double knot_rotation_warn_rad_ = 0.05;
+    int64_t knot_rot_checked_ = 0;
+    std::atomic<uint64_t> knot_rot_warn_count_{0};
+    std::atomic<uint32_t> knot_rot_max_mrad_{0};
     double cube_len = 2000; 
     const float MOV_THRESHOLD = 1.5f;
     float det_range = 100.0;
@@ -1656,6 +1715,14 @@ private:
                 "lag the spline edge by %d knots (odometry unaffected).",
                 map_insert_lag_knots_, map_insert_lag_knots_);
         }
+        // §6.3 covariance gate for early release of staged map points
+        // (degrees of edge-pose orientation std; 0 = pure fixed-knot lag).
+        map_insert_cov_gate_deg_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "map_insert_cov_gate_deg", 0.0);
+        if (map_insert_cov_gate_deg_ < 0.0) map_insert_cov_gate_deg_ = 0.0;
+        // §6.3 knot under-resolution warning threshold (rad of rotation per
+        // knot interval; 0 disables). 0.05 rad/knot = 5 rad/s at knot_hz 100 —
+        // well above any rover/handheld motion, fires on HelmDyn-class spin.
+        knot_rotation_warn_rad_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "knot_rotation_warn_rad", 0.05);
 
         // HARDENING §3.3 divergence recovery policy: off (detection-only,
         // legacy) | hold (gate odometry/TF while DIVERGED) | reset
@@ -2041,6 +2108,11 @@ private:
         stat.add("Avg Computation Time (ms)", avg_computation_time);
         stat.add("Avg IEKF Iterations", avg_iekf_iters);
         stat.add("Num Threads", num_threads_);
+        // §6.3 knot under-resolution diagnostic (knot_rotation_warn_rad).
+        stat.add("Knot Rotation Max (rad)",
+                 knot_rot_max_mrad_.load(std::memory_order_relaxed) / 1000.0);
+        stat.add("Knot Rotation Warnings",
+                 static_cast<int>(knot_rot_warn_count_.load(std::memory_order_relaxed)));
         stat.add("Num Match Points", num_match_points_);
 
         // Buffer sizes: read the worker-maintained atomic caches instead of the
