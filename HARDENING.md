@@ -1296,20 +1296,30 @@ This is the inherent **real-time-output vs. smoothed-estimate gap**; only
 extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
 
 **Mitigations and their trade-offs:**
-- **Map lag (IMPLEMENTED 2026-06-10, `map_deskew_lag_knots`, default 4).**
-  Build/deskew the map from poses a few knots *behind* the edge — i.e., after
-  later scans have refined them — trading a small output latency for
-  crispness. The estimate is already good there (4.7 cm); we just stop
-  publishing the bleeding edge into the map. Implementation: the Mapping
-  worker holds each scan until `spline_max - t_end >= lag × dt`
-  (`MappingBase::processScan` gate); the held scan is then deskewed with knots
-  that `updateKnots`/`setOneStateKnot` have already overwritten with refined
-  est_window values. Default 4 knots matches the estimator's own edge zone
-  (`Association.h` treats points within `4·dt` of `maxTimeNs` as
-  under-constrained). `0` restores bleeding-edge output. Odometry
-  (`/odom`, `/current_scan`, TF) is untouched — RESPLE-node outputs by design.
-  Pending bag validation: re-render HelmDyn01 and confirm the azimuth smear
-  collapses; sweep lag ∈ {2, 4, 8} if 4 is insufficient.
+- **Map lag (IMPLEMENTED 2026-06-10/11, `map_deskew_lag_knots`, default 8).**
+  Build/deskew the map from poses *behind* the edge — i.e., after later scans
+  have refined them — trading a small output latency for crispness.
+  Implementation: the Mapping worker holds each scan until
+  `spline_max - t_end >= lag × dt` (`MappingBase::processScan` gate); the held
+  scan is then deskewed with knots that `updateKnots`/`setOneStateKnot` have
+  already overwritten with refined est_window values. The publishPath tip is
+  lagged identically, and pubOdom's odom→base lookup is **time-paired to the
+  tip stamp** (previously Time(0)/latest — that pairing put full body motion
+  over a 50–180 ms gap into the map→odom TF). `0` restores bleeding-edge.
+
+  **Convergence horizon (why 8 and not more):** the IEKF updates only the
+  last 4 RCPs and `getSplineMsg` resends only the last 5 knots, so a knot is
+  final — in the estimator AND at the Mapping replica — once ~4 behind the
+  edge. Cubic interpolation at scan time `t` reads knots up to `idx(t)+2`,
+  so every knot a scan touches is final once the edge is ≥6 knots past it;
+  8 adds margin. Beyond that, lag buys latency, not accuracy: at `knot_hz`
+  100 the map runs 80 ms behind, far inside the accepted 0.5 s map-latency
+  budget (requirement 2026-06-11: odometry must stay real-time; the map and
+  `map→odom` may lag up to ~500 ms if that buys accuracy). A larger budget
+  would only matter if the est_window protocol were widened AND the
+  estimator re-optimized older knots — it does not (recursive-by-design).
+  Pending bag validation: re-render HelmDyn01 + R_Campus and confirm the
+  azimuth smear collapses; sweep lag ∈ {0, 4, 8} to confirm the horizon.
 
   *Main-vs-lyrical logic audit (2026-06-11):* before trusting the
   "inherent real-time gap" framing, the map path was diffed against upstream

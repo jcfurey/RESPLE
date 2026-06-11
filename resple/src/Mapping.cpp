@@ -93,11 +93,15 @@ class MappingBase
         frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
         map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map/frame_id", "map");
         num_threads_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "num_threads", 5);
-        // Map lag in knots (see processScan). Default 4 matches the estimator's
-        // own edge zone: Association.h treats points within 4*dt of maxTimeNs
-        // as under-constrained, so knots older than that are converged enough
-        // to deskew the map crisply. 0 restores the bleeding-edge behavior.
-        deskew_lag_knots_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "map_deskew_lag_knots", 4);
+        // Map lag in knots (see processScan). Default 8 = the convergence
+        // horizon plus margin: the IEKF only updates the last 4 RCPs and
+        // est_window only resends the last 5 knots, so a knot is FINAL once
+        // ~4 behind the edge; cubic interpolation at scan time t reads knots
+        // up to idx(t)+2, so every knot a scan touches is final once the edge
+        // is >= 6 knots past it. Beyond ~8 the lag buys zero further
+        // refinement — only latency (80 ms at knot_hz 100, well inside the
+        // 0.5 s map-latency budget). 0 restores the bleeding-edge behavior.
+        deskew_lag_knots_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "map_deskew_lag_knots", 8);
         if (deskew_lag_knots_ < 0) {
             RCLCPP_WARN(nh->get_logger(),
                 "map_deskew_lag_knots=%d is negative; using 0 (no lag)", deskew_lag_knots_);
@@ -363,7 +367,7 @@ class MappingBase
     int num_threads_ = 5;
     // Scans wait until the spline edge is this many knots past their end
     // before being deskewed into the map (map_deskew_lag_knots, HARDENING §6.3).
-    int deskew_lag_knots_ = 4;
+    int deskew_lag_knots_ = 8;
     
     // TF transformation
     rclcpp::Node::SharedPtr node_handle_;
@@ -892,6 +896,12 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 spline_prune_keep_knots_);
             spline_prune_keep_knots_ = 100;
         }
+        // Same lag the per-sensor buffers use for the map (MappingBase reads
+        // it too; readParam's has_parameter guard makes the double read safe).
+        // Here it lags the path tip, so the map->odom TF composed in pubOdom
+        // is built from fully-converged knots (see publishPath).
+        map_deskew_lag_knots_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "map_deskew_lag_knots", 8);
+        if (map_deskew_lag_knots_ < 0) map_deskew_lag_knots_ = 0;
 
         std::vector<double> cov_varp = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
         cov_pose << cov_varp.at(0), cov_varp.at(1), cov_varp.at(2), cov_varp.at(3), cov_varp.at(4), cov_varp.at(5);        
@@ -1222,6 +1232,9 @@ private:
     std::mutex est_cb_mtx_;
     // Phase 3.1: knots retained by the sliding-window prune (0 disables).
     int spline_prune_keep_knots_ = 600;
+    // §6.3 map lag, node-level copy: lags the publishPath tip (and therefore
+    // the map->odom TF composed from it in pubOdom).
+    int map_deskew_lag_knots_ = 8;
 
     void displayControlPoints()
     {
@@ -1386,21 +1399,32 @@ private:
             baselink_to_map.transform.translation.z = odom_pose_current.pose.position.z;
             baselink_to_map.transform.rotation = odom_pose_current.pose.orientation;
 
-            // Get frame to odom transform. Use Time(0) — "latest available"
-            // — instead of odom_msg.header.stamp, because:
-            //   - the map→odom offset changes slowly (mostly drift correction),
-            //     so using the most recent base_link↔odom is fine for the
-            //     map↔odom rebroadcast computed below;
-            //   - exact-stamp lookup keeps failing whenever RESPLE's TF
-            //     stamp clock and Mapping's odom_msg stamp clock diverge
-            //     (sliding spline window vs. local path index), even when
-            //     fresh transforms are flowing.
+            // Get frame to odom transform AT THE PATH-TIP STAMP, so both
+            // factors of the map→odom composition below are sampled at the
+            // same instant. The old Time(0) ("latest") lookup paired a
+            // base→map pose that is 50–180 ms old (lagged path tip + 100 ms
+            // path stepping) with the freshest odom→base — that mismatch puts
+            // full body motion over the gap into the map→odom TF, which is
+            // exactly the yaw jitter §6.3 documents. The tip stamp is well in
+            // the past by construction (the deskew/tip lag), so the exact-time
+            // lookup interpolates inside buffered TF history instead of racing
+            // the live edge — the failure mode that originally motivated
+            // Time(0). Keep Time(0) as a fallback for warm-up, where history
+            // may not reach back to the tip yet.
             geometry_msgs::msg::TransformStamped odom_to_baselink;
             bool got_odom_transform = false;
+            const tf2::TimePoint tip_time = tf2::TimePoint(
+                std::chrono::nanoseconds(rclcpp::Time(odom_pose_current.header.stamp).nanoseconds()));
             try {
                 if (tf_buffer->canTransform(this->frame_id, this->odom_id,
-                                            tf2::TimePointZero,
+                                            tip_time,
                                             tf2::durationFromSec(0.1))) {
+                    odom_to_baselink = tf_buffer->lookupTransform(
+                        this->frame_id, this->odom_id, tip_time);
+                    got_odom_transform = true;
+                } else if (tf_buffer->canTransform(this->frame_id, this->odom_id,
+                                                   tf2::TimePointZero,
+                                                   tf2::durationFromSec(0.1))) {
                     odom_to_baselink = tf_buffer->lookupTransform(
                         this->frame_id, this->odom_id, tf2::TimePointZero);
                     got_odom_transform = true;
@@ -1494,7 +1518,17 @@ private:
         if (path_t_ns_ == 0) {
             path_t_ns_ = spline_active_.minTimeNs();
         }
-        while (path_t_ns_ < std::min(spl_window_st_ns, spline_active_.maxTimeNs())) {
+        // Lag the path tip like the map deskew (HARDENING §6.3): the tip pose
+        // is what pubOdom composes into the map->odom TF, so it must come from
+        // knots the estimator has finished refining (IEKF updates only the
+        // last 4 RCPs; est_window resends only the last 5 knots — beyond that
+        // every knot is final). spl_window_st_ns alone leaves the tip inside
+        // the still-converging zone.
+        const int64_t tip_lag_ns = map_deskew_lag_knots_ *
+            std::max<int64_t>(spline_active_.getKnotTimeIntervalNs(), 0);
+        const int64_t tip_limit_ns =
+            std::min(spl_window_st_ns, spline_active_.maxTimeNs() - tip_lag_ns);
+        while (path_t_ns_ < tip_limit_ns) {
             Eigen::Quaterniond orient_interp;
             Eigen::Vector3d t_interp = spline_active_.itpPosition(path_t_ns_);
             spline_active_.itpQuaternion(path_t_ns_, &orient_interp);
