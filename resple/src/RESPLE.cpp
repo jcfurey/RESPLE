@@ -391,6 +391,8 @@ public:
         pt_meas.clear();
         pc_world.clear();
         accum_nearest_points.clear();
+        map_insert_staging_.clear();
+        released_w_.clear();
         if_init_filter = false;
         if_init_map = false;
         localmap_initialized_ = false;
@@ -828,24 +830,62 @@ public:
                         break;
                     }
                 }
+                size_t n_release = 0;
                 {
                     // pointBodyToWorld reads spline; keep serialized with
                     // IEKF writes via spline_mutex_.
                     std::lock_guard<std::mutex> spline_lock(spline_mutex_);
-                    #pragma omp parallel for num_threads(num_threads_)
-                    for (size_t i = 0; i < pt_meas.size(); i++) {
-                        PointData& pt_data = pt_meas[i];
-                        Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
+                    if (map_insert_lag_knots_ == 0) {
+                        // Upstream behavior: world-fix at IEKF time (edge knots).
+                        #pragma omp parallel for num_threads(num_threads_)
+                        for (size_t i = 0; i < pt_meas.size(); i++) {
+                            PointData& pt_data = pt_meas[i];
+                            Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
+                        }
+                    } else {
+                        // §6.3 insertion lag: stage body-frame, then deskew and
+                        // release everything past the convergence horizon with
+                        // knot values the IEKF has finished refining. pt_meas
+                        // is time-sorted and cycles are monotone, so the
+                        // staging deque is time-ordered and the release scan
+                        // can stop at the first too-new entry.
+                        for (size_t i = 0; i < pt_meas.size(); i++) {
+                            PointData& pt_data = pt_meas[i];
+                            map_insert_staging_.push_back(StagedMapPoint{
+                                pt_data.time_ns, pt_data.pt, pt_data.q_bl,
+                                pt_data.t_bl, std::move(pt_neighbors_[i])});
+                        }
+                        const int64_t release_horizon_ns = spline->maxTimeNs() -
+                            map_insert_lag_knots_ * spline->getKnotTimeIntervalNs();
+                        while (n_release < map_insert_staging_.size() &&
+                               map_insert_staging_[n_release].time_ns <= release_horizon_ns) {
+                            n_release++;
+                        }
+                        released_w_.resize(n_release);
+                        #pragma omp parallel for num_threads(num_threads_)
+                        for (size_t i = 0; i < n_release; i++) {
+                            StagedMapPoint& s = map_insert_staging_[i];
+                            Association::pointBodyToWorld(s.time_ns, spline, s.pt, released_w_[i], s.t_bl, s.q_bl);
+                        }
                     }
                     // Cache knot count for updateDiagnostics (may run on the
                     // executor thread; atomic read there is lock-free).
                     cached_spline_knots_.store(spline->numKnots(), std::memory_order_relaxed);
                     cached_spline_total_knots_.store(spline->totalKnots(), std::memory_order_relaxed);
                 }
-                for (size_t i = 0; i < pt_meas.size(); i++) {
-                    PointData& pt_data = pt_meas[i];
-                    pc_world.points.push_back(pt_data.pt_w);
-                    accum_nearest_points.push_back(std::move(pt_neighbors_[i]));
+                if (map_insert_lag_knots_ == 0) {
+                    for (size_t i = 0; i < pt_meas.size(); i++) {
+                        PointData& pt_data = pt_meas[i];
+                        pc_world.points.push_back(pt_data.pt_w);
+                        accum_nearest_points.push_back(std::move(pt_neighbors_[i]));
+                    }
+                } else {
+                    for (size_t i = 0; i < n_release; i++) {
+                        pc_world.points.push_back(released_w_[i]);
+                        accum_nearest_points.push_back(std::move(map_insert_staging_.front().neighbors));
+                        map_insert_staging_.pop_front();
+                    }
+                    released_w_.clear();
                 }
                 pt_meas.clear();
                 const auto deskew_end = std::chrono::high_resolution_clock::now();
@@ -1283,6 +1323,26 @@ private:
     // Per-frame parallel buffer for k-NN results (used to live in PointData::nearest_points).
     // Sized to pt_meas.size() before each IEKF call; results moved into accum_nearest_points after.
     std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> pt_neighbors_;
+    // HARDENING §6.3 internal-map insertion lag (map_insert_lag_knots, default
+    // 0 = upstream insert-at-edge). Body-frame points are staged here until
+    // their timestamps fall behind the convergence horizon (the IEKF only
+    // updates the last 4 RCPs, so knots >= ~4 behind the edge are final), then
+    // deskewed with those final knot values and released into pc_world for the
+    // async ikd-Tree insert. Keeps trailing-edge jitter out of the REFERENCE
+    // map the IEKF matches against (cf. SLICT's marginalization-time map
+    // admission, arXiv:2211.03900; retrospective map refinement,
+    // arXiv:2503.21293). Worker-thread-only state — no extra locking.
+    struct StagedMapPoint {
+        int64_t time_ns;
+        pcl::PointXYZINormal pt;  // body frame
+        Eigen::Quaterniond q_bl;
+        Eigen::Vector3d t_bl;
+        Eigen::aligned_vector<pcl::PointXYZINormal> neighbors;
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    };
+    Eigen::aligned_deque<StagedMapPoint> map_insert_staging_;
+    Eigen::aligned_vector<pcl::PointXYZINormal> released_w_;  // per-cycle scratch
+    int map_insert_lag_knots_ = 0;
     double cube_len = 2000; 
     const float MOV_THRESHOLD = 1.5f;
     float det_range = 100.0;
@@ -1581,6 +1641,21 @@ private:
         // previously hardcoded 2000; 0 disables). Drop-oldest + counters.
         max_scan_buffer_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_scan_buffer", 0);
         max_imu_staging_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_imu_staging", 2000);
+
+        // HARDENING §6.3 internal-map insertion lag (0 = upstream
+        // insert-at-edge; recommended trial value 8 = the convergence
+        // horizon + margin). Delays ikd-Tree insertion — and therefore
+        // /current_scan, which publishes the same released points — by
+        // lag × dt so the REFERENCE map is built from final knot values.
+        // Off by default pending bag validation (repo decision-gate rule).
+        map_insert_lag_knots_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "map_insert_lag_knots", 0);
+        if (map_insert_lag_knots_ < 0) map_insert_lag_knots_ = 0;
+        if (map_insert_lag_knots_ > 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] map_insert_lag_knots=%d: ikd-Tree insertion + /current_scan "
+                "lag the spline edge by %d knots (odometry unaffected).",
+                map_insert_lag_knots_, map_insert_lag_knots_);
+        }
 
         // HARDENING §3.3 divergence recovery policy: off (detection-only,
         // legacy) | hold (gate odometry/TF while DIVERGED) | reset

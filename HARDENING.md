@@ -1321,6 +1321,32 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
   Pending bag validation: re-render HelmDyn01 + R_Campus and confirm the
   azimuth smear collapses; sweep lag ∈ {0, 4, 8} to confirm the horizon.
 
+- **Internal-map insertion lag (CAPABILITY LANDED 2026-06-11,
+  `map_insert_lag_knots`, default 0 = off).** The display-map lag above does
+  not touch the deeper instance of the same disease: `processData`
+  world-fixes points immediately after the IEKF (`pointBodyToWorld` with the
+  freshest knots — upstream `main` does the identical thing) and the async
+  `mapIncremental` inserts them into the ikd-Tree. Trailing-edge jitter is
+  thereby baked into the REFERENCE map the IEKF matches against, and the
+  error feeds back into every subsequent estimate ("registration errors
+  introduced at an earlier stage remain in the map and affect all subsequent
+  estimates" — retrospective map refinement, arXiv:2503.21293; SLICT admits
+  scans to its map only at marginalization time for the same reason,
+  arXiv:2211.03900; the RESPLE paper itself frames map maintenance as
+  happening when "active RCPs transition into idle state", arXiv:2504.11580,
+  which is closer to lagged insertion than to the shipped insert-at-edge).
+  Implementation: with lag > 0 the worker stages body-frame points
+  (`map_insert_staging_`, worker-thread-only) and releases them once the
+  edge is `lag` knots past their stamps, deskewing with final knot values
+  under `spline_mutex_`. `/current_scan` publishes the same released points,
+  so it inherits the lag. Trade-off: the reference map is missing the last
+  `lag × dt` of points (~1 scan at 10 Hz / 80 ms) — marginal near-field
+  sparsity against a permanently crisper reference. **Off by default
+  (decision-gate rule: this alters the odometry feedback loop); recommended
+  trial value 8.** Bag experiment: HelmDyn01 + R_Campus APE with
+  `map_insert_lag_knots` ∈ {0, 8}, after the display-lag sweep isolates the
+  display-side effect.
+
   *Main-vs-lyrical logic audit (2026-06-11):* before trusting the
   "inherent real-time gap" framing, the map path was diffed against upstream
   `main`. The Mapping node is logic-equivalent (same `t_end <= maxTimeNs`

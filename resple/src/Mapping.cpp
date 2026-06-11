@@ -883,6 +883,13 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/publish_tf", true);
         invert_tf  = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/invert_tf", false);
+        // amcl-style future-dating for the map->odom TF (seconds added to the
+        // stamp). The transform is stamped at the (lagged) path tip, so exact-
+        // time lookups in the map frame at fresh sensor stamps fail with
+        // "extrapolation into the future". Future-dating the slowly-varying
+        // drift correction is the standard remedy; 0 = off (stamp at the tip).
+        map_tf_tolerance_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "map/transform_tolerance", 0.0);
+        if (map_tf_tolerance_ < 0.0) map_tf_tolerance_ = 0.0;
 
         // HARDENING §3.1: same retention parameter as the RESPLE node.
         // spline_active_ otherwise grows one knot per est_window knot for the
@@ -1195,6 +1202,8 @@ private:
     Eigen::Vector<double, 6> cov_pose;
     Eigen::Vector<double, 6> cov_twist;
     bool publish_tf, invert_tf;
+    // map->odom TF future-dating in seconds (map/transform_tolerance, 0 = off).
+    double map_tf_tolerance_ = 0.0;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     // cuda-perf-nano addition: latch identity map→odom on first
     // startCallBack so the REP-105 chain is closed during the cold-start
@@ -1416,9 +1425,14 @@ private:
             const tf2::TimePoint tip_time = tf2::TimePoint(
                 std::chrono::nanoseconds(rclcpp::Time(odom_pose_current.header.stamp).nanoseconds()));
             try {
+                // No wait on the tip-stamp lookup: the stamp is in the past, so
+                // either buffered history already covers it (steady state,
+                // instant success) or it never will until more history accrues
+                // (warm-up) — waiting can't help, and it would stack with the
+                // fallback's 0.1 s wait below.
                 if (tf_buffer->canTransform(this->frame_id, this->odom_id,
                                             tip_time,
-                                            tf2::durationFromSec(0.1))) {
+                                            tf2::durationFromSec(0.0))) {
                     odom_to_baselink = tf_buffer->lookupTransform(
                         this->frame_id, this->odom_id, tip_time);
                     got_odom_transform = true;
@@ -1449,7 +1463,10 @@ private:
                 }
                 geometry_msgs::msg::TransformStamped odom_to_map;
                 tf2::toMsg(odom_to_map_tf, odom_to_map.transform);
-                odom_to_map.header.stamp = odom_msg.header.stamp;
+                // Optional future-dating (map/transform_tolerance) so exact-time
+                // lookups at stamps newer than the lagged tip still resolve.
+                odom_to_map.header.stamp = rclcpp::Time(odom_msg.header.stamp) +
+                    rclcpp::Duration::from_seconds(map_tf_tolerance_);
                 if(invert_tf){
                     odom_to_map.header.frame_id = odom_id;
                     odom_to_map.child_frame_id  = map_id;

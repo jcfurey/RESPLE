@@ -215,6 +215,14 @@ class SplineState
             if (target < num_knot) {
                 setOneStateKnot(static_cast<int>(target), other->t_knots[i], other->ort_delta[i]);
             } else {
+                if (target > num_knot) {
+                    // A gap means a whole est_window went missing (reliable
+                    // QoS should prevent this); appending sequentially would
+                    // silently misalign every later knot's time index.
+                    RESPLE_LOG_INVARIANT_ONCE("updateKnots gap: target=" << target
+                        << " > num_knot=" << num_knot
+                        << " (missed est_window?); knot indices misaligned from here");
+                }
                 addOneStateKnot(other->t_knots[i], other->ort_delta[i]);
             }
         }
