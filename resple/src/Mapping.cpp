@@ -154,12 +154,13 @@ class MappingBase
         }
     }
 
-    void processScan(SplineState* spl, const int64_t spl_window_st_ns)
+    // Returns true if any scan was consumed (published or dropped-as-old) —
+    // the worker uses this to pace itself. Pacing lives in process(), NOT
+    // here: a sleep inside this gate used to throttle the whole worker loop
+    // (est_window ingest included) to ~20 Hz, starving the spline replica.
+    bool processScan(SplineState* spl, const int64_t spl_window_st_ns)
     {
         (void)spl_window_st_ns;
-        // chrono sleep (instead of rclcpp::Rate) so SIGINT-invalidated
-        // contexts don't throw mid-tick.
-        constexpr auto kRatePeriod = std::chrono::milliseconds(50);  // ~20 Hz
         // Tally outcomes per call so the throttled summary log below
         // shows where every scan went: published, dropped-as-old, or
         // gated by spline-not-yet-caught-up.
@@ -199,10 +200,8 @@ class MappingBase
                 }
                 if (t_end_ns > spl->maxTimeNs() - lag_ns) {
                     // Front spans beyond the lagged spline window — retry
-                    // next tick once more (refined) knots are available.
-                    lock.unlock();
+                    // next cycle once more (refined) knots are available.
                     n_pending_new++;
-                    std::this_thread::sleep_for(kRatePeriod);
                     break;
                 }
                 // Move the cloud out of the deque (deque move of
@@ -237,6 +236,7 @@ class MappingBase
                 buf_remaining, spl->numKnots(), s_min, s_max, last_t_end_ns,
                 total_published_, total_dropped_old_, total_pending_new_);
         }
+        return (n_published + n_dropped_old) > 0;
     }
 
     void publishMap(const typename pcl::PointCloud<PointType>::Ptr& pcs,
@@ -1099,6 +1099,9 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                     std::lock_guard<std::mutex> lock(m_spline);
                     // dt=1 placeholder; overridden by getEstCallback's first window.
                     spline_active_.init(1, 0, start_bag_time_pending_.load(std::memory_order_relaxed), 0);
+                    // Windows staged by the previous run target its indexing.
+                    est_window_queue_.clear();
+                    est_windows_dropped_ = 0;
                     spline_pending_ready_.store(false, std::memory_order_relaxed);
                 }
                 // Only now is spline_active_ init'd: publish that to consumers.
@@ -1106,14 +1109,21 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 // reader can act on a default-constructed / stale spline.
                 if_init_succeed.store(true, std::memory_order_release);
             }
-            // Swap pending spline to active (lock-free check then mutex swap)
+            // Drain ALL staged est_windows in order (lock-free check then
+            // mutex drain). Applying every window keeps the replica's knot
+            // indexing exactly in step with the estimator — see the
+            // est_window_queue_ member comment for the drift this prevents.
             if (spline_pending_ready_.load()) {
                 std::lock_guard<std::mutex> lock(m_spline);
                 if (spline_pending_ready_.load()) {
                     ScopedMappingsLock maps_lock(vis_maps);
-                    spl_window_st_ns = spl_window_st_ns_pending_;
-                    spline_active_.setTimeIntervalNs(spline_pending_.getKnotTimeIntervalNs());
-                    spline_active_.updateKnots(&spline_pending_);
+                    while (!est_window_queue_.empty()) {
+                        EstWindow& w = est_window_queue_.front();
+                        spl_window_st_ns = w.window_st_ns;
+                        spline_active_.setTimeIntervalNs(w.spline.getKnotTimeIntervalNs());
+                        spline_active_.updateKnots(&w.spline);
+                        est_window_queue_.pop_front();
+                    }
                     spline_pending_ready_.store(false);
                 }
             }
@@ -1132,7 +1142,13 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             // + swap above) is on this worker thread, so these reads are now
             // genuinely single-threaded with respect to spline_active_ — no
             // m_spline coverage needed here.
-            if (if_init_succeed.load(std::memory_order_acquire) && spline_active_.totalKnots() > num_knot) {
+            // Throttle the publish block to the old ~20 Hz cadence: knots now
+            // land at est rate (~100 Hz) since the queue drain, and each
+            // publishPath ships the entire accumulated Path message.
+            const auto now_steady = std::chrono::steady_clock::now();
+            if (if_init_succeed.load(std::memory_order_acquire) && spline_active_.totalKnots() > num_knot
+                && now_steady - last_pub_block_ >= std::chrono::milliseconds(50)) {
+                last_pub_block_ = now_steady;
                 // Lock order MUST match the swap branch above (m_spline -> maps).
                 // This branch previously took maps (ScopedMappingsLock) first and
                 // m_spline only for the prune, giving maps -> m_spline — a
@@ -1161,8 +1177,16 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 std::this_thread::sleep_for(kRatePeriod);
                 continue;
             }
+            bool progress = false;
             for (const auto vis_map : vis_maps) {
-                vis_map->processScan(&spline_active_, spl_window_st_ns);
+                progress = vis_map->processScan(&spline_active_, spl_window_st_ns) || progress;
+            }
+            // Single pacing point (sleeps used to live inside processScan's
+            // gate branch, which throttled the whole worker — including the
+            // est_window drain above — to ~20 Hz). 5 ms: gate retries and
+            // queue drains stay prompt, no busy-spin when idle.
+            if (!progress && !spline_pending_ready_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         }
     }
@@ -1170,13 +1194,33 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
 private:
     std::string node_name = "Mapping";
     int64_t spl_window_st_ns;
-    // Double-buffered spline: getEstCallback writes to spline_pending_,
-    // process() copies pending to spline_active_ under m_spline mutex.
-    // This eliminates the race between the callback thread and process thread.
+    // Spline replica: getEstCallback enqueues est_windows, process() applies
+    // them to spline_active_ under m_spline — the worker remains the only
+    // thread that mutates spline_active_ (no callback-vs-worker race).
     SplineState spline_active_;
-    SplineState spline_pending_;
-    std::atomic<bool> spline_pending_ready_{false};
-    int64_t spl_window_st_ns_pending_ = 0;
+    // Lossless est_window ingest queue (guarded by m_spline). The previous
+    // single-slot double buffer (spline_pending_) kept only the LATEST
+    // window: every window arriving while the worker was mid-cycle was
+    // overwritten, and updateKnots then appended across the index gap —
+    // compressing the replica's time axis. Symptoms: traj_path//odometry
+    // stamps drifting ~0.7-10% of elapsed time vs their poses, and the
+    // deskew consumer pacing itself to the slowed replica edge (the
+    // apparent Avia-frame "saturation"). The worker drains the whole queue
+    // in order each cycle, so the replica applies every window exactly as
+    // the estimator emitted it.
+    struct EstWindow { SplineState spline; int64_t window_st_ns; };
+    Eigen::aligned_deque<EstWindow> est_window_queue_;
+    // ~20 s of windows @ 100 Hz est rate. Overflow means the worker stalled
+    // that long; drop oldest with a warn (the updateKnots gap invariant then
+    // marks the misalignment, which the next RESPLE restart clears).
+    static constexpr size_t kEstWindowQueueCap = 2000;
+    size_t est_windows_dropped_ = 0;                 // guarded by m_spline
+    std::atomic<bool> spline_pending_ready_{false};  // queue non-empty hint
+    // Pace for the path/odom/control-point publishes: knots now arrive at
+    // est rate (~100 Hz) instead of the old ~20 Hz swap rate, and each
+    // publishPath ships the whole accumulated Path msg — re-publishing that
+    // per knot would be pure bandwidth. 50 ms keeps the old ~20 Hz cadence.
+    std::chrono::steady_clock::time_point last_pub_block_{};
     rclcpp::Subscription<estimate_msgs::msg::Estimate>::SharedPtr sub_est;
     rclcpp::Subscription<std_msgs::msg::Int64>::SharedPtr sub_start;
     rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;
@@ -1295,22 +1339,23 @@ private:
             Eigen::Vector3d quat_idle(idle.orientation_del.x, idle.orientation_del.y, idle.orientation_del.z);
             spline_w.setIdles(i, t_idle, quat_idle, q_idle0);
         }
-        // Write to pending buffer — process() will swap to active under mutex.
-        //
-        // Move-assign (don't merge): spline_pending_ must hold THIS window's
-        // knots/start_i intact so process()'s spline_active_.updateKnots()
-        // sees the correct global indexing offset. The previous code called
-        // spline_pending_.updateKnots(&spline_w), which:
-        //   (a) read spline_pending_.num_knot before it was ever initialized
-        //       (default ctor leaves int64_t indeterminate → loop bound was
-        //       garbage on first call → setOneStateKnot writes out of bounds
-        //       → SIGSEGV in Eigen Vector3d copy);
-        //   (b) accumulated knots across callbacks, so spline_pending_ grew
-        //       unbounded and start_i never matched the latest window.
+        // Enqueue — process() drains the queue in order under m_spline.
+        // Every window must be queued (not overwritten): each one carries its
+        // own start_idx, and a skipped window leaves an index gap that
+        // updateKnots can only fill by misaligning every later knot's time.
         {
             std::lock_guard<std::mutex> lock(m_spline);
-            spl_window_st_ns_pending_ = spline_msg.start_t - spline_msg.dt;
-            spline_pending_ = std::move(spline_w);
+            if (est_window_queue_.size() >= kEstWindowQueueCap) {
+                est_window_queue_.pop_front();
+                if ((++est_windows_dropped_ % 100) == 1) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "[Mapping] est_window queue overflow (worker stalled?): "
+                        "%zu windows dropped — replica knot times misaligned until restart",
+                        est_windows_dropped_);
+                }
+            }
+            est_window_queue_.push_back(
+                EstWindow{std::move(spline_w), spline_msg.start_t - spline_msg.dt});
             spline_pending_ready_.store(true);
         }
         } catch (const std::exception& e) {
