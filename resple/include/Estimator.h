@@ -36,6 +36,24 @@ class Estimator
     // Set once at configure (like corresp_cfg); worker-thread reads only.
     int robust_kernel = 0;
     double robust_delta = 0.1;
+    // §3.2 prototype: X-ICP-style degenerate-direction gate (translation
+    // only). When the per-point-normalized LiDAR constraint matrix
+    // E_tt = (1/N) Σ n nᵀ (world-frame normals) has an eigenvalue below this
+    // gate, the LiDAR columns of the Kalman gain are projected out of that
+    // eigendirection for the RCP position rows: the LiDAR update can no
+    // longer pull the pose along an axis it cannot observe (tunnel map-lock),
+    // while IMU rows and the spline prior keep full authority there. Joseph
+    // form stays consistent for the projected (suboptimal) gain, so the
+    // posterior covariance keeps growing along the gated axis — NIS and
+    // downstream consumers see honest uncertainty. 0 disables (default;
+    // decision-gate rule — see HARDENING §3.2/§6.3). E_tt eigenvalues sum
+    // to 1; healthy geometry runs ~0.08+ min-eig, tunnel collapse is 1e-3
+    // and below (06042026 analysis) — 0.02 is the recommended trial gate.
+    double loc_gate_trans_min_eig = 0.0;
+    // Diagnostics accessors for the gate (worker-thread reads, like
+    // corresp_stats: the node snapshots right after the update returns).
+    int locGateAxes() const { return loc_gate_axes_; }
+    uint64_t locGateUpdateCount() const { return loc_gate_update_count_; }
     double robustWeight(double r) const
     {
         const double a = std::abs(r);
@@ -459,6 +477,53 @@ class Estimator
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> cov_inv_buf_;
+    // Degenerate-direction gate state (worker-thread only, armed by the
+    // updateLiDAR* assemblers immediately before update() consumes it).
+    // loc_gate_mask_ marks which measurement rows are LiDAR (1) vs IMU (0):
+    // the LIO assembler interleaves them by timestamp, so the projection
+    // must select gain columns, not a contiguous block.
+    Eigen::ArrayXd loc_gate_mask_;
+    Eigen::Matrix3d loc_gate_VVt_ = Eigen::Matrix3d::Zero();
+    bool loc_gate_armed_ = false;
+    int loc_gate_axes_ = 0;            // degenerate axes at last arm check
+    uint64_t loc_gate_update_count_ = 0;  // updates with projection applied
+
+    // Decide whether this update's LiDAR constraint set is degenerate and
+    // cache the projector. Ett_sum = Σ n nᵀ over the rows actually filled.
+    void armLocGate(const Eigen::Matrix3d& Ett_sum, int n_used)
+    {
+        loc_gate_armed_ = false;
+        loc_gate_axes_ = 0;
+        if (loc_gate_trans_min_eig <= 0.0 || n_used < 20) return;
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(Ett_sum / static_cast<double>(n_used));
+        Eigen::Matrix3d VVt = Eigen::Matrix3d::Zero();
+        for (int i = 0; i < 3; i++) {
+            if (es.eigenvalues()(i) < loc_gate_trans_min_eig) {
+                const Eigen::Vector3d v = es.eigenvectors().col(i);
+                VVt.noalias() += v * v.transpose();
+                loc_gate_axes_++;
+            }
+        }
+        if (loc_gate_axes_ > 0) {
+            loc_gate_VVt_ = VVt;
+            loc_gate_armed_ = true;
+        }
+    }
+
+    // Project the degenerate-direction component of the LiDAR columns out of
+    // the RCP position rows of K. IMU columns (mask 0) keep full gain; bias
+    // rows (XSIZE==30) are untouched.
+    template <int RSIZE>
+    void applyLocGate(Eigen::Matrix<double, XSIZE, RSIZE>& K)
+    {
+        for (int j = 0; j < 4; j++) {
+            auto rows = K.template middleRows<3>(j * 6);
+            const Eigen::Matrix<double, 3, Eigen::Dynamic> lidar_part =
+                (rows.array().rowwise() * loc_gate_mask_.transpose()).matrix();
+            rows.noalias() -= loc_gate_VVt_ * lidar_part;
+        }
+        loc_gate_update_count_++;
+    }
     int max_iter = 5;
     double eps = 0.1;
 
@@ -554,6 +619,11 @@ class Estimator
             prepLiDAR(pt_data);
         }
         int idx_offset = 0;
+        Eigen::Matrix3d gate_Ett = Eigen::Matrix3d::Zero();
+        int gate_n = 0;
+        if (loc_gate_trans_min_eig > 0.0) {
+            loc_gate_mask_ = Eigen::ArrayXd::Ones(num_valid);  // LO: all rows LiDAR
+        }
         for(size_t i = 0; i < num_pt; i++) {
             const PointData& pt_data = pt_meas[i];
             if (pt_data.if_valid) {
@@ -563,7 +633,10 @@ class Estimator
                 if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
                     innv_buf_(idx_offset) = - pt_data.zp;
                     H_buf_.row(idx_offset) = Hi;
-
+                    if (loc_gate_trans_min_eig > 0.0) {
+                        gate_Ett.noalias() += pt_data.normvec * pt_data.normvec.transpose();
+                        gate_n++;
+                    }
                 }
                 constexpr double range_ref = 3.0;
                 double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
@@ -573,10 +646,11 @@ class Estimator
                 idx_offset++;
             }
         }
+        armLocGate(gate_Ett, gate_n);
         return update(innv_buf_, cov_inv_buf_, H_buf_, x_prop, P_prop);
     }
 
-    bool updateLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, Eigen::aligned_deque<ImuData>& imu_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
+    bool updateLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas, Eigen::aligned_deque<ImuData>& imu_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop,
         const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const double pt_thresh, const double cov_thresh, const Eigen::Vector3d& g, const Eigen::Vector3d& cov_acc, const Eigen::Vector3d& cov_gyro, int num_threads = 5)
     {
         Eigen::Matrix<double, 6, 1> cov_imu_inv =  Eigen::Matrix<double, 6, 1>(1/cov_acc[0], 1/cov_acc[1], 1/cov_acc[2], 1/cov_gyro[0], 1/cov_gyro[1], 1/cov_gyro[2]);
@@ -599,6 +673,13 @@ class Estimator
         int idx_offset = 0;
         size_t id_imu = 0;
         size_t id_pt = 0;
+        Eigen::Matrix3d gate_Ett = Eigen::Matrix3d::Zero();
+        int gate_n = 0;
+        // LiDAR and IMU rows interleave by timestamp below; the gate needs to
+        // know which gain columns belong to LiDAR (IMU keeps full authority).
+        if (loc_gate_trans_min_eig > 0.0) {
+            loc_gate_mask_ = Eigen::ArrayXd::Zero(dim_meas);
+        }
         for (size_t j = 0; j < imu_meas.size() + pt_meas.size(); j++) {
             if ((id_pt < pt_meas.size() && id_imu < imu_meas.size() && pt_meas[id_pt].time_ns < imu_meas[id_imu].time_ns) ||
                 (id_pt < pt_meas.size() && id_imu >= imu_meas.size())) {
@@ -609,6 +690,11 @@ class Estimator
                         if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
                             innv_buf_(idx_offset) = - pt_data.zp;
                             H_buf_.block(idx_offset, 0, 1, 24) = pt_data.H;
+                            if (loc_gate_trans_min_eig > 0.0) {
+                                loc_gate_mask_(idx_offset) = 1.0;
+                                gate_Ett.noalias() += pt_data.normvec * pt_data.normvec.transpose();
+                                gate_n++;
+                            }
                         }
                         constexpr double range_ref = 3.0;
                         double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
@@ -648,7 +734,8 @@ class Estimator
                     idx_offset += 6;
                     id_imu++;
             }
-        }        
+        }
+        armLocGate(gate_Ett, gate_n);
         return update(innv_buf_, cov_inv_buf_, H_buf_, x_prop, P_prop);
     }
 
@@ -698,7 +785,16 @@ class Estimator
                 last_nis_ = innov.dot(Rinv_nu) - b.dot(llt_S.solve(b));
             }
 
-            KH.noalias() = S_inv * HT_R_inv_H;
+            // Degenerate-direction gate: project the LiDAR columns of K out of
+            // the unobservable translation axes, then KH must be rebuilt from
+            // the projected gain (Joseph form below stays valid for any gain).
+            if (loc_gate_armed_ && loc_gate_mask_.size() == K.cols()) {
+                applyLocGate(K);
+                KH.noalias() = K * H;
+            } else {
+                KH.noalias() = S_inv * HT_R_inv_H;
+            }
+            loc_gate_armed_ = false;
             Eigen::Matrix<double, XSIZE, 1> delta_cur = (getState() - x_prop);
             Eigen::Matrix<double, XSIZE, 1> deltax = KH * delta_cur + K * innov - delta_cur;
             RCPs_post.noalias() = getState() + deltax;
@@ -721,6 +817,11 @@ class Estimator
             }
             Eigen::Matrix<double, XSIZE, RSIZE> K;
             K.noalias() = cov_prop * H.transpose() * lu_S.inverse();
+            // Degenerate-direction gate (see information-form branch above).
+            if (loc_gate_armed_ && loc_gate_mask_.size() == K.cols()) {
+                applyLocGate(K);
+            }
+            loc_gate_armed_ = false;
             KH.noalias() = K * H;
             // Measurement-space NIS directly from S = H P H^T + R (already
             // factored for the gain): nu^T S^{-1} nu.

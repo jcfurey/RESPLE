@@ -1748,6 +1748,7 @@ design, what evidence flips it, and where it is documented.
 | Knot under-resolution warn | `knot_rotation_warn_rad` | **0.05 (ON)** | Tune threshold per deployment if noisy | §6.3 |
 | Localizability diagnostics | (always on, report-only) | — | Feeds the §3.2 `plane_min_cond_ratio` decision | §6.3 |
 | Plane-fit degeneracy gate | `plane_min_cond_ratio` | 0 (off) | Localizability distributions from bags | §6.3 / §3.2 |
+| Degenerate-direction gate (X-ICP-style) | `loc_gate_trans_min_eig` | 0 (off) | Prototype VALIDATED 2026-06-11 @0.02: tunnel map-lock oscillation eliminated (max step 16.9 m → 0.18 m), HelmDyn01 APE unchanged despite 35 % arming. Before default: threshold semantics (relative/condition arming or reweighting) + GT-scored tunnel run | §3.2 / doc/PARAMETERS.md |
 | Dynamic-aware mapping (BTSA) | design only | — | Bag with moving objects | §6.6 |
 | Barron adaptive kernel α | design only | — | Fixed kernels A/B first | §6.3 |
 | SE(2)/wheel soft prior | design only | — | Downstream fusion rebalance decision | §6.3 |

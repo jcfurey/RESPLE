@@ -950,6 +950,13 @@ public:
                         degen_cond_trans_.store(static_cast<float>(lt(0) > 0.0 ? lt(2) / lt(0) : 0.0), std::memory_order_relaxed);
                         degen_cond_rot_.store(static_cast<float>(lr(0) > 0.0 ? lr(2) / lr(0) : 0.0), std::memory_order_relaxed);
                     }
+                    // Gate activity snapshot (worker context, like corresp_stats).
+                    loc_gate_axes_diag_.store(if_lidar_only
+                        ? estimator_lo.locGateAxes() : estimator_lio.locGateAxes(),
+                        std::memory_order_relaxed);
+                    loc_gate_updates_diag_.store(if_lidar_only
+                        ? estimator_lo.locGateUpdateCount() : estimator_lio.locGateUpdateCount(),
+                        std::memory_order_relaxed);
                 }
                 if (map_insert_lag_knots_ == 0) {
                     for (size_t i = 0; i < pt_meas.size(); i++) {
@@ -1452,6 +1459,9 @@ private:
     std::atomic<float> degen_min_eig_rot_{0.f};
     std::atomic<float> degen_cond_trans_{0.f};
     std::atomic<float> degen_cond_rot_{0.f};
+    // §3.2 degeneracy-gate activity (0 axes = gate idle / disabled).
+    std::atomic<int> loc_gate_axes_diag_{0};
+    std::atomic<uint64_t> loc_gate_updates_diag_{0};
     double cube_len = 2000; 
     const float MOV_THRESHOLD = 1.5f;
     float det_range = 100.0;
@@ -1761,6 +1771,25 @@ private:
                 RCLCPP_INFO(this->get_logger(),
                     "[RESPLE] robust_kernel=%s (delta=%.3f m) on LiDAR residuals.",
                     kernel.c_str(), kernel_delta);
+            }
+        }
+
+        // §3.2 prototype: X-ICP-style degenerate-direction gate (translation
+        // only). 0 disables (default — decision-gate rule: this changes the
+        // estimator's update; enable only behind a bag A/B). Recommended
+        // trial gate 0.02 (E_tt eigenvalues sum to 1; healthy geometry runs
+        // ~0.08+ min-eig, tunnel collapse 1e-3 and below).
+        {
+            const double loc_gate = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "loc_gate_trans_min_eig", 0.0);
+            estimator_lo.loc_gate_trans_min_eig = loc_gate;
+            estimator_lio.loc_gate_trans_min_eig = loc_gate;
+            if (loc_gate > 0.0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] loc_gate_trans_min_eig=%.4f: LiDAR gain projected out of "
+                    "translation directions whose constraint eigenvalue falls below the "
+                    "gate; IMU rows and the spline prior keep full authority there "
+                    "(degeneracy gate, HARDENING §3.2).", loc_gate);
             }
         }
 
@@ -2203,6 +2232,8 @@ private:
         stat.add("Localizability Min Eig (rot)", degen_min_eig_rot_.load(std::memory_order_relaxed));
         stat.add("Localizability Cond (trans)", degen_cond_trans_.load(std::memory_order_relaxed));
         stat.add("Localizability Cond (rot)", degen_cond_rot_.load(std::memory_order_relaxed));
+        stat.add("Loc Gate Axes (current)", loc_gate_axes_diag_.load(std::memory_order_relaxed));
+        stat.add("Loc Gate Updates (cumulative)", static_cast<double>(loc_gate_updates_diag_.load(std::memory_order_relaxed)));
         stat.add("Num Match Points", num_match_points_);
 
         // Buffer sizes: read the worker-maintained atomic caches instead of the
