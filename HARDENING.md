@@ -22,7 +22,7 @@ Companion docs:
 | 3   | Spline / mapping accuracy | **Complete** — 3.1 pruning; 3.2 parameterized + instrumented; 3.3 detection + recovery modes; 3.4 radius pruning (opt-in). Tuning passes → §6.3/§6.4 | — |
 | 4   | Diagnostics publisher | **Complete** — `estimate_msgs/Diagnostics` on `resple_diagnostics`, ~20 Hz typed | — |
 | 5   | Regression tests | **Complete except §6.2** — ROS-free + ASan/UBSan + ikd-Tree TSan CI gates | — |
-| 6   | Bag-gated validation & tuning | **In progress (bag available 2026-06-10)** — §6.1 TSan leg DONE: 4 real concurrency bugs found+fixed on the HelmDyn01 LIO replay (see §6.1 results); §6.1 ASan leg, §6.2 CI smoke, §6.3 plane-fit tuning, §6.4 recovery policy still open | — |
+| 6   | Bag-gated validation & tuning | **In progress (bag available 2026-06-10)** — §6.1 TSan leg DONE: 4 real concurrency bugs found+fixed on the HelmDyn01 LIO replay (see §6.1 results); §6.3 display-lag sweep + insert-lag A/B DONE 2026-06-11 (keep 8 / safe-but-gated) and Mapping est_window ingestion loss found+FIXED (see §6.3 results); §6.1 ASan leg, §6.2 CI smoke, §6.3 plane-fit tuning, §6.4 recovery policy still open | — |
 
 Commits are in the `resple` submodule on `develop`, relative to `fced6a1`.
 
@@ -1318,8 +1318,10 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
   `map→odom` may lag up to ~500 ms if that buys accuracy). A larger budget
   would only matter if the est_window protocol were widened AND the
   estimator re-optimized older knots — it does not (recursive-by-design).
-  Pending bag validation: re-render HelmDyn01 + R_Campus and confirm the
-  azimuth smear collapses; sweep lag ∈ {0, 4, 8} to confirm the horizon.
+  **VALIDATED 2026-06-11** — lag sweep {0,4,8} on HelmDyn01 LIO: see
+  "§6.3 validation results" below. Verdict: keep default 8. R_Campus
+  legs deferred but unblocked (the rate-1.0 consumer saturation observed
+  during sweep prep was the est_window ingestion bug, since fixed).
 
 - **Internal-map insertion lag (CAPABILITY LANDED 2026-06-11,
   `map_insert_lag_knots`, default 0 = off).** The display-map lag above does
@@ -1345,7 +1347,9 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
   (decision-gate rule: this alters the odometry feedback loop); recommended
   trial value 8.** Bag experiment: HelmDyn01 + R_Campus APE with
   `map_insert_lag_knots` ∈ {0, 8}, after the display-lag sweep isolates the
-  display-side effect.
+  display-side effect. **A/B RUN 2026-06-11 (HelmDyn01, 3v3): safe — no
+  regression, slight gain within noise; see "§6.3 validation results"
+  below. TudoRun01 A/B recommended before a default flip.**
 
   **Related work map (2026-06-11 survey)** — where each thread of the smear
   problem sits in the literature, for designing follow-ups after the bag
@@ -1566,6 +1570,54 @@ Procedure (per candidate bag, ideally one normal + one degenerate):
    normal-geometry `used` and trajectory error are within noise.
    Otherwise leave 0 and record the numbers here.
 
+#### §6.3 validation results — 2026-06-11 (HelmDyn01 LIO; full writeup in resple_test_ws `results/SWEEP_NOTES_2026-06-11.md`)
+
+**Display-lag sweep (`map_deskew_lag_knots` ∈ {0,4,8}, full bag, 1 run
+each).** Controls green in all legs: APE vs mocap GT 0.021–0.022 % of path
+(= baseline — the lag provably never touches `/odom`), zero
+divergence/numerical failures, effective gate verified from the
+front-to-edge staircase (−40 / +15 / +44 ms). Map crispness at equal sampled
+density (MME entropy + MPV plane thickness over 200k k=30 neighborhoods):
+median thickness 6.23 → 6.21 → 6.04 cm, entropy monotonically crisper.
+**Verdict: keep default 8** (lag 4 captures most of the median gain; 8 adds
+margin). Reframed expectation: with the TF-pairing fix in, residual deskew
+smear on HelmDyn01 is a few-percent thickness effect, not the dramatic
+2026-06-10 render artifact — knot rotations (0.016–0.019 rad, warn 0.05)
+show this sequence is not under-resolved. R_Campus legs deferred
+(unblocked by the est_window fix below).
+
+**Insert-lag A/B (`map_insert_lag_knots` {0,8} × 3 repeats).** RMSE
+4.88/4.93/4.90 → 4.73/4.81/4.93 cm (mean −1.6 %, median −3.8 %, ranges
+overlap); NIS and IEKF iterations unchanged; compute +0.03 ms. **Safe; gain
+within noise on this sequence. Gate to flip the default: repeat on
+TudoRun01 (GT, gentler motion baseline) — until then stays 0.**
+
+**Edge-vs-final quantified.** Recording `/odom` (edge) and the Mapping
+lagged tip (refined) in one run: raw same-stamp agreement **0.58 cm / 0.49°
+median** — the entire correction later scans apply to a published pose.
+
+#### Mapping replica est_window ingestion loss — found + FIXED 2026-06-11
+
+Probing edge-vs-refined exposed `traj_path`/`odometry` stamps drifting
+~0.7–10 % of elapsed time vs their poses (tip 2.3 s late after 200 s;
+refined-vs-GT APE 2.26 m vs 0.047 m for `/odom`). Root cause:
+`getEstCallback` kept only the LATEST est_window in a single pending slot
+while the worker consumed at ~20 Hz (50 ms sleeps inside `processScan`'s
+deskew gate) against ~100 Hz arrivals; `updateKnots` then appended across
+the index gap (its invariant fired in every bag run), compressing the
+replica's time axis. Same mechanism produced the *apparent* Avia-frame
+deskew saturation at rate 1.0 — the consumer paces to the replica edge;
+compute was never the bottleneck (`transformCloud` is OMP-parallel, itp is
+O(1)). Fix (Mapping.cpp `a84b7f4` + counter cleanup): bounded lossless
+`est_window_queue_` drained in order by the worker; pacing moved to a
+single 5 ms idle sleep in `process()`; publish block throttled to ~20 Hz;
+gap invariant now counts events (power-of-2 throttled) instead of
+once-only. Validated: edge-vs-refined 0.84 m-with-growing-shift →
+0.58 cm/no shift; replica edge rate 0.92× → 0.994× realtime; R_Campus
+rate 1.0 consumes full 10 Hz production with a flat buffer (was
++2 frames/s unbounded); post-fix runs log ZERO gap events including the
+former startup-handshake artifact.
+
 ### 6.4 §3.3 recovery-policy validation (hold vs reset)
 
 Goal: pick the production `nis_recovery_mode` default (currently "off").
@@ -1687,8 +1739,8 @@ design, what evidence flips it, and where it is documented.
 
 | Capability | Param / location | Default | Decision gate | Ref |
 | --- | --- | --- | --- | --- |
-| Display-map deskew lag | `map_deskew_lag_knots` | **8 (ON)** | Lag sweep {0,4,8} on R_Campus/HelmDyn01 confirms horizon | §6.3 |
-| Internal-map insertion lag | `map_insert_lag_knots` | 0 (off) | APE A/B {0,8} after display sweep | §6.3 |
+| Display-map deskew lag | `map_deskew_lag_knots` | **8 (ON)** | **VALIDATED 2026-06-11** (HelmDyn01 sweep {0,4,8}: keep 8; R_Campus deferred) | §6.3 results |
+| Internal-map insertion lag | `map_insert_lag_knots` | 0 (off) | **A/B DONE 2026-06-11** (HelmDyn01 3v3: safe, gain within noise) → TudoRun01 A/B before default flip | §6.3 results |
 | Covariance-gated early release | `map_insert_cov_gate_deg` | 0 (off) | Enable with insertion lag; watch NIS + funnel | §6.3 |
 | Robust kernel (Huber/Cauchy) | `robust_kernel`, `robust_kernel_delta` | none (off) | Funnel + localizability show outlier-driven inconsistency | §6.3 |
 | map→odom future-dating | `map/transform_tolerance` | 0 (off) | A downstream consumer needs exact-time map-frame lookups | doc/PARAMETERS.md |
