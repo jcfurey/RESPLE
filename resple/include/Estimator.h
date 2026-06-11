@@ -25,6 +25,30 @@ class Estimator
     Association::CorrespConfig corresp_cfg;
     Association::CorrespStats corresp_stats;
 
+    // HARDENING §3.2 robust kernel (M-estimator) on the point-to-plane
+    // residuals: the IRLS weight w(zp) scales each point's information
+    // (cov_inv_buf_), smoothly downweighting outliers instead of the binary
+    // pt_thresh/cov_thresh accept-reject cliff alone (which is kept — the
+    // kernel softens what survives it). 0 = none (legacy), 1 = Huber,
+    // 2 = Cauchy; robust_delta is the kernel scale in meters (residual
+    // units). Adaptive shape estimation (Barron, arXiv:2004.14938) is a
+    // possible follow-up; fixed kernels first, per the decision-gate rule.
+    // Set once at configure (like corresp_cfg); worker-thread reads only.
+    int robust_kernel = 0;
+    double robust_delta = 0.1;
+    double robustWeight(double r) const
+    {
+        const double a = std::abs(r);
+        if (robust_kernel == 1) {  // Huber
+            return (a <= robust_delta) ? 1.0 : robust_delta / a;
+        }
+        if (robust_kernel == 2) {  // Cauchy
+            const double t = a / robust_delta;
+            return 1.0 / (1.0 + t * t);
+        }
+        return 1.0;
+    }
+
     // Atomic because updateDiagnostics may read these from the ROS executor
     // thread while the worker is mid-IEKF. Monotonic; no reset — the diagnostics
     // publisher snapshots deltas.
@@ -544,7 +568,8 @@ class Estimator
                 constexpr double range_ref = 3.0;
                 double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
                 double noise_scale = (r < range_ref) ? (range_ref * range_ref) / (r * r) : 1.0;
-                cov_inv_buf_(idx_offset) = 1.0 / (pt_data.var_pt * noise_scale);
+                cov_inv_buf_(idx_offset) =
+                    robustWeight(pt_data.zp) / (pt_data.var_pt * noise_scale);
                 idx_offset++;
             }
         }
@@ -588,7 +613,8 @@ class Estimator
                         constexpr double range_ref = 3.0;
                         double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
                         double noise_scale = (r < range_ref) ? (range_ref * range_ref) / (r * r) : 1.0;
-                        cov_inv_buf_(idx_offset) = 1.0 / (pt_data.var_pt * noise_scale);
+                        cov_inv_buf_(idx_offset) =
+                            robustWeight(pt_data.zp) / (pt_data.var_pt * noise_scale);
                         idx_offset++;
                     }
                     id_pt++;

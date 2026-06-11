@@ -391,6 +391,9 @@ public:
         pt_meas.clear();
         pc_world.clear();
         accum_nearest_points.clear();
+        map_insert_staging_.clear();
+        released_w_.clear();
+        knot_rot_checked_ = 0;
         if_init_filter = false;
         if_init_map = false;
         localmap_initialized_ = false;
@@ -828,24 +831,139 @@ public:
                         break;
                     }
                 }
+                size_t n_release = 0;
+                Eigen::Quaterniond q_edge = Eigen::Quaterniond::Identity();
                 {
                     // pointBodyToWorld reads spline; keep serialized with
                     // IEKF writes via spline_mutex_.
                     std::lock_guard<std::mutex> spline_lock(spline_mutex_);
-                    #pragma omp parallel for num_threads(num_threads_)
-                    for (size_t i = 0; i < pt_meas.size(); i++) {
-                        PointData& pt_data = pt_meas[i];
-                        Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
+                    // Edge orientation for the localizability diagnostic below
+                    // (rotates world-frame plane normals into the body frame;
+                    // one rotation for the whole update is adequate for a
+                    // diagnostic over a ≤100 ms point window).
+                    spline->itpQuaternion(spline->maxTimeNs(), &q_edge);
+                    if (map_insert_lag_knots_ == 0) {
+                        // Upstream behavior: world-fix at IEKF time (edge knots).
+                        #pragma omp parallel for num_threads(num_threads_)
+                        for (size_t i = 0; i < pt_meas.size(); i++) {
+                            PointData& pt_data = pt_meas[i];
+                            Association::pointBodyToWorld(pt_data.time_ns, spline, pt_data.pt, pt_data.pt_w, pt_data.t_bl, pt_data.q_bl);
+                        }
+                    } else {
+                        // §6.3 insertion lag: stage body-frame, then deskew and
+                        // release everything past the convergence horizon with
+                        // knot values the IEKF has finished refining. pt_meas
+                        // is time-sorted and cycles are monotone, so the
+                        // staging deque is time-ordered and the release scan
+                        // can stop at the first too-new entry.
+                        for (size_t i = 0; i < pt_meas.size(); i++) {
+                            PointData& pt_data = pt_meas[i];
+                            map_insert_staging_.push_back(StagedMapPoint{
+                                pt_data.time_ns, pt_data.pt, pt_data.q_bl,
+                                pt_data.t_bl, std::move(pt_neighbors_[i])});
+                        }
+                        int64_t release_horizon_ns = spline->maxTimeNs() -
+                            map_insert_lag_knots_ * spline->getKnotTimeIntervalNs();
+                        if (map_insert_cov_gate_deg_ > 0.0) {
+                            // VoxelMap-style uncertainty convergence: if the
+                            // edge pose is already tight, the hold buys
+                            // nothing — release everything staged.
+                            const double ori_var_tr = (if_lidar_only
+                                ? estimator_lo.getLastPoseCovariance()
+                                : estimator_lio.getLastPoseCovariance())
+                                    .block<3, 3>(3, 3).trace();
+                            const double ori_std_deg =
+                                std::sqrt(std::max(ori_var_tr, 0.0)) * 180.0 / M_PI;
+                            if (ori_std_deg < map_insert_cov_gate_deg_) {
+                                release_horizon_ns = spline->maxTimeNs();
+                            }
+                        }
+                        while (n_release < map_insert_staging_.size() &&
+                               map_insert_staging_[n_release].time_ns <= release_horizon_ns) {
+                            n_release++;
+                        }
+                        released_w_.resize(n_release);
+                        #pragma omp parallel for num_threads(num_threads_)
+                        for (size_t i = 0; i < n_release; i++) {
+                            StagedMapPoint& s = map_insert_staging_[i];
+                            Association::pointBodyToWorld(s.time_ns, spline, s.pt, released_w_[i], s.t_bl, s.q_bl);
+                        }
+                    }
+                    // §6.3 knot under-resolution check: each knot's FINAL
+                    // ort_delta norm is the rotation absorbed in one knot
+                    // interval; values near/above the threshold mean knot_hz
+                    // under-fits the motion (Coco-LIC lesson) and trailing-
+                    // edge jitter is expected. Checked once per knot as it
+                    // leaves the est window (>= 5 behind the edge => final).
+                    if (knot_rotation_warn_rad_ > 0.0) {
+                        const int64_t total_k = spline->totalKnots();
+                        const int64_t pruned_k = spline->numKnotsPruned();
+                        if (knot_rot_checked_ < pruned_k) knot_rot_checked_ = pruned_k;
+                        for (; knot_rot_checked_ < total_k - 5; ++knot_rot_checked_) {
+                            const double rot = spline->getKnotOrtDel(
+                                static_cast<size_t>(knot_rot_checked_ - pruned_k)).norm();
+                            const uint32_t mrad = static_cast<uint32_t>(rot * 1000.0);
+                            uint32_t prev = knot_rot_max_mrad_.load(std::memory_order_relaxed);
+                            while (mrad > prev &&
+                                   !knot_rot_max_mrad_.compare_exchange_weak(prev, mrad)) {}
+                            if (rot > knot_rotation_warn_rad_) {
+                                knot_rot_warn_count_.fetch_add(1, std::memory_order_relaxed);
+                                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                    "[RESPLE] rotation per knot %.3f rad exceeds %.3f (knot #%ld): "
+                                    "knot_hz under-resolves this motion — expect trailing-edge "
+                                    "jitter; consider a higher knot_hz.",
+                                    rot, knot_rotation_warn_rad_,
+                                    static_cast<long>(knot_rot_checked_));
+                            }
+                        }
                     }
                     // Cache knot count for updateDiagnostics (may run on the
                     // executor thread; atomic read there is lock-free).
                     cached_spline_knots_.store(spline->numKnots(), std::memory_order_relaxed);
                     cached_spline_total_knots_.store(spline->totalKnots(), std::memory_order_relaxed);
                 }
-                for (size_t i = 0; i < pt_meas.size(); i++) {
-                    PointData& pt_data = pt_meas[i];
-                    pc_world.points.push_back(pt_data.pt_w);
-                    accum_nearest_points.push_back(std::move(pt_neighbors_[i]));
+                // §3.2/§6.3 localizability diagnostic from this update's valid
+                // point-to-plane constraints (rationale at the member decls:
+                // separate 3×3 blocks, per-point normalized, report-only).
+                {
+                    Eigen::Matrix3d E_tt = Eigen::Matrix3d::Zero();
+                    Eigen::Matrix3d E_rr = Eigen::Matrix3d::Zero();
+                    size_t n_valid = 0;
+                    for (size_t i = 0; i < pt_meas.size(); i++) {
+                        const PointData& pt_data = pt_meas[i];
+                        if (!pt_data.if_valid) continue;
+                        const Eigen::Vector3d n_b = q_edge.conjugate() * pt_data.normvec;
+                        const Eigen::Vector3d rxn = pt_data.pt_b.cross(n_b);
+                        E_tt.noalias() += n_b * n_b.transpose();
+                        E_rr.noalias() += rxn * rxn.transpose();
+                        n_valid++;
+                    }
+                    if (n_valid >= 6) {
+                        E_tt /= static_cast<double>(n_valid);
+                        E_rr /= static_cast<double>(n_valid);
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_t(E_tt);
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_r(E_rr);
+                        const Eigen::Vector3d lt = es_t.eigenvalues();  // ascending
+                        const Eigen::Vector3d lr = es_r.eigenvalues();
+                        degen_min_eig_trans_.store(static_cast<float>(lt(0)), std::memory_order_relaxed);
+                        degen_min_eig_rot_.store(static_cast<float>(lr(0)), std::memory_order_relaxed);
+                        degen_cond_trans_.store(static_cast<float>(lt(0) > 0.0 ? lt(2) / lt(0) : 0.0), std::memory_order_relaxed);
+                        degen_cond_rot_.store(static_cast<float>(lr(0) > 0.0 ? lr(2) / lr(0) : 0.0), std::memory_order_relaxed);
+                    }
+                }
+                if (map_insert_lag_knots_ == 0) {
+                    for (size_t i = 0; i < pt_meas.size(); i++) {
+                        PointData& pt_data = pt_meas[i];
+                        pc_world.points.push_back(pt_data.pt_w);
+                        accum_nearest_points.push_back(std::move(pt_neighbors_[i]));
+                    }
+                } else {
+                    for (size_t i = 0; i < n_release; i++) {
+                        pc_world.points.push_back(released_w_[i]);
+                        accum_nearest_points.push_back(std::move(map_insert_staging_.front().neighbors));
+                        map_insert_staging_.pop_front();
+                    }
+                    released_w_.clear();
                 }
                 pt_meas.clear();
                 const auto deskew_end = std::chrono::high_resolution_clock::now();
@@ -1283,6 +1401,57 @@ private:
     // Per-frame parallel buffer for k-NN results (used to live in PointData::nearest_points).
     // Sized to pt_meas.size() before each IEKF call; results moved into accum_nearest_points after.
     std::vector<Eigen::aligned_vector<pcl::PointXYZINormal>> pt_neighbors_;
+    // HARDENING §6.3 internal-map insertion lag (map_insert_lag_knots, default
+    // 0 = upstream insert-at-edge). Body-frame points are staged here until
+    // their timestamps fall behind the convergence horizon (the IEKF only
+    // updates the last 4 RCPs, so knots >= ~4 behind the edge are final), then
+    // deskewed with those final knot values and released into pc_world for the
+    // async ikd-Tree insert. Keeps trailing-edge jitter out of the REFERENCE
+    // map the IEKF matches against (cf. SLICT's marginalization-time map
+    // admission, arXiv:2211.03900; retrospective map refinement,
+    // arXiv:2503.21293). Worker-thread-only state — no extra locking.
+    struct StagedMapPoint {
+        int64_t time_ns;
+        pcl::PointXYZINormal pt;  // body frame
+        Eigen::Quaterniond q_bl;
+        Eigen::Vector3d t_bl;
+        Eigen::aligned_vector<pcl::PointXYZINormal> neighbors;
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    };
+    Eigen::aligned_deque<StagedMapPoint> map_insert_staging_;
+    Eigen::aligned_vector<pcl::PointXYZINormal> released_w_;  // per-cycle scratch
+    int map_insert_lag_knots_ = 0;
+    // §6.3 covariance gate (VoxelMap's uncertainty-convergence criterion in
+    // cheap form, arXiv:2109.07082): when > 0, staged points are released
+    // EARLY whenever the edge-pose orientation std (sqrt of the rotational
+    // covariance trace via getLastPoseCovariance) is below this many degrees.
+    // Gentle motion gets a fresh reference map; aggressive motion gets the
+    // full fixed-knot hold. Only meaningful with map_insert_lag_knots > 0.
+    double map_insert_cov_gate_deg_ = 0.0;
+    // §6.3 knot under-resolution diagnostic (Coco-LIC / ATI-CTLO lesson:
+    // fixed knot_hz under-fits violent rotation). Each knot's FINAL ort_delta
+    // norm — the rotation the spline must absorb in one knot interval — is
+    // checked once when the knot leaves the est window. Worker-only cursor;
+    // atomics for the executor-thread diagnostics reader.
+    double knot_rotation_warn_rad_ = 0.05;
+    int64_t knot_rot_checked_ = 0;
+    std::atomic<uint64_t> knot_rot_warn_count_{0};
+    std::atomic<uint32_t> knot_rot_max_mrad_{0};
+    // §6.3 / §3.2 LiDAR localizability diagnostic (X-ICP family, report-only).
+    // Per update, the information matrices of the point-to-plane constraints:
+    //   E_tt = (1/N) Σ n nᵀ        (translation, world-frame-invariant scale)
+    //   E_rr = (1/N) Σ (p×n)(p×n)ᵀ (rotation, body-frame lever arms)
+    // kept as SEPARATE 3×3 blocks — a joint 6×6 mixes meter-scaled rotation
+    // rows with unit normals and its condition number becomes
+    // scale-dependent (the arXiv:2408.11809 field-analysis pitfall). Min
+    // eigenvalue ≈ how constrained the weakest axis is; condition number ≈
+    // anisotropy. Report-only by design: hard eigenvalue gates are brittle
+    // across environments (same field analysis); these fields exist to
+    // decide §3.2 (plane_min_cond_ratio) from bag evidence.
+    std::atomic<float> degen_min_eig_trans_{0.f};
+    std::atomic<float> degen_min_eig_rot_{0.f};
+    std::atomic<float> degen_cond_trans_{0.f};
+    std::atomic<float> degen_cond_rot_{0.f};
     double cube_len = 2000; 
     const float MOV_THRESHOLD = 1.5f;
     float det_range = 100.0;
@@ -1562,6 +1731,39 @@ private:
             estimator_lio.corresp_cfg = ccfg;
         }
 
+        // HARDENING §3.2 robust kernel on the point-to-plane residuals
+        // (M-estimator IRLS weight on each point's information; softens the
+        // binary accept-reject cliff). "none" preserves legacy weighting
+        // exactly; off by default pending bag A/B via the funnel +
+        // localizability diagnostics.
+        {
+            const std::string kernel = CommonUtils::readParam<std::string>(
+                this->get_node_parameters_interface(), "robust_kernel", std::string("none"));
+            double kernel_delta = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "robust_kernel_delta", 0.1);
+            int kernel_id = 0;
+            if (kernel == "huber") kernel_id = 1;
+            else if (kernel == "cauchy") kernel_id = 2;
+            else if (kernel != "none") {
+                RCLCPP_WARN(this->get_logger(),
+                    "robust_kernel='%s' unknown (none|huber|cauchy); using none", kernel.c_str());
+            }
+            if (kernel_delta <= 0.0) {
+                RCLCPP_WARN(this->get_logger(),
+                    "robust_kernel_delta=%.3f must be > 0; using 0.1", kernel_delta);
+                kernel_delta = 0.1;
+            }
+            estimator_lo.robust_kernel = kernel_id;
+            estimator_lio.robust_kernel = kernel_id;
+            estimator_lo.robust_delta = kernel_delta;
+            estimator_lio.robust_delta = kernel_delta;
+            if (kernel_id != 0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] robust_kernel=%s (delta=%.3f m) on LiDAR residuals.",
+                    kernel.c_str(), kernel_delta);
+            }
+        }
+
         // HARDENING §3.1 sliding-window knot pruning. Default 600 knots
         // (6 s at the canonical knot_hz=100) bounds spline memory while
         // staying far wider than any backward-looking consumer. 0 disables.
@@ -1581,6 +1783,29 @@ private:
         // previously hardcoded 2000; 0 disables). Drop-oldest + counters.
         max_scan_buffer_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_scan_buffer", 0);
         max_imu_staging_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_imu_staging", 2000);
+
+        // HARDENING §6.3 internal-map insertion lag (0 = upstream
+        // insert-at-edge; recommended trial value 8 = the convergence
+        // horizon + margin). Delays ikd-Tree insertion — and therefore
+        // /current_scan, which publishes the same released points — by
+        // lag × dt so the REFERENCE map is built from final knot values.
+        // Off by default pending bag validation (repo decision-gate rule).
+        map_insert_lag_knots_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "map_insert_lag_knots", 0);
+        if (map_insert_lag_knots_ < 0) map_insert_lag_knots_ = 0;
+        if (map_insert_lag_knots_ > 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] map_insert_lag_knots=%d: ikd-Tree insertion + /current_scan "
+                "lag the spline edge by %d knots (odometry unaffected).",
+                map_insert_lag_knots_, map_insert_lag_knots_);
+        }
+        // §6.3 covariance gate for early release of staged map points
+        // (degrees of edge-pose orientation std; 0 = pure fixed-knot lag).
+        map_insert_cov_gate_deg_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "map_insert_cov_gate_deg", 0.0);
+        if (map_insert_cov_gate_deg_ < 0.0) map_insert_cov_gate_deg_ = 0.0;
+        // §6.3 knot under-resolution warning threshold (rad of rotation per
+        // knot interval; 0 disables). 0.05 rad/knot = 5 rad/s at knot_hz 100 —
+        // well above any rover/handheld motion, fires on HelmDyn-class spin.
+        knot_rotation_warn_rad_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "knot_rotation_warn_rad", 0.05);
 
         // HARDENING §3.3 divergence recovery policy: off (detection-only,
         // legacy) | hold (gate odometry/TF while DIVERGED) | reset
@@ -1966,6 +2191,18 @@ private:
         stat.add("Avg Computation Time (ms)", avg_computation_time);
         stat.add("Avg IEKF Iterations", avg_iekf_iters);
         stat.add("Num Threads", num_threads_);
+        // §6.3 knot under-resolution diagnostic (knot_rotation_warn_rad).
+        stat.add("Knot Rotation Max (rad)",
+                 knot_rot_max_mrad_.load(std::memory_order_relaxed) / 1000.0);
+        stat.add("Knot Rotation Warnings",
+                 static_cast<int>(knot_rot_warn_count_.load(std::memory_order_relaxed)));
+        // §3.2 localizability (per-point-normalized constraint information;
+        // min eigenvalue = weakest axis, condition = anisotropy; 0 until the
+        // first update with >= 6 valid correspondences).
+        stat.add("Localizability Min Eig (trans)", degen_min_eig_trans_.load(std::memory_order_relaxed));
+        stat.add("Localizability Min Eig (rot)", degen_min_eig_rot_.load(std::memory_order_relaxed));
+        stat.add("Localizability Cond (trans)", degen_cond_trans_.load(std::memory_order_relaxed));
+        stat.add("Localizability Cond (rot)", degen_cond_rot_.load(std::memory_order_relaxed));
         stat.add("Num Match Points", num_match_points_);
 
         // Buffer sizes: read the worker-maintained atomic caches instead of the
@@ -2239,6 +2476,10 @@ private:
 
         if(!updateLidarTransform(livox_msg_in->header.frame_id)) return;
 
+        // NOTE (applies to all three livox callbacks): the point loop below
+        // intentionally starts at i = 1 — points[0] seeds pt_pre for the
+        // duplicate-point filter. Mapping.cpp's livox ingest has no pt_pre and
+        // loops from 0.
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         int plsize = livox_msg_in->point_num;
         // Belt-and-braces: gate on the actual vector size, not just the

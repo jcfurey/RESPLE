@@ -36,5 +36,15 @@
 # involvement (publish() -> DDS internals). The production deployment uses
 # rmw_zenoh, where this Fast-DDS path does not exist. Suppressed so the gate
 # measures RESPLE code, not the DDS vendor. See HARDENING.md §6.1.
-race:eprosima::fastcdr::Cdr::serialize_array
+#
+# Deliberately anchored on the DESERIALIZE side only. TSan suppresses a report
+# if any frame of either stack matches, and the vendor race always carries the
+# receive/statistics thread's deserialize frame — so this one entry silences
+# it. A generic serialize_array entry was removed on purpose: "racing a
+# serialize" is also the signature of a REAL bug class (RESPLE mutating a
+# message while publish() serializes it), and that report would carry
+# serialize_array but NOT deserialize_array, so it now fails the gate instead
+# of being swallowed. If a new vendor-only serialize-side variant ever shows
+# up, add it back anchored on a frame that cannot contain RESPLE code, with a
+# HARDENING.md entry.
 race:eprosima::fastcdr::Cdr::deserialize_array

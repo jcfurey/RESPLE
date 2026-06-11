@@ -1296,10 +1296,223 @@ This is the inherent **real-time-output vs. smoothed-estimate gap**; only
 extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
 
 **Mitigations and their trade-offs:**
-- **Map lag (preferred if needed).** Build/deskew the map from poses a few
-  knots *behind* the edge — i.e., after later scans have refined them — trading
-  a small output latency for crispness. The estimate is already good there
-  (4.7 cm); we'd just stop publishing the bleeding edge into the map.
+- **Map lag (IMPLEMENTED 2026-06-10/11, `map_deskew_lag_knots`, default 8).**
+  Build/deskew the map from poses *behind* the edge — i.e., after later scans
+  have refined them — trading a small output latency for crispness.
+  Implementation: the Mapping worker holds each scan until
+  `spline_max - t_end >= lag × dt` (`MappingBase::processScan` gate); the held
+  scan is then deskewed with knots that `updateKnots`/`setOneStateKnot` have
+  already overwritten with refined est_window values. The publishPath tip is
+  lagged identically, and pubOdom's odom→base lookup is **time-paired to the
+  tip stamp** (previously Time(0)/latest — that pairing put full body motion
+  over a 50–180 ms gap into the map→odom TF). `0` restores bleeding-edge.
+
+  **Convergence horizon (why 8 and not more):** the IEKF updates only the
+  last 4 RCPs and `getSplineMsg` resends only the last 5 knots, so a knot is
+  final — in the estimator AND at the Mapping replica — once ~4 behind the
+  edge. Cubic interpolation at scan time `t` reads knots up to `idx(t)+2`,
+  so every knot a scan touches is final once the edge is ≥6 knots past it;
+  8 adds margin. Beyond that, lag buys latency, not accuracy: at `knot_hz`
+  100 the map runs 80 ms behind, far inside the accepted 0.5 s map-latency
+  budget (requirement 2026-06-11: odometry must stay real-time; the map and
+  `map→odom` may lag up to ~500 ms if that buys accuracy). A larger budget
+  would only matter if the est_window protocol were widened AND the
+  estimator re-optimized older knots — it does not (recursive-by-design).
+  Pending bag validation: re-render HelmDyn01 + R_Campus and confirm the
+  azimuth smear collapses; sweep lag ∈ {0, 4, 8} to confirm the horizon.
+
+- **Internal-map insertion lag (CAPABILITY LANDED 2026-06-11,
+  `map_insert_lag_knots`, default 0 = off).** The display-map lag above does
+  not touch the deeper instance of the same disease: `processData`
+  world-fixes points immediately after the IEKF (`pointBodyToWorld` with the
+  freshest knots — upstream `main` does the identical thing) and the async
+  `mapIncremental` inserts them into the ikd-Tree. Trailing-edge jitter is
+  thereby baked into the REFERENCE map the IEKF matches against, and the
+  error feeds back into every subsequent estimate ("registration errors
+  introduced at an earlier stage remain in the map and affect all subsequent
+  estimates" — retrospective map refinement, arXiv:2503.21293; SLICT admits
+  scans to its map only at marginalization time for the same reason,
+  arXiv:2211.03900; the RESPLE paper itself frames map maintenance as
+  happening when "active RCPs transition into idle state", arXiv:2504.11580,
+  which is closer to lagged insertion than to the shipped insert-at-edge).
+  Implementation: with lag > 0 the worker stages body-frame points
+  (`map_insert_staging_`, worker-thread-only) and releases them once the
+  edge is `lag` knots past their stamps, deskewing with final knot values
+  under `spline_mutex_`. `/current_scan` publishes the same released points,
+  so it inherits the lag. Trade-off: the reference map is missing the last
+  `lag × dt` of points (~1 scan at 10 Hz / 80 ms) — marginal near-field
+  sparsity against a permanently crisper reference. **Off by default
+  (decision-gate rule: this alters the odometry feedback loop); recommended
+  trial value 8.** Bag experiment: HelmDyn01 + R_Campus APE with
+  `map_insert_lag_knots` ∈ {0, 8}, after the display-lag sweep isolates the
+  display-side effect.
+
+  **Related work map (2026-06-11 survey)** — where each thread of the smear
+  problem sits in the literature, for designing follow-ups after the bag
+  experiments:
+  - *Lagged/converged map admission (what we shipped):* retrospective map
+    refinement (arXiv:2503.21293) — lag queue, promote to map after pose
+    convergence; SLICT (arXiv:2211.03900) — scans enter the map only at
+    sliding-window marginalization. Both validate the
+    `map_deskew_lag_knots` / `map_insert_lag_knots` design.
+  - *Uncertainty-weighted maps (the alternative to binary lag):* VoxelMap
+    (arXiv:2109.07082) propagates BOTH LiDAR noise and POSE-ESTIMATE
+    covariance into per-plane uncertainty, then weights matching by it —
+    instead of delaying insertion, insert immediately but downweight
+    edge-pose points until "empirical convergence of plane uncertainty".
+    IMPLEMENTED in cheap form (2026-06-11): `map_insert_cov_gate_deg` —
+    staged points release early when the edge-pose orientation std (from
+    `getLastPoseCovariance`, the proper spline-Jacobian propagation) drops
+    below the gate; the fixed-knot hold remains the aggressive-motion
+    ceiling. Full VoxelMap-style per-plane uncertainty remains future work.
+  - *Estimate-side fixes for aggressive motion (the part lag cannot fix):*
+    Point-LIO (10.1002/aisy.202200459) updates per-point at 4–8 kHz, removes
+    in-frame distortion by construction, and survives IMU saturation at
+    75 rad/s — the benchmark for HelmDyn-class motion. Coco-LIC
+    (arXiv:2309.09808) places B-spline knots NON-UNIFORMLY by motion
+    intensity; ATI-CTLO (arXiv:2407.20619) adapts the temporal interval
+    likewise; FR-LIO (arXiv:2302.04031) splits scans into sub-frames by
+    motion intensity and smooths within an iterated Kalman smoother window.
+    Shared lesson: a fixed `knot_hz` under-fits violent yaw — adaptive knot
+    density is the principled estimate-side remedy if the lag sweep + parity
+    A/B leave residual smear on HelmDyn01. The DETECTION side is implemented
+    (2026-06-11): `knot_rotation_warn_rad` checks each knot's final
+    `ort_delta` norm (= rotation absorbed per knot interval) as it leaves the
+    est window, WARNs + counts in `/diagnostics` when the motion exceeds what
+    `knot_hz` resolves — so bag runs now measure under-resolution directly
+    instead of inferring it from smear renders.
+  - *Spline theory + lineage:* the ETH continuous-time estimation survey
+    (arXiv:2411.03951) is the canonical reference for the knot-count/order
+    vs accuracy/cost trade-off; Cioffi et al. (RA-L 2021, CT-vs-DT SLAM)
+    formalize when continuous-time wins. SFUISE (arXiv:2301.09033) is this
+    group's own predecessor (recursive sliding-window spline fusion) —
+    consult it before touching the RCP recursion.
+  - *Degeneracy detection (feeds the open §3.2 `plane_min_cond_ratio`
+    decision):* the literature gates the OPTIMIZATION, not the per-plane
+    fit — X-ICP projects normalized Jacobians onto the Hessian eigenspace
+    for per-axis NONE/PARTIAL/FULL localizability; LION/others threshold
+    the Hessian condition number; GenZ-ICP (arXiv:2411.06766) adaptively
+    reweights instead of gating; "Informed, Constrained, Aligned"
+    (arXiv:2408.11809) is a field comparison of these methods. Our QR
+    pivot-ratio gate is per-correspondence — a cheap per-update diagnostic
+    on the stacked LiDAR Jacobian's eigenspectrum (the H rows already
+    exist in pt_meas) would match the literature-standard signal and could
+    decide §3.2 with better evidence than the plane-fit-level gate alone.
+    DETECTION IMPLEMENTED (2026-06-11), report-only: per update, the
+    per-point-normalized constraint information matrices E_tt = Σnnᵀ/N and
+    E_rr = Σ(p×n)(p×n)ᵀ/N as SEPARATE 3×3 blocks (a joint 6×6 mixes
+    meter-scaled rotation rows with unit normals → scale-dependent
+    condition number, the field-analysis pitfall), min-eig + condition for
+    each in `/diagnostics` ("Localizability ..."). Hard gating deliberately
+    NOT implemented: arXiv:2408.11809's own conclusion is that eigenvalue
+    thresholds are brittle across environments — collect bag distributions
+    first, then decide §3.2 remediation (GenZ-ICP-style reweighting being
+    the literature favorite over hard gates).
+  - *Map data structure:* Faster-LIO's iVox (parallel sparse incremental
+    voxels) trades slower per-query k-NN (~2.76 vs ~1.42 µs/point) for
+    O(1) insertion and NO REBUILD THREAD. Note well: the ikd-Tree rebuild
+    thread is the root of hazards 33–35 (Phases 2.4/2.5, the costliest
+    concurrency work in this package) — an iVox-class structure would
+    delete that hazard class outright, which is a stronger motive here
+    than raw speed. Surfel-LIO (arXiv:2512.03397, Z-order voxel hashing +
+    precomputed surfels) is the newer same-family option. DELIBERATELY NOT
+    implemented as a drive-by (2026-06-11): Faster-LIO's own numbers show
+    per-query k-NN ~2× SLOWER than ikd-Tree (≈2.76 vs ≈1.42 µs/point — its
+    wins are insertion + parallelism), and RESPLE's hot loop is
+    k-NN-dominated (num_match_points plane fits per point), so a naive swap
+    risks a net regression. If attempted: own project, benchmarked on our
+    bags, justified by the hazard-class deletion.
+  - *Validation datasets beyond the current bags:* the Hilti SLAM
+    Challenge / Hilti-Oxford datasets (arXiv:2208.09825; 2021–2023
+    editions, handheld + robot-mounted, deliberate shaking/swinging,
+    narrow stairs, dark corners) provide MILLIMETER-accurate control-point
+    ground truth — directly useful because HelmDyn's mocap orientation GT
+    is unreliable (§6.3 baseline note), so Hilti sequences can quantify
+    orientation accuracy under aggressive motion where HelmDyn cannot.
+  - *Ground-vehicle priors (production-deployment relevant — Rover MAX):*
+    Kinematic-ICP (arXiv:2410.10277) and SE(2)-constrained LIO
+    (arXiv:2404.01584) add planar/kinematic soft constraints; LIWO
+    (arXiv:2302.14298) adds wheel-encoder velocity observations. RESPLE
+    estimates unconstrained 6-DoF; a soft planar prior or wheel-velocity
+    pseudo-measurement in the IEKF could cut z/pitch/roll drift on the
+    rover. CAUTION: production already fuses RESPLE into the
+    robot_localization EKF alongside wheel odom — a native constraint
+    would double-count unless the downstream fusion is rebalanced, and
+    hard SE(2) breaks on rough terrain. Soft-constraint-with-honest-
+    covariance only, and only after the A/B campaign settles the baseline.
+  - *Dynamic-object-aware mapping (production-relevant):* moving
+    people/vehicles insert ghost points into the ikd-Tree reference map —
+    the same corrupt-the-reference feedback loop as the smear, different
+    cause. ERASOR family (pseudo-occupancy, offline map cleaning —
+    applicable to SaveMap exports today), ID-LIO (delayed removal — note:
+    our `map_insert_lag_knots` staging is a natural host for a future
+    cheap dynamic filter at release time), and spatio-temporal normal
+    analysis LIO (arXiv:2510.22313) for the online case.
+  - *Filter-consistency theory (the WHY behind §3.3 NIS):* FEJ-EKF (Huang
+    et al.) and observability-based consistency rules show Jacobians
+    re-evaluated at updated estimates inflate the observable subspace →
+    spurious information gain → overconfidence — and explicitly note the
+    ITERATED EKF does not fix this. RESPLE's IEKF relinearizes each
+    iteration; the §3.3 NIS detector catches exactly this symptom class.
+    If bags show systematic NIS divergence (not just under degeneracy),
+    FEJ-style pinned linearization for the older RCPs is the literature
+    direction — research-grade for a spline filter, record only.
+  - *Robust kernels (cheap, concrete §3.2 upgrade path):* RESPLE's
+    outlier handling is binary gates (`nn_thresh`, `plane_fit_thresh`);
+    the literature standard is an M-estimator weight (Huber/Cauchy) on
+    each point-to-plane residual, and adaptive kernels (Barron's loss,
+    arXiv:2004.14938) self-tune the shape online. IMPLEMENTED
+    (2026-06-11, fixed kernels, off by default): `robust_kernel`
+    none|huber|cauchy + `robust_kernel_delta`, applied as an IRLS weight
+    on each point's information (`cov_inv_buf_`) in both updateLiDAR
+    paths; "none" is bit-exact legacy. Barron's adaptive α deferred —
+    fixed kernels first, A/B on bags via the funnel + localizability
+    diagnostics, then decide if adaptivity earns its complexity.
+  - *Deep-read outcomes (2026-06-11):* Kinematic-ICP's own Palace
+    ablation shows the unicycle subspace UNDERPERFORMS the baseline on
+    uneven terrain → do not adopt the constraint for the rover; its
+    no-tuning adaptive regularization (β = ICP cost at the wheel-odom
+    prediction) is the reusable idea if wheel fusion ever moves into
+    RESPLE. SE(2)-LIO's perturbation-as-noise (σz, Σθxy) is the correct
+    soft formulation if/when the downstream double-counting question is
+    settled. The spatio-temporal-normal dynamic-LIO paper's math is not
+    accessible (abstract + compressed PDF only) — dynamic screening at
+    staging-release stays DEFERRED rather than implemented from a
+    paraphrase. ERASOR on SaveMap exports needs per-scan poses + scans,
+    which production bags already contain — run ERASOR offline from a
+    bag + /odom, no SaveMap extension required.
+
+  *Main-vs-lyrical logic audit (2026-06-11):* before trusting the
+  "inherent real-time gap" framing, the map path was diffed against upstream
+  `main`. The Mapping node is logic-equivalent (same `t_end <= maxTimeNs`
+  bleeding-edge gate, same per-scan — not accumulated — `/global_map`
+  publication, same per-point deskew; the staging swap and 200-scan cap only
+  add ≤50 ms latency / backlog bounds). If `main` renders the same bag
+  crisper, the delta is in the **estimator's numeric path**, where several
+  default-on changes accumulated: `EIGEN_USE_BLAS` (different FP
+  rounding/order — the CMake note records it initially destabilized the
+  covariance update), threaded k-NN/association (`num_threads: 5`,
+  FP-order changes), async background `mapIncremental`, and
+  `EIGEN_INITIALIZE_MATRICES_BY_NAN` no longer set in Release. Each is a
+  small perturbation; the trailing-edge knots are exactly where small
+  perturbations are least damped. Decisive experiment (bag-gated): same bag
+  through an `origin/main` build vs a parity-configured current build
+  (`doc/PARAMETERS.md` § "Reproducing the original (`main`) behavior"),
+  compare `evo_ape` + map renders.
+
+  *Operator report (2026-06-11):* smearing was observed on the **hardened
+  build** on HelmDyn01 AND **R_Campus** (LIO, Livox Avia, handheld-grade
+  motion), among other datasets, while the operator's recollection is that
+  upstream `main` rendered these crisp. Two implications: (1) the smear is
+  NOT confined to HelmDyn-grade violent motion — ordinary walking/handheld
+  yaw oscillation suffices, so the original "only extreme motion exposes
+  it" framing above is too narrow and the map-lag default matters in
+  normal operation; (2) the regression hypothesis (estimator numeric-path
+  deltas, previous paragraph) is strengthened and the main-parity A/B is
+  promoted to the highest-priority bag-gated experiment. Suggested order:
+  first re-render R_Campus on the current build with `map_deskew_lag_knots`
+  ∈ {0, 4, 8} (cheap, isolates the edge-deskew mechanism), then the
+  main-vs-parity A/B (isolates the numeric regression).
 - **Faster knot convergence — POTENTIAL ISSUES (document before attempting).**
   Trying to make the trailing knots converge sooner (more IEKF iterations,
   larger point budget, or tighter orientation process/measurement noise so the
@@ -1322,10 +1535,13 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
   - **Net:** faster convergence is a tuning lever with diminishing returns and
     real downside; map lag addresses the actual mechanism (use refined poses)
     without destabilising the filter.
-- **Accept (current decision).** Position is accurate (4.7 cm) and the
-  deployment sensor is an **Ouster on a rover** — motion much closer to TudoRun
-  than to a head-worn helmet — so this edge-pose smear is unlikely to manifest
-  in production. HelmDyn is effectively a worst-case stress test.
+- **Accept (superseded 2026-06-10).** The original decision — position is
+  accurate (4.7 cm) and the deployment sensor is an **Ouster on a rover**
+  (motion much closer to TudoRun than to a head-worn helmet), so the
+  edge-pose smear was unlikely to manifest in production. Superseded by the
+  map-lag implementation above: the fix is cheap (latency-only, off-switch via
+  `map_deskew_lag_knots: 0`), so it now ships enabled instead of relying on
+  the deployment motion staying benign.
 
 Goal: decide the production `plane_min_cond_ratio` (degeneracy guard,
 currently 0 = off) and sanity-check `nn_max_sq_dist` / `plane_fit_thresh`
@@ -1375,6 +1591,118 @@ is not). `reset` wins only if it recovers materially faster without
 thrash. Record the choice in the workspace config and the params docs.
 
 ---
+
+### 6.5 ROS 2 runtime & middleware literature (2026-06-11 survey)
+
+Complements §6.1's empirical RMW findings (Fast-DDS payload-pool races,
+zenoh-c TSan noise) with the systems literature, and records why most of
+it does NOT translate into code changes here.
+
+- **RMW comparisons validate the production zenoh choice.** The
+  planetary-exploration mesh study (arXiv:2407.03091, JIRS 2025) finds
+  zenoh stable by an order of magnitude under degrading/mesh networks
+  where CycloneDDS and Fast-DDS collapse; the edge-to-cloud comparison
+  (arXiv:2309.07496) agrees (CycloneDDS wins on wired Ethernet via UDP
+  multicast; zenoh wins on Wi-Fi/4G). For a teleoperated field rover,
+  rmw_zenoh is the literature-supported pick — consistent with §6.1's
+  "gate TSan on Fast-DDS, deploy zenoh" decision. Fast-DDS's intra-process
+  large-payload advantage is irrelevant here (our nodes are separate
+  processes).
+- **Executor scheduling theory mostly bypasses us — by our own design.**
+  Casini et al. (ECRTS 2019) founded ROS 2 executor response-time
+  analysis; arXiv:2408.08440 extends it to multi-threaded executors;
+  the events-executor line shows classical real-time bounds become
+  applicable with it; arXiv:2601.10722 (Jan 2026) surveys the field.
+  RESPLE's latency-critical path (IEKF worker, map update) runs on
+  DEDICATED threads outside any executor precisely so executor
+  wait-set/scheduling pathologies cannot touch it; executor callbacks are
+  buffer-pushes on a MutuallyExclusive group. EventsExecutor is a
+  candidate ONLY if ros2_tracing ever shows callback-dispatch latency on
+  the sensor path — do not churn main() speculatively (it is still
+  `experimental::` in Jazzy).
+- **Zero-copy is blocked on our message type, not on configuration.**
+  Loaned-message/iceoryx zero-copy requires fixed-size types;
+  `PointCloud2` is unsized (std::vector payload), which mainline
+  zero-copy does not support — the practical catch the discourse threads
+  and the Agnocast paper (arXiv:2506.16882, true zero-copy for unsized
+  types) both document. Agnocast is research-stage; the config-level
+  lever available TODAY for on-host large messages is rmw_zenoh's
+  shared-memory transport — an ops experiment (zenoh config), no code.
+  `use_intra_process_comms(true)` already covers the in-process case.
+- **ros2_tracing (arXiv:2201.00393) is the right latency instrument for
+  the bag campaign.** ~3 µs/event via LTTng, tracepoints already compiled
+  into rclcpp/rmw (no code changes — install tracing tools, run a
+  session), REP-2014 gives the benchmarking methodology. Use it to
+  measure the sensor→/odom chain end-to-end instead of ad-hoc timers if
+  the deskew/processing-time diagnostics ever implicate transport.
+
+### 6.6 Dynamic-aware mapping (BTSA) — implementation-ready design
+
+Unblocks the §6.3 deferral: the paper's math was recovered from the HTML
+version and the released code (github.com/thisparticle/btsa, RA-L 2025,
+arXiv:2510.22313) was read. Mechanism, from source:
+
+- **Time channel:** every point in a short-lived temporal map carries its
+  timestamp in `curvature` (ms; `/1000` → seconds in the fit). The
+  temporal map retains ~2 s of scans (`time_slice: 20` at 10 Hz).
+- **Detection (`esti_stPlane`, common_lib.h:231):** per query point, k-NN
+  (k=`neighborhood_size: 15`) in the temporal map → 4×4 covariance of
+  (x, y, z, t) → smallest eigenvector ñ=(a,b,c,d). |d| is surface
+  velocity projected on the spatial normal; `|d| ≥ vel_thre (0.2)` ⇒
+  dynamic ⇒ excluded from registration (`point_selected_surf_=false`).
+  Static surfaces give d≈0 because their 4D neighborhood is flat in t.
+- **False-positive rescue (before global map insertion):** upsample
+  flagged points to full resolution (kNN/radius), DBSCAN-cluster,
+  bounding-box, then volumetric-overlap test against a short-term static
+  voxel map — high-overlap clusters are newly-visible STATIC area and are
+  kept.
+- **Cost & results:** ~49.7 ms/scan on an i5-12490 (the whole real-time
+  budget of our worker on embedded hardware); ablation APE 35.84 m →
+  0.46 m in dynamic + geometrically-degenerate scenes — the gain is
+  existential there, marginal in static scenes.
+
+**RESPLE adaptation (when a dynamic-objects bag exists):**
+1. Stamp absolute insertion time (s) into the `curvature` field of map
+   copies (currently carries reflectivity, unused by matching; SaveMap
+   would inherit the channel).
+2. Maintain a second, small temporal kd-tree (~2 s retention) alongside
+   the main ikd-Tree — BTSA's detection NEVER queries the long-lived
+   registration map, and neither should ours (mixed-age static points
+   would dilute d).
+3. Cheapest integration first: score points at `map_insert_staging_`
+   RELEASE time (the hook recorded in §6.3) and drop |d|-flagged points
+   from map insertion only. Registration gating (BTSA's bigger win, but
+   also its bigger cost/risk) second, only if the bag shows registration
+   itself is corrupted by dynamics.
+4. Start params: `vel_thre 0.2`, k=15, 2 s window; expose all three.
+
+Decision gate: requires a bag with actual moving objects + ground truth
+(or at least map renders); none of the current bags qualifies. Until
+then this stays a design.
+
+### 6.7 Pending capabilities & decision queue (consolidated)
+
+Single place to find every shipped-but-off capability and deferred
+design, what evidence flips it, and where it is documented.
+
+| Capability | Param / location | Default | Decision gate | Ref |
+| --- | --- | --- | --- | --- |
+| Display-map deskew lag | `map_deskew_lag_knots` | **8 (ON)** | Lag sweep {0,4,8} on R_Campus/HelmDyn01 confirms horizon | §6.3 |
+| Internal-map insertion lag | `map_insert_lag_knots` | 0 (off) | APE A/B {0,8} after display sweep | §6.3 |
+| Covariance-gated early release | `map_insert_cov_gate_deg` | 0 (off) | Enable with insertion lag; watch NIS + funnel | §6.3 |
+| Robust kernel (Huber/Cauchy) | `robust_kernel`, `robust_kernel_delta` | none (off) | Funnel + localizability show outlier-driven inconsistency | §6.3 |
+| map→odom future-dating | `map/transform_tolerance` | 0 (off) | A downstream consumer needs exact-time map-frame lookups | doc/PARAMETERS.md |
+| Main-parity numeric path | `-DENABLE_EIGEN_BLAS=OFF` + recipe | BLAS on | Main-vs-parity A/B (the regression question) | doc/PARAMETERS.md |
+| Knot under-resolution warn | `knot_rotation_warn_rad` | **0.05 (ON)** | Tune threshold per deployment if noisy | §6.3 |
+| Localizability diagnostics | (always on, report-only) | — | Feeds the §3.2 `plane_min_cond_ratio` decision | §6.3 |
+| Plane-fit degeneracy gate | `plane_min_cond_ratio` | 0 (off) | Localizability distributions from bags | §6.3 / §3.2 |
+| Dynamic-aware mapping (BTSA) | design only | — | Bag with moving objects | §6.6 |
+| Barron adaptive kernel α | design only | — | Fixed kernels A/B first | §6.3 |
+| SE(2)/wheel soft prior | design only | — | Downstream fusion rebalance decision | §6.3 |
+| iVox/ikd-Tree replacement | design only | — | Own benchmarked project (hazard-class motive) | §6.3 |
+| EventsExecutor | noted only | — | ros2_tracing shows callback-dispatch latency | §6.5 |
+| zenoh SHM transport | ops config | — | On-host transport cost shows up in tracing | §6.5 |
+| ERASOR map cleaning | ops workflow (bag + /odom) | — | Whenever a clean static map export is wanted | §6.3 |
 
 ## Open questions for future work
 

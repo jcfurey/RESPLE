@@ -53,8 +53,14 @@ endif()
 # BLAS backend for Eigen (24x24 / 30x30 Cholesky in IEKF + general matrix
 # products). Initially destabilized the simpler (I-KH)*P covariance update;
 # now safe with Joseph-form posterior P=(I-KH)P(I-KH)^T+KRK^T.
+# OFF reproduces the upstream/main numeric path (pure-Eigen products) for
+# A/B accuracy comparisons — BLAS rounds/orders FP differently, which can
+# shift the weakly-observed trailing-edge knots under aggressive motion
+# (HARDENING §6.3). BLAS is still linked when found so the toggle does not
+# ripple through the test wiring.
+option(ENABLE_EIGEN_BLAS "Route Eigen matrix products through BLAS" ON)
 find_package(BLAS QUIET)
-if(BLAS_FOUND)
+if(BLAS_FOUND AND ENABLE_EIGEN_BLAS)
 	add_definitions(-DEIGEN_USE_BLAS)
 endif()
 

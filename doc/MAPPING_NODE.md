@@ -82,7 +82,7 @@ What you lose is exactly Mapping's outputs:
 
 | Output | Notes |
 | --- | --- |
-| `global_map` | Accumulated display cloud |
+| `global_map` | Accumulated display cloud. Deskewed `map_deskew_lag_knots` (default 8) knots behind the spline edge, so each scan is placed with fully-converged — not bleeding-edge — poses; costs `lag × dt` of display latency and fixes the motion-induced azimuth smear (HARDENING §6.3) |
 | `traj_path` | Trajectory history for rviz/Foxglove |
 | `active_control_points` | The 4 active B-spline knots |
 | `odometry` (Mapping's) | Redundant re-interpolation of the same spline |
@@ -93,6 +93,13 @@ init, then live). RESPLE solo roots the TF tree at `odom`. That is the
 correct shape for feeding an external mapping/planning stack that builds its
 own world representation; but if some consumer requires a `map` frame from
 *this* package, run with `use_mapping:=true`.
+
+**map → odom accuracy:** the transform is composed from the spline path tip
+(base→map) and RESPLE's odom→base TF, both sampled **at the tip's stamp**
+(time-paired exact lookup, with a latest-available fallback during warm-up).
+The tip itself is lagged by `map_deskew_lag_knots`, so the composition uses
+only fully-converged knots. The odometry path stays bleeding-edge; only the
+slow-varying drift-correction frame trades latency for accuracy.
 
 ## Empirically verified
 

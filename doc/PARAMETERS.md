@@ -124,9 +124,16 @@ All behaviour-preserving or opt-in by default. Section references are to
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `spline_prune_keep_knots` | `600` | §3.1 sliding-window knot pruning: knots kept in memory (≈6 s at `knot_hz` 100). Interpolation over the retained window is bit-identical to the unpruned spline. `0` disables (unbounded growth); values 1–99 clamp to 100. Read by **both** nodes. |
+| `map_insert_lag_knots` | `0` | §6.3 internal-map insertion lag (RESPLE node): body-frame points are staged and only deskewed + inserted into the ikd-Tree once their timestamps are this many knots behind the spline edge, so the **reference map the IEKF matches against** is built from final knot values instead of trailing-edge estimates (cf. SLICT's marginalization-time map admission, arXiv:2211.03900; retrospective map refinement, arXiv:2503.21293). Also delays `current_scan` (same released points). `0` = upstream insert-at-edge. Recommended trial value `8`; **off by default pending bag validation** — this changes the odometry feedback loop. |
+| `map_insert_cov_gate_deg` | `0.0` | §6.3 covariance gate for the insertion lag (RESPLE node): when > 0, staged points are released **early** whenever the edge-pose orientation std (deg, from `getLastPoseCovariance`) is below this value — gentle motion keeps a fresh reference map, aggressive motion gets the full `map_insert_lag_knots` hold (VoxelMap's uncertainty-convergence criterion, arXiv:2109.07082). Only meaningful with `map_insert_lag_knots > 0`. `0` = pure fixed-knot lag. Trial value: start at `1.0` and compare against the diagnostics' NIS/orientation fields. |
+| `knot_rotation_warn_rad` | `0.05` | §6.3 knot under-resolution diagnostic (RESPLE node): each knot's **final** `ort_delta` norm is the rotation the spline absorbs in one knot interval; values above this threshold mean `knot_hz` under-fits the motion (Coco-LIC/ATI-CTLO lesson, arXiv:2309.09808 / 2407.20619) and trailing-edge jitter is expected. Fires a throttled WARN + counts in `/diagnostics` (`Knot Rotation Max (rad)`, `Knot Rotation Warnings`). Default 0.05 rad/knot = 5 rad/s at `knot_hz` 100 — silent on rover/handheld motion, fires on HelmDyn-class spin. `0` disables. |
+| `map/transform_tolerance` | `0.0` | amcl-style future-dating (s) added to the `map→odom` TF stamp (Mapping node). The TF is stamped at the lagged path tip, so exact-time lookups in the map frame at fresh sensor stamps fail with extrapolation errors; set this to ≳ the lag + lookup horizon if a downstream consumer needs them. `0` = stamp at the tip (latest-available lookups unaffected). |
+| `map_deskew_lag_knots` | `8` | §6.3 map lag (Mapping node only): scans wait until the spline edge is this many knots past their end before deskew into `/global_map`, and the path tip feeding the `map→odom` TF is lagged the same way — so both use knots the estimator has **finished** refining instead of the under-observed trailing edge (azimuth smear). The default is the convergence horizon + margin: the IEKF updates only the last 4 RCPs and `est_window` resends only the last 5 knots, so every knot a scan touches is final once the edge is ≥6 knots past it — larger values buy latency, not accuracy. Costs `lag × dt` of map latency (80 ms at `knot_hz` 100, well inside a 0.5 s map budget); odometry (`/odom`, `current_scan`, `odom→base_link`) is unaffected. `0` = bleeding-edge (old behavior). |
 | `nn_max_sq_dist` | `5.0` | §3.2 correspondence gate: max squared distance (m²) of the k-th nearest neighbor; the k-NN search radius is its square root. |
 | `plane_fit_thresh` | `0.1` | §3.2 plane-fit residual threshold (m): every neighbor must lie within this distance of the fitted plane. |
 | `plane_min_cond_ratio` | `0.0` | §3.2 degeneracy guard (rank-revealing-QR pivot ratio): rejects collinear / rank-deficient neighbor patches. `0` = off. Enabling changes which correspondences feed the filter — benchmark against a known-good dataset first; watch the funnel counters. |
+| `robust_kernel` | `"none"` | §3.2 M-estimator on the point-to-plane residuals: `"none"` (legacy weighting, bit-exact), `"huber"`, or `"cauchy"`. The IRLS weight `w(zp)` scales each point's information in the IEKF, smoothly downweighting outliers; the legacy `pt_thresh`/`cov_thresh` accept-reject gate is kept — the kernel softens what survives it (adaptive kernels: arXiv:2004.14938). Off pending bag A/B against the funnel + localizability diagnostics. |
+| `robust_kernel_delta` | `0.1` | §3.2 kernel scale (m, residual units): the soft threshold where the loss transitions from quadratic to robust. Matches `plane_fit_thresh` scale by default. |
 | `nis_window` | `32` | §3.3 NIS consistency window (IEKF cycles). |
 | `nis_warn_ratio` | `2.0` | WARN when windowed NIS mean exceeds ratio × dof. |
 | `nis_diverged_ratio` | `4.0` | DIVERGED threshold (same form). |
@@ -141,3 +148,34 @@ then adjust. The funnel counters localize correspondence losses (sparse map
 vs degenerate patches vs association outliers), `Spline Knots (total)` and
 the drop counters show memory pressure, and the NIS fields show filter
 consistency before/after any change.
+
+## Reproducing the original (`main`) behavior for A/B comparison
+
+The Mapping node's map *path* is logic-equivalent to upstream `main` (same
+scan gating, same per-scan `/global_map` publication, same per-point deskew
+math); the accuracy-relevant differences live in the estimator's numeric
+path and a handful of defaults. To run an A/B against the original behavior:
+
+Runtime parameters:
+
+| Set | Restores |
+| --- | --- |
+| `map_deskew_lag_knots: 0` | Bleeding-edge map deskew (original timing, original aggressive-motion smear) |
+| `spline_prune_keep_knots: 0` | Unbounded spline retention (original memory behavior) |
+| `num_threads: 1` | Serial k-NN / transforms (original FP evaluation order) |
+| `num_match_points: 5` | Already the default (upstream constant) |
+| `nis_recovery_mode: "off"` | Already the default |
+| `max_scan_buffer: 0`, `max_imu_staging: 2000` | Already the defaults: unbounded scan buffer; `main` hardcoded the 2000-sample IMU staging cap |
+
+Build flags (numeric path — parameters cannot toggle these):
+
+| Set | Restores |
+| --- | --- |
+| `-DENABLE_EIGEN_BLAS=OFF` | Pure-Eigen matrix products (`main` never routed Eigen through BLAS; BLAS rounds/orders FP differently) |
+
+Not reproducible by toggles: `main` compiled with
+`-DEIGEN_INITIALIZE_MATRICES_BY_NAN` in all builds (now Debug-only) and ran
+the IEKF + map insertion fully synchronously. For a definitive comparison,
+run the same bag through an `origin/main` build and a parity-configured
+current build, then compare `evo_ape` on `/odom` and render both
+`/global_map` streams side by side (HARDENING §6.3).

@@ -93,6 +93,20 @@ class MappingBase
         frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
         map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map/frame_id", "map");
         num_threads_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "num_threads", 5);
+        // Map lag in knots (see processScan). Default 8 = the convergence
+        // horizon plus margin: the IEKF only updates the last 4 RCPs and
+        // est_window only resends the last 5 knots, so a knot is FINAL once
+        // ~4 behind the edge; cubic interpolation at scan time t reads knots
+        // up to idx(t)+2, so every knot a scan touches is final once the edge
+        // is >= 6 knots past it. Beyond ~8 the lag buys zero further
+        // refinement — only latency (80 ms at knot_hz 100, well inside the
+        // 0.5 s map-latency budget). 0 restores the bleeding-edge behavior.
+        deskew_lag_knots_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "map_deskew_lag_knots", 8);
+        if (deskew_lag_knots_ < 0) {
+            RCLCPP_WARN(nh->get_logger(),
+                "map_deskew_lag_knots=%d is negative; using 0 (no lag)", deskew_lag_knots_);
+            deskew_lag_knots_ = 0;
+        }
 
         RCLCPP_INFO(nh->get_logger(), "Frame IDs -  map: %s, body: %s", 
                     map_id.c_str(), frame_id.c_str());        
@@ -124,6 +138,22 @@ class MappingBase
         return imu_to_baselink_;
     }
 
+    // Single definition of the sensor-callback guard policy: serialize the
+    // callback body on cb_mtx_ (see above) and convert any exception into a
+    // dropped scan + throttled WARN — a torn/corrupt DDS message must never
+    // std::terminate the node (HARDENING Phase 6.1).
+    template <typename Fn>
+    void guardedCallback(Fn&& body)
+    {
+        std::lock_guard<std::mutex> cb_lock(cb_mtx_);
+        try {
+            body();
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
+                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
+        }
+    }
+
     void processScan(SplineState* spl, const int64_t spl_window_st_ns)
     {
         (void)spl_window_st_ns;
@@ -135,6 +165,14 @@ class MappingBase
         // gated by spline-not-yet-caught-up.
         int n_published = 0, n_dropped_old = 0, n_pending_new = 0;
         int64_t last_t_end_ns = 0;
+        // Map lag (HARDENING §6.3 mitigation): hold each scan until the spline
+        // edge has advanced deskew_lag_knots_ * dt past its end, so the deskew
+        // reads knots that later est_windows have already refined via
+        // updateKnots/setOneStateKnot — not the under-observed trailing edge
+        // whose yaw jitter smears the accumulated map under aggressive motion.
+        // Costs that much map latency; 0 = publish at the bleeding edge.
+        const int64_t lag_ns =
+            deskew_lag_knots_ * std::max<int64_t>(spl->getKnotTimeIntervalNs(), 0);
         while (true) {
             // Pull the next cloud out of the buffer entirely under the lock
             // before doing any work. Reading pc_L_buff.front() outside the
@@ -159,9 +197,9 @@ class MappingBase
                     n_dropped_old++;
                     continue;
                 }
-                if (t_end_ns > spl->maxTimeNs()) {
-                    // Front spans beyond the current spline window — retry
-                    // next tick once more knots are available.
+                if (t_end_ns > spl->maxTimeNs() - lag_ns) {
+                    // Front spans beyond the lagged spline window — retry
+                    // next tick once more (refined) knots are available.
                     lock.unlock();
                     n_pending_new++;
                     std::this_thread::sleep_for(kRatePeriod);
@@ -327,6 +365,9 @@ class MappingBase
     std::string frame_id = "base_link";
     std::string map_id = "map";
     int num_threads_ = 5;
+    // Scans wait until the spline edge is this many knots past their end
+    // before being deskewed into the map (map_deskew_lag_knots, HARDENING §6.3).
+    int deskew_lag_knots_ = 8;
     
     // TF transformation
     rclcpp::Node::SharedPtr node_handle_;
@@ -357,8 +398,7 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
 
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Guard against negative timestamps (sim-time messages)
         int64_t stamp_ns = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds();
         if (stamp_ns < time_offset) return;
@@ -404,10 +444,7 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -435,8 +472,7 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
 
     void genericLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Guard against negative timestamps (sim-time messages)
         int64_t stamp_ns = rclcpp::Time(msg_in->header.stamp).nanoseconds();
         if (stamp_ns < time_offset) return;
@@ -477,10 +513,7 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -502,8 +535,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
 
     void livoxLidarCallback(const livox_ros_driver::msg::CustomMsg::SharedPtr livox_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -514,7 +546,10 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (size_t i = 1; i < plsize; i++) {
+        // Start at 0: RESPLE.cpp's livox ingest starts at 1 because points[0]
+        // seeds pt_pre for its duplicate-point filter; this loop has no pt_pre,
+        // so starting at 1 just dropped one valid point per scan.
+        for (size_t i = 0; i < plsize; i++) {
             if ((livox_msg_in->points[i].tag & 0x30) == 0x10 || (livox_msg_in->points[i].tag & 0x30) == 0x00) {
                 pt.x = livox_msg_in->points[i].x;
                 pt.y = livox_msg_in->points[i].y;
@@ -544,10 +579,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -567,8 +599,7 @@ public:
 
     void livoxLidarCallback(livox_ros_driver2::msg::CustomMsg::SharedPtr livox_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -579,7 +610,10 @@ public:
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (size_t i = 1; i < plsize; i++) {
+        // Start at 0: RESPLE.cpp's livox ingest starts at 1 because points[0]
+        // seeds pt_pre for its duplicate-point filter; this loop has no pt_pre,
+        // so starting at 1 just dropped one valid point per scan.
+        for (size_t i = 0; i < plsize; i++) {
             if ((livox_msg_in->points[i].tag & 0x30) == 0x10 || (livox_msg_in->points[i].tag & 0x30) == 0x00) {
                 pt.x = livox_msg_in->points[i].x;
                 pt.y = livox_msg_in->points[i].y;
@@ -609,10 +643,7 @@ public:
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -632,8 +663,7 @@ public:
 
     void livoxLidarCallback(livox_interfaces::msg::CustomMsg::SharedPtr livox_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
                 
@@ -644,7 +674,10 @@ public:
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (size_t i = 1; i < plsize; i++) {
+        // Start at 0: RESPLE.cpp's livox ingest starts at 1 because points[0]
+        // seeds pt_pre for its duplicate-point filter; this loop has no pt_pre,
+        // so starting at 1 just dropped one valid point per scan.
+        for (size_t i = 0; i < plsize; i++) {
             if ((livox_msg_in->points[i].tag & 0x30) == 0x10 || (livox_msg_in->points[i].tag & 0x30) == 0x00) {
                 pt.x = livox_msg_in->points[i].x;
                 pt.y = livox_msg_in->points[i].y;
@@ -674,10 +707,7 @@ public:
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -697,8 +727,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
 
     void hesaiLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr hesai_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(hesai_msg_in->header.frame_id)) return;
                 
@@ -745,10 +774,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -768,8 +794,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
 
     void mid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -814,10 +839,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -861,6 +883,13 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/publish_tf", true);
         invert_tf  = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/invert_tf", false);
+        // amcl-style future-dating for the map->odom TF (seconds added to the
+        // stamp). The transform is stamped at the (lagged) path tip, so exact-
+        // time lookups in the map frame at fresh sensor stamps fail with
+        // "extrapolation into the future". Future-dating the slowly-varying
+        // drift correction is the standard remedy; 0 = off (stamp at the tip).
+        map_tf_tolerance_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "map/transform_tolerance", 0.0);
+        if (map_tf_tolerance_ < 0.0) map_tf_tolerance_ = 0.0;
 
         // HARDENING §3.1: same retention parameter as the RESPLE node.
         // spline_active_ otherwise grows one knot per est_window knot for the
@@ -874,6 +903,12 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 spline_prune_keep_knots_);
             spline_prune_keep_knots_ = 100;
         }
+        // Same lag the per-sensor buffers use for the map (MappingBase reads
+        // it too; readParam's has_parameter guard makes the double read safe).
+        // Here it lags the path tip, so the map->odom TF composed in pubOdom
+        // is built from fully-converged knots (see publishPath).
+        map_deskew_lag_knots_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "map_deskew_lag_knots", 8);
+        if (map_deskew_lag_knots_ < 0) map_deskew_lag_knots_ = 0;
 
         std::vector<double> cov_varp = CommonUtils::readParam<std::vector<double>>(this->get_node_parameters_interface(), "cov_pose", {0.2, 0.2, 0.2, 0.1, 0.1, 0.1});
         cov_pose << cov_varp.at(0), cov_varp.at(1), cov_varp.at(2), cov_varp.at(3), cov_varp.at(4), cov_varp.at(5);        
@@ -1167,6 +1202,8 @@ private:
     Eigen::Vector<double, 6> cov_pose;
     Eigen::Vector<double, 6> cov_twist;
     bool publish_tf, invert_tf;
+    // map->odom TF future-dating in seconds (map/transform_tolerance, 0 = off).
+    double map_tf_tolerance_ = 0.0;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     // cuda-perf-nano addition: latch identity map→odom on first
     // startCallBack so the REP-105 chain is closed during the cold-start
@@ -1204,6 +1241,9 @@ private:
     std::mutex est_cb_mtx_;
     // Phase 3.1: knots retained by the sliding-window prune (0 disables).
     int spline_prune_keep_knots_ = 600;
+    // §6.3 map lag, node-level copy: lags the publishPath tip (and therefore
+    // the map->odom TF composed from it in pubOdom).
+    int map_deskew_lag_knots_ = 8;
 
     void displayControlPoints()
     {
@@ -1368,21 +1408,37 @@ private:
             baselink_to_map.transform.translation.z = odom_pose_current.pose.position.z;
             baselink_to_map.transform.rotation = odom_pose_current.pose.orientation;
 
-            // Get frame to odom transform. Use Time(0) — "latest available"
-            // — instead of odom_msg.header.stamp, because:
-            //   - the map→odom offset changes slowly (mostly drift correction),
-            //     so using the most recent base_link↔odom is fine for the
-            //     map↔odom rebroadcast computed below;
-            //   - exact-stamp lookup keeps failing whenever RESPLE's TF
-            //     stamp clock and Mapping's odom_msg stamp clock diverge
-            //     (sliding spline window vs. local path index), even when
-            //     fresh transforms are flowing.
+            // Get frame to odom transform AT THE PATH-TIP STAMP, so both
+            // factors of the map→odom composition below are sampled at the
+            // same instant. The old Time(0) ("latest") lookup paired a
+            // base→map pose that is 50–180 ms old (lagged path tip + 100 ms
+            // path stepping) with the freshest odom→base — that mismatch puts
+            // full body motion over the gap into the map→odom TF, which is
+            // exactly the yaw jitter §6.3 documents. The tip stamp is well in
+            // the past by construction (the deskew/tip lag), so the exact-time
+            // lookup interpolates inside buffered TF history instead of racing
+            // the live edge — the failure mode that originally motivated
+            // Time(0). Keep Time(0) as a fallback for warm-up, where history
+            // may not reach back to the tip yet.
             geometry_msgs::msg::TransformStamped odom_to_baselink;
             bool got_odom_transform = false;
+            const tf2::TimePoint tip_time = tf2::TimePoint(
+                std::chrono::nanoseconds(rclcpp::Time(odom_pose_current.header.stamp).nanoseconds()));
             try {
+                // No wait on the tip-stamp lookup: the stamp is in the past, so
+                // either buffered history already covers it (steady state,
+                // instant success) or it never will until more history accrues
+                // (warm-up) — waiting can't help, and it would stack with the
+                // fallback's 0.1 s wait below.
                 if (tf_buffer->canTransform(this->frame_id, this->odom_id,
-                                            tf2::TimePointZero,
-                                            tf2::durationFromSec(0.1))) {
+                                            tip_time,
+                                            tf2::durationFromSec(0.0))) {
+                    odom_to_baselink = tf_buffer->lookupTransform(
+                        this->frame_id, this->odom_id, tip_time);
+                    got_odom_transform = true;
+                } else if (tf_buffer->canTransform(this->frame_id, this->odom_id,
+                                                   tf2::TimePointZero,
+                                                   tf2::durationFromSec(0.1))) {
                     odom_to_baselink = tf_buffer->lookupTransform(
                         this->frame_id, this->odom_id, tf2::TimePointZero);
                     got_odom_transform = true;
@@ -1407,7 +1463,10 @@ private:
                 }
                 geometry_msgs::msg::TransformStamped odom_to_map;
                 tf2::toMsg(odom_to_map_tf, odom_to_map.transform);
-                odom_to_map.header.stamp = odom_msg.header.stamp;
+                // Optional future-dating (map/transform_tolerance) so exact-time
+                // lookups at stamps newer than the lagged tip still resolve.
+                odom_to_map.header.stamp = rclcpp::Time(odom_msg.header.stamp) +
+                    rclcpp::Duration::from_seconds(map_tf_tolerance_);
                 if(invert_tf){
                     odom_to_map.header.frame_id = odom_id;
                     odom_to_map.child_frame_id  = map_id;
@@ -1476,7 +1535,17 @@ private:
         if (path_t_ns_ == 0) {
             path_t_ns_ = spline_active_.minTimeNs();
         }
-        while (path_t_ns_ < std::min(spl_window_st_ns, spline_active_.maxTimeNs())) {
+        // Lag the path tip like the map deskew (HARDENING §6.3): the tip pose
+        // is what pubOdom composes into the map->odom TF, so it must come from
+        // knots the estimator has finished refining (IEKF updates only the
+        // last 4 RCPs; est_window resends only the last 5 knots — beyond that
+        // every knot is final). spl_window_st_ns alone leaves the tip inside
+        // the still-converging zone.
+        const int64_t tip_lag_ns = map_deskew_lag_knots_ *
+            std::max<int64_t>(spline_active_.getKnotTimeIntervalNs(), 0);
+        const int64_t tip_limit_ns =
+            std::min(spl_window_st_ns, spline_active_.maxTimeNs() - tip_lag_ns);
+        while (path_t_ns_ < tip_limit_ns) {
             Eigen::Quaterniond orient_interp;
             Eigen::Vector3d t_interp = spline_active_.itpPosition(path_t_ns_);
             spline_active_.itpQuaternion(path_t_ns_, &orient_interp);
