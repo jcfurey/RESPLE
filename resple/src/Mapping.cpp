@@ -201,7 +201,13 @@ class MappingBase
                 if (t_end_ns > spl->maxTimeNs() - lag_ns) {
                     // Front spans beyond the lagged spline window — retry
                     // next cycle once more (refined) knots are available.
-                    n_pending_new++;
+                    // Count SCANS that hit the gate, not worker cycles: the
+                    // 5 ms cycle would otherwise inflate this ~200/s and the
+                    // periodic totals would read as a failure mode.
+                    if (t_end_ns != last_gated_t_end_ns_) {
+                        last_gated_t_end_ns_ = t_end_ns;
+                        n_pending_new++;
+                    }
                     break;
                 }
                 // Move the cloud out of the deque (deque move of
@@ -359,6 +365,8 @@ class MappingBase
     size_t total_published_ = 0;
     size_t total_dropped_old_ = 0;
     size_t total_pending_new_ = 0;
+    // Last gate-held front t_end — dedupes pending_new across worker cycles.
+    int64_t last_gated_t_end_ns_ = 0;
     typename pcl::PointCloud<PointType>::Ptr pc_last;
     typename pcl::PointCloud<PointType>::Ptr pc_last_ds;
     pcl::VoxelGrid<pcl::PointXYZINormal> ds_filter_each_scan;

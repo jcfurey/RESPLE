@@ -57,6 +57,7 @@ class SplineState
         start_t_ns = start_t_ns_;
         num_knot = num_knot_;
         num_knots_pruned_ = 0;
+        update_gap_events_ = 0;
         last_start_idx_ = 0;
         inv_dt = 1e9 / dt_ns;
         start_i = start_i_;
@@ -216,12 +217,24 @@ class SplineState
                 setOneStateKnot(static_cast<int>(target), other->t_knots[i], other->ort_delta[i]);
             } else {
                 if (target > num_knot) {
-                    // A gap means a whole est_window went missing (reliable
-                    // QoS should prevent this); appending sequentially would
-                    // silently misalign every later knot's time index.
-                    RESPLE_LOG_INVARIANT_ONCE("updateKnots gap: target=" << target
-                        << " > num_knot=" << num_knot
-                        << " (missed est_window?); knot indices misaligned from here");
+                    update_gap_events_++;
+                    if (num_knot == 0) {
+                        // Startup origin artifact, expected once per (re)start:
+                        // windows published before the start-signal handshake
+                        // completed are rejected by design, so the first
+                        // applied window begins at a nonzero absolute index.
+                        std::cerr << "[SplineState] updateKnots: first window begins at absolute idx "
+                                  << target << " (startup origin; expected after (re)start)\n";
+                    } else if ((update_gap_events_ & (update_gap_events_ - 1)) == 0) {
+                        // Mid-run gap = real est_window loss (the Mapping
+                        // ingest queue should prevent this); appending
+                        // sequentially misaligns every later knot's time.
+                        // Log counts at powers of two: early visibility
+                        // without per-window log spam.
+                        std::cerr << "[SplineState] updateKnots gap #" << update_gap_events_
+                                  << ": target=" << target << " > num_knot=" << num_knot
+                                  << " (missed est_window); knot times misaligned from here\n";
+                    }
                 }
                 addOneStateKnot(other->t_knots[i], other->ort_delta[i]);
             }
@@ -693,6 +706,9 @@ class SplineState
     // 3.1). Deque index = absolute index - num_knots_pruned_; start_t_ns is
     // advanced in lock-step so time-based lookups need no translation.
     int64_t num_knots_pruned_ = 0;
+    // updateKnots index-gap events (first one per (re)start is the expected
+    // startup origin artifact; mid-run events are real est_window loss).
+    int64_t update_gap_events_ = 0;
     int64_t start_i;
     int64_t start_t_ns;
     int64_t last_start_idx_ = 0;
