@@ -93,6 +93,16 @@ class MappingBase
         frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
         map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map/frame_id", "map");
         num_threads_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "num_threads", 5);
+        // Map lag in knots (see processScan). Default 4 matches the estimator's
+        // own edge zone: Association.h treats points within 4*dt of maxTimeNs
+        // as under-constrained, so knots older than that are converged enough
+        // to deskew the map crisply. 0 restores the bleeding-edge behavior.
+        deskew_lag_knots_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "map_deskew_lag_knots", 4);
+        if (deskew_lag_knots_ < 0) {
+            RCLCPP_WARN(nh->get_logger(),
+                "map_deskew_lag_knots=%d is negative; using 0 (no lag)", deskew_lag_knots_);
+            deskew_lag_knots_ = 0;
+        }
 
         RCLCPP_INFO(nh->get_logger(), "Frame IDs -  map: %s, body: %s", 
                     map_id.c_str(), frame_id.c_str());        
@@ -124,6 +134,22 @@ class MappingBase
         return imu_to_baselink_;
     }
 
+    // Single definition of the sensor-callback guard policy: serialize the
+    // callback body on cb_mtx_ (see above) and convert any exception into a
+    // dropped scan + throttled WARN — a torn/corrupt DDS message must never
+    // std::terminate the node (HARDENING Phase 6.1).
+    template <typename Fn>
+    void guardedCallback(Fn&& body)
+    {
+        std::lock_guard<std::mutex> cb_lock(cb_mtx_);
+        try {
+            body();
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
+                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
+        }
+    }
+
     void processScan(SplineState* spl, const int64_t spl_window_st_ns)
     {
         (void)spl_window_st_ns;
@@ -135,6 +161,14 @@ class MappingBase
         // gated by spline-not-yet-caught-up.
         int n_published = 0, n_dropped_old = 0, n_pending_new = 0;
         int64_t last_t_end_ns = 0;
+        // Map lag (HARDENING §6.3 mitigation): hold each scan until the spline
+        // edge has advanced deskew_lag_knots_ * dt past its end, so the deskew
+        // reads knots that later est_windows have already refined via
+        // updateKnots/setOneStateKnot — not the under-observed trailing edge
+        // whose yaw jitter smears the accumulated map under aggressive motion.
+        // Costs that much map latency; 0 = publish at the bleeding edge.
+        const int64_t lag_ns =
+            deskew_lag_knots_ * std::max<int64_t>(spl->getKnotTimeIntervalNs(), 0);
         while (true) {
             // Pull the next cloud out of the buffer entirely under the lock
             // before doing any work. Reading pc_L_buff.front() outside the
@@ -159,9 +193,9 @@ class MappingBase
                     n_dropped_old++;
                     continue;
                 }
-                if (t_end_ns > spl->maxTimeNs()) {
-                    // Front spans beyond the current spline window — retry
-                    // next tick once more knots are available.
+                if (t_end_ns > spl->maxTimeNs() - lag_ns) {
+                    // Front spans beyond the lagged spline window — retry
+                    // next tick once more (refined) knots are available.
                     lock.unlock();
                     n_pending_new++;
                     std::this_thread::sleep_for(kRatePeriod);
@@ -327,6 +361,9 @@ class MappingBase
     std::string frame_id = "base_link";
     std::string map_id = "map";
     int num_threads_ = 5;
+    // Scans wait until the spline edge is this many knots past their end
+    // before being deskewed into the map (map_deskew_lag_knots, HARDENING §6.3).
+    int deskew_lag_knots_ = 4;
     
     // TF transformation
     rclcpp::Node::SharedPtr node_handle_;
@@ -357,8 +394,7 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
 
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Guard against negative timestamps (sim-time messages)
         int64_t stamp_ns = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds();
         if (stamp_ns < time_offset) return;
@@ -404,10 +440,7 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -435,8 +468,7 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
 
     void genericLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Guard against negative timestamps (sim-time messages)
         int64_t stamp_ns = rclcpp::Time(msg_in->header.stamp).nanoseconds();
         if (stamp_ns < time_offset) return;
@@ -477,10 +509,7 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -502,8 +531,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
 
     void livoxLidarCallback(const livox_ros_driver::msg::CustomMsg::SharedPtr livox_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -514,7 +542,10 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (size_t i = 1; i < plsize; i++) {
+        // Start at 0: RESPLE.cpp's livox ingest starts at 1 because points[0]
+        // seeds pt_pre for its duplicate-point filter; this loop has no pt_pre,
+        // so starting at 1 just dropped one valid point per scan.
+        for (size_t i = 0; i < plsize; i++) {
             if ((livox_msg_in->points[i].tag & 0x30) == 0x10 || (livox_msg_in->points[i].tag & 0x30) == 0x00) {
                 pt.x = livox_msg_in->points[i].x;
                 pt.y = livox_msg_in->points[i].y;
@@ -544,10 +575,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -567,8 +595,7 @@ public:
 
     void livoxLidarCallback(livox_ros_driver2::msg::CustomMsg::SharedPtr livox_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -579,7 +606,10 @@ public:
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (size_t i = 1; i < plsize; i++) {
+        // Start at 0: RESPLE.cpp's livox ingest starts at 1 because points[0]
+        // seeds pt_pre for its duplicate-point filter; this loop has no pt_pre,
+        // so starting at 1 just dropped one valid point per scan.
+        for (size_t i = 0; i < plsize; i++) {
             if ((livox_msg_in->points[i].tag & 0x30) == 0x10 || (livox_msg_in->points[i].tag & 0x30) == 0x00) {
                 pt.x = livox_msg_in->points[i].x;
                 pt.y = livox_msg_in->points[i].y;
@@ -609,10 +639,7 @@ public:
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -632,8 +659,7 @@ public:
 
     void livoxLidarCallback(livox_interfaces::msg::CustomMsg::SharedPtr livox_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
                 
@@ -644,7 +670,10 @@ public:
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (size_t i = 1; i < plsize; i++) {
+        // Start at 0: RESPLE.cpp's livox ingest starts at 1 because points[0]
+        // seeds pt_pre for its duplicate-point filter; this loop has no pt_pre,
+        // so starting at 1 just dropped one valid point per scan.
+        for (size_t i = 0; i < plsize; i++) {
             if ((livox_msg_in->points[i].tag & 0x30) == 0x10 || (livox_msg_in->points[i].tag & 0x30) == 0x00) {
                 pt.x = livox_msg_in->points[i].x;
                 pt.y = livox_msg_in->points[i].y;
@@ -674,10 +703,7 @@ public:
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -697,8 +723,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
 
     void hesaiLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr hesai_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(hesai_msg_in->header.frame_id)) return;
                 
@@ -745,10 +770,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:
@@ -768,8 +790,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
 
     void mid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
     {
-        std::lock_guard<std::mutex> cb_lock(this->cb_mtx_);  // Phase 6.1: serialize callback scratch
-        try {  // Phase 6.1 DDS robustness: drop+log a bad/torn scan, never terminate
+        this->guardedCallback([&] {
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -814,10 +835,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
             while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
             this->pc_L_buff.push_back(*pc_last_ds);
         }
-        } catch (const std::exception& e) {
-            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
-                "[Mapping] sensor callback dropped a scan on exception: %s", e.what());
-        }
+        });
     }
 
   private:

@@ -1296,10 +1296,38 @@ This is the inherent **real-time-output vs. smoothed-estimate gap**; only
 extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
 
 **Mitigations and their trade-offs:**
-- **Map lag (preferred if needed).** Build/deskew the map from poses a few
-  knots *behind* the edge — i.e., after later scans have refined them — trading
-  a small output latency for crispness. The estimate is already good there
-  (4.7 cm); we'd just stop publishing the bleeding edge into the map.
+- **Map lag (IMPLEMENTED 2026-06-10, `map_deskew_lag_knots`, default 4).**
+  Build/deskew the map from poses a few knots *behind* the edge — i.e., after
+  later scans have refined them — trading a small output latency for
+  crispness. The estimate is already good there (4.7 cm); we just stop
+  publishing the bleeding edge into the map. Implementation: the Mapping
+  worker holds each scan until `spline_max - t_end >= lag × dt`
+  (`MappingBase::processScan` gate); the held scan is then deskewed with knots
+  that `updateKnots`/`setOneStateKnot` have already overwritten with refined
+  est_window values. Default 4 knots matches the estimator's own edge zone
+  (`Association.h` treats points within `4·dt` of `maxTimeNs` as
+  under-constrained). `0` restores bleeding-edge output. Odometry
+  (`/odom`, `/current_scan`, TF) is untouched — RESPLE-node outputs by design.
+  Pending bag validation: re-render HelmDyn01 and confirm the azimuth smear
+  collapses; sweep lag ∈ {2, 4, 8} if 4 is insufficient.
+
+  *Main-vs-lyrical logic audit (2026-06-11):* before trusting the
+  "inherent real-time gap" framing, the map path was diffed against upstream
+  `main`. The Mapping node is logic-equivalent (same `t_end <= maxTimeNs`
+  bleeding-edge gate, same per-scan — not accumulated — `/global_map`
+  publication, same per-point deskew; the staging swap and 200-scan cap only
+  add ≤50 ms latency / backlog bounds). If `main` renders the same bag
+  crisper, the delta is in the **estimator's numeric path**, where several
+  default-on changes accumulated: `EIGEN_USE_BLAS` (different FP
+  rounding/order — the CMake note records it initially destabilized the
+  covariance update), threaded k-NN/association (`num_threads: 5`,
+  FP-order changes), async background `mapIncremental`, and
+  `EIGEN_INITIALIZE_MATRICES_BY_NAN` no longer set in Release. Each is a
+  small perturbation; the trailing-edge knots are exactly where small
+  perturbations are least damped. Decisive experiment (bag-gated): same bag
+  through an `origin/main` build vs a parity-configured current build
+  (`doc/PARAMETERS.md` § "Reproducing the original (`main`) behavior"),
+  compare `evo_ape` + map renders.
 - **Faster knot convergence — POTENTIAL ISSUES (document before attempting).**
   Trying to make the trailing knots converge sooner (more IEKF iterations,
   larger point budget, or tighter orientation process/measurement noise so the
@@ -1322,10 +1350,13 @@ extreme motion exposes it. TudoRun's gentler motion keeps the edge knots good.
   - **Net:** faster convergence is a tuning lever with diminishing returns and
     real downside; map lag addresses the actual mechanism (use refined poses)
     without destabilising the filter.
-- **Accept (current decision).** Position is accurate (4.7 cm) and the
-  deployment sensor is an **Ouster on a rover** — motion much closer to TudoRun
-  than to a head-worn helmet — so this edge-pose smear is unlikely to manifest
-  in production. HelmDyn is effectively a worst-case stress test.
+- **Accept (superseded 2026-06-10).** The original decision — position is
+  accurate (4.7 cm) and the deployment sensor is an **Ouster on a rover**
+  (motion much closer to TudoRun than to a head-worn helmet), so the
+  edge-pose smear was unlikely to manifest in production. Superseded by the
+  map-lag implementation above: the fix is cheap (latency-only, off-switch via
+  `map_deskew_lag_knots: 0`), so it now ships enabled instead of relying on
+  the deployment motion staying benign.
 
 Goal: decide the production `plane_min_cond_ratio` (degeneracy guard,
 currently 0 = off) and sanity-check `nn_max_sq_dist` / `plane_fit_thresh`

@@ -2,8 +2,8 @@ import os
 import launch
 import launch_ros.actions
 from ament_index_python.packages import get_package_share_directory
-from launch.actions import DeclareLaunchArgument, TimerAction, IncludeLaunchDescription
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, TimerAction, IncludeLaunchDescription, LogInfo
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
@@ -55,6 +55,12 @@ def generate_launch_description():
         start_delay_arg,
         mapping_delay_arg,
         use_mapping_arg,
+        # Make the silent default obvious: without Mapping there is no
+        # /global_map and no map->odom TF (doc/MAPPING_NODE.md).
+        LogInfo(
+            condition=UnlessCondition(LaunchConfiguration('use_mapping')),
+            msg='Mapping node disabled (use_mapping:=false): no /global_map or '
+                'map->odom TF will be published. Pass use_mapping:=true to enable.'),
         lidar_frame_arg,
         launch_ros.actions.Node(
             package='tf2_ros',

@@ -2239,6 +2239,10 @@ private:
 
         if(!updateLidarTransform(livox_msg_in->header.frame_id)) return;
 
+        // NOTE (applies to all three livox callbacks): the point loop below
+        // intentionally starts at i = 1 — points[0] seeds pt_pre for the
+        // duplicate-point filter. Mapping.cpp's livox ingest has no pt_pre and
+        // loops from 0.
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         int plsize = livox_msg_in->point_num;
         // Belt-and-braces: gate on the actual vector size, not just the

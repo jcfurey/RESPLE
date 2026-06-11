@@ -82,7 +82,7 @@ What you lose is exactly Mapping's outputs:
 
 | Output | Notes |
 | --- | --- |
-| `global_map` | Accumulated display cloud |
+| `global_map` | Accumulated display cloud. Deskewed `map_deskew_lag_knots` (default 4) knots behind the spline edge, so each scan is placed with refined — not bleeding-edge — poses; costs `lag × dt` of display latency and fixes the aggressive-motion azimuth smear (HARDENING §6.3) |
 | `traj_path` | Trajectory history for rviz/Foxglove |
 | `active_control_points` | The 4 active B-spline knots |
 | `odometry` (Mapping's) | Redundant re-interpolation of the same spline |

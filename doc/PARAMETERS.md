@@ -124,6 +124,7 @@ All behaviour-preserving or opt-in by default. Section references are to
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `spline_prune_keep_knots` | `600` | §3.1 sliding-window knot pruning: knots kept in memory (≈6 s at `knot_hz` 100). Interpolation over the retained window is bit-identical to the unpruned spline. `0` disables (unbounded growth); values 1–99 clamp to 100. Read by **both** nodes. |
+| `map_deskew_lag_knots` | `4` | §6.3 map lag (Mapping node only): each scan waits until the spline edge is this many knots past its end before being deskewed into `/global_map`, so the deskew uses knots already refined by later est_windows instead of the under-observed trailing edge (aggressive-motion azimuth smear). Costs `lag × dt` of map latency (≈40 ms at `knot_hz` 100); odometry is unaffected. `0` = bleeding-edge (old behavior). |
 | `nn_max_sq_dist` | `5.0` | §3.2 correspondence gate: max squared distance (m²) of the k-th nearest neighbor; the k-NN search radius is its square root. |
 | `plane_fit_thresh` | `0.1` | §3.2 plane-fit residual threshold (m): every neighbor must lie within this distance of the fitted plane. |
 | `plane_min_cond_ratio` | `0.0` | §3.2 degeneracy guard (rank-revealing-QR pivot ratio): rejects collinear / rank-deficient neighbor patches. `0` = off. Enabling changes which correspondences feed the filter — benchmark against a known-good dataset first; watch the funnel counters. |
@@ -141,3 +142,34 @@ then adjust. The funnel counters localize correspondence losses (sparse map
 vs degenerate patches vs association outliers), `Spline Knots (total)` and
 the drop counters show memory pressure, and the NIS fields show filter
 consistency before/after any change.
+
+## Reproducing the original (`main`) behavior for A/B comparison
+
+The Mapping node's map *path* is logic-equivalent to upstream `main` (same
+scan gating, same per-scan `/global_map` publication, same per-point deskew
+math); the accuracy-relevant differences live in the estimator's numeric
+path and a handful of defaults. To run an A/B against the original behavior:
+
+Runtime parameters:
+
+| Set | Restores |
+| --- | --- |
+| `map_deskew_lag_knots: 0` | Bleeding-edge map deskew (original timing, original aggressive-motion smear) |
+| `spline_prune_keep_knots: 0` | Unbounded spline retention (original memory behavior) |
+| `num_threads: 1` | Serial k-NN / transforms (original FP evaluation order) |
+| `num_match_points: 5` | Already the default (upstream constant) |
+| `nis_recovery_mode: "off"` | Already the default |
+| `max_scan_buffer: 0`, `max_imu_staging: 0` | Unbounded ingest buffers (`max_scan_buffer` already default) |
+
+Build flags (numeric path — parameters cannot toggle these):
+
+| Set | Restores |
+| --- | --- |
+| `-DENABLE_EIGEN_BLAS=OFF` | Pure-Eigen matrix products (`main` never routed Eigen through BLAS; BLAS rounds/orders FP differently) |
+
+Not reproducible by toggles: `main` compiled with
+`-DEIGEN_INITIALIZE_MATRICES_BY_NAN` in all builds (now Debug-only) and ran
+the IEKF + map insertion fully synchronously. For a definitive comparison,
+run the same bag through an `origin/main` build and a parity-configured
+current build, then compare `evo_ape` on `/odom` and render both
+`/global_map` streams side by side (HARDENING §6.3).
