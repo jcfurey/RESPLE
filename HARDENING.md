@@ -1592,6 +1592,50 @@ thrash. Record the choice in the workspace config and the params docs.
 
 ---
 
+### 6.5 ROS 2 runtime & middleware literature (2026-06-11 survey)
+
+Complements §6.1's empirical RMW findings (Fast-DDS payload-pool races,
+zenoh-c TSan noise) with the systems literature, and records why most of
+it does NOT translate into code changes here.
+
+- **RMW comparisons validate the production zenoh choice.** The
+  planetary-exploration mesh study (arXiv:2407.03091, JIRS 2025) finds
+  zenoh stable by an order of magnitude under degrading/mesh networks
+  where CycloneDDS and Fast-DDS collapse; the edge-to-cloud comparison
+  (arXiv:2309.07496) agrees (CycloneDDS wins on wired Ethernet via UDP
+  multicast; zenoh wins on Wi-Fi/4G). For a teleoperated field rover,
+  rmw_zenoh is the literature-supported pick — consistent with §6.1's
+  "gate TSan on Fast-DDS, deploy zenoh" decision. Fast-DDS's intra-process
+  large-payload advantage is irrelevant here (our nodes are separate
+  processes).
+- **Executor scheduling theory mostly bypasses us — by our own design.**
+  Casini et al. (ECRTS 2019) founded ROS 2 executor response-time
+  analysis; arXiv:2408.08440 extends it to multi-threaded executors;
+  the events-executor line shows classical real-time bounds become
+  applicable with it; arXiv:2601.10722 (Jan 2026) surveys the field.
+  RESPLE's latency-critical path (IEKF worker, map update) runs on
+  DEDICATED threads outside any executor precisely so executor
+  wait-set/scheduling pathologies cannot touch it; executor callbacks are
+  buffer-pushes on a MutuallyExclusive group. EventsExecutor is a
+  candidate ONLY if ros2_tracing ever shows callback-dispatch latency on
+  the sensor path — do not churn main() speculatively (it is still
+  `experimental::` in Jazzy).
+- **Zero-copy is blocked on our message type, not on configuration.**
+  Loaned-message/iceoryx zero-copy requires fixed-size types;
+  `PointCloud2` is unsized (std::vector payload), which mainline
+  zero-copy does not support — the practical catch the discourse threads
+  and the Agnocast paper (arXiv:2506.16882, true zero-copy for unsized
+  types) both document. Agnocast is research-stage; the config-level
+  lever available TODAY for on-host large messages is rmw_zenoh's
+  shared-memory transport — an ops experiment (zenoh config), no code.
+  `use_intra_process_comms(true)` already covers the in-process case.
+- **ros2_tracing (arXiv:2201.00393) is the right latency instrument for
+  the bag campaign.** ~3 µs/event via LTTng, tracepoints already compiled
+  into rclcpp/rmw (no code changes — install tracing tools, run a
+  session), REP-2014 gives the benchmarking methodology. Use it to
+  measure the sensor→/odom chain end-to-end instead of ad-hoc timers if
+  the deskew/processing-time diagnostics ever implicate transport.
+
 ## Open questions for future work
 
 Out of scope of this plan but worth noting:
