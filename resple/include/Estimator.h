@@ -50,10 +50,41 @@ class Estimator
     // to 1; healthy geometry runs ~0.08+ min-eig, tunnel collapse is 1e-3
     // and below (06042026 analysis) — 0.02 is the recommended trial gate.
     double loc_gate_trans_min_eig = 0.0;
+    // Publish-side covariance inflation along persistently-gated axes. The gate
+    // above keeps the LiDAR from pulling along an unobservable axis, but the
+    // IEKF posterior over the 4-knot window only reports cm-scale *local*
+    // uncertainty there — it does not capture the metres-scale *global* drift
+    // that accumulates while the axis stays unobserved (06042026 verify,
+    // 2026-06-12). So a downstream EKF sees an overconfident /odom covariance.
+    // These knobs grow an ADVISORY inflation that publishPoseAndTf adds to the
+    // OUTGOING pose covariance only (the internal cov_rcp / gain are untouched —
+    // trajectory is unchanged). A leaky integrator builds variance along the
+    // gated subspace while the gate fires on consecutive frames; a persistence
+    // guard keeps transient healthy arming (HelmDyn arms ~150k iters) from
+    // inflating. 0 = off (default; decision-gate rule, pairs with the gate).
+    double loc_gate_cov_rate = 0.0;      // m² added per severely-degenerate frame
+    double loc_gate_cov_decay = 0.99;    // per-frame leak; steady state = rate/(1-decay)
+    int    loc_gate_cov_persist = 5;     // consecutive degenerate frames before inflating
+    // Inflation fires on a STRICTER eigenvalue threshold than the projection
+    // gate: the gate must be lenient to catch degeneracy early (0.10 caught the
+    // tunnel with 0 catastrophes) but it also arms on healthy geometry whose
+    // min-eig dips to ~0.05-0.10, so reusing it would balloon healthy covariance.
+    // True collapse is ~1e-3, so inflation triggers only below this threshold,
+    // weighted by the eigenvalue deficit. 0 = derive it as loc_gate_trans_min_eig/10.
+    double loc_gate_cov_min_eig = 0.0;
     // Diagnostics accessors for the gate (worker-thread reads, like
     // corresp_stats: the node snapshots right after the update returns).
     int locGateAxes() const { return loc_gate_axes_; }
     uint64_t locGateUpdateCount() const { return loc_gate_update_count_; }
+    // World-frame translation inflation currently added to the published pose
+    // covariance, and its largest standard deviation (m) for diagnostics.
+    const Eigen::Matrix3d& locGateCovInfl() const { return loc_gate_cov_infl_; }
+    double locGateCovInflMaxStd() const {
+        if (loc_gate_cov_rate <= 0.0) return 0.0;
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(loc_gate_cov_infl_,
+                                                          Eigen::EigenvaluesOnly);
+        return std::sqrt(std::max(0.0, es.eigenvalues()(2)));
+    }
     double robustWeight(double r) const
     {
         const double a = std::abs(r);
@@ -172,6 +203,7 @@ class Estimator
                 break;
             }
         }
+        accumGateInflation();   // once-per-frame advisory pose-cov inflation
     }
 
 #ifdef RESPLE_USE_CUDA
@@ -218,6 +250,7 @@ class Estimator
                 break;
             }
         }
+        accumGateInflation();   // once-per-frame advisory pose-cov inflation
     }
 
     void updateIEKFLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas,
@@ -267,6 +300,7 @@ class Estimator
                 break;
             }
         }
+        accumGateInflation();   // once-per-frame advisory pose-cov inflation
     }
 #endif  // RESPLE_USE_CUDA
 
@@ -319,6 +353,7 @@ class Estimator
                 break;
             }
         }
+        accumGateInflation();   // once-per-frame advisory pose-cov inflation
     }
 
     void propRCP(int64_t t)
@@ -487,6 +522,35 @@ class Estimator
     bool loc_gate_armed_ = false;
     int loc_gate_axes_ = 0;            // degenerate axes at last arm check
     uint64_t loc_gate_update_count_ = 0;  // updates with projection applied
+    // Publish-side inflation accumulator (worker-thread only; written by
+    // accumGateInflation() once per frame, read by the node in publishPoseAndTf
+    // under spline_mutex_).
+    Eigen::Matrix3d loc_gate_cov_infl_ = Eigen::Matrix3d::Zero();
+    // Deficit-weighted projector onto SEVERELY-degenerate directions (λ below
+    // loc_gate_cov_min_eig), built in armLocGate alongside the projection VVt.
+    Eigen::Matrix3d loc_gate_VVt_infl_ = Eigen::Matrix3d::Zero();
+    int loc_gate_infl_axes_ = 0;          // severely-degenerate axes this frame
+    int loc_gate_persist_ctr_ = 0;        // consecutive severely-degenerate frames
+
+    // Once-per-frame leaky integrator for the advisory pose-covariance
+    // inflation. loc_gate_infl_axes_ / loc_gate_VVt_infl_ hold the converged
+    // iteration's SEVERE-degeneracy state (stricter than the projection gate) so
+    // a tunnel inflates while healthy geometry — which trips the lenient gate but
+    // not the strict inflation threshold — does not. A tunnel keeps the same axis
+    // severely degenerate every frame → the counter passes the threshold and the
+    // integrator builds toward rate/(1-decay) along loc_gate_VVt_infl_.
+    void accumGateInflation()
+    {
+        if (loc_gate_cov_rate <= 0.0) return;            // feature off
+        if (loc_gate_infl_axes_ > 0) {
+            loc_gate_cov_infl_ *= loc_gate_cov_decay;
+            if (++loc_gate_persist_ctr_ >= loc_gate_cov_persist)
+                loc_gate_cov_infl_.noalias() += loc_gate_cov_rate * loc_gate_VVt_infl_;
+        } else {
+            loc_gate_persist_ctr_ = 0;
+            loc_gate_cov_infl_ *= loc_gate_cov_decay;    // relax when observable
+        }
+    }
 
     // Decide whether this update's LiDAR constraint set is degenerate and
     // cache the projector. Ett_sum = Σ n nᵀ over the rows actually filled.
@@ -494,20 +558,37 @@ class Estimator
     {
         loc_gate_armed_ = false;
         loc_gate_axes_ = 0;
+        loc_gate_infl_axes_ = 0;
         if (loc_gate_trans_min_eig <= 0.0 || n_used < 20) return;
+        // Stricter, separate threshold for the advisory covariance inflation
+        // (default: an order below the projection gate). Keeps healthy geometry
+        // that merely trips the lenient gate from inflating the published cov.
+        const double infl_thresh = loc_gate_cov_min_eig > 0.0
+            ? loc_gate_cov_min_eig : 0.1 * loc_gate_trans_min_eig;
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(Ett_sum / static_cast<double>(n_used));
         Eigen::Matrix3d VVt = Eigen::Matrix3d::Zero();
+        Eigen::Matrix3d VVt_infl = Eigen::Matrix3d::Zero();
         for (int i = 0; i < 3; i++) {
-            if (es.eigenvalues()(i) < loc_gate_trans_min_eig) {
+            const double lambda = es.eigenvalues()(i);
+            if (lambda < loc_gate_trans_min_eig) {
                 const Eigen::Vector3d v = es.eigenvectors().col(i);
                 VVt.noalias() += v * v.transpose();
                 loc_gate_axes_++;
+                if (lambda < infl_thresh) {
+                    // Deficit weight in [0,1): ~0 just under the threshold, →1 as
+                    // λ→0, so only genuine collapse contributes meaningfully.
+                    const double w = (infl_thresh - lambda) / infl_thresh;
+                    VVt_infl.noalias() += w * v * v.transpose();
+                    loc_gate_infl_axes_++;
+                }
             }
         }
         if (loc_gate_axes_ > 0) {
             loc_gate_VVt_ = VVt;
             loc_gate_armed_ = true;
         }
+        if (loc_gate_infl_axes_ > 0)
+            loc_gate_VVt_infl_ = VVt_infl;
     }
 
     // Project the degenerate-direction component of the LiDAR columns out of

@@ -957,6 +957,9 @@ public:
                     loc_gate_updates_diag_.store(if_lidar_only
                         ? estimator_lo.locGateUpdateCount() : estimator_lio.locGateUpdateCount(),
                         std::memory_order_relaxed);
+                    loc_gate_cov_infl_diag_.store(if_lidar_only
+                        ? estimator_lo.locGateCovInflMaxStd() : estimator_lio.locGateCovInflMaxStd(),
+                        std::memory_order_relaxed);
                 }
                 if (map_insert_lag_knots_ == 0) {
                     for (size_t i = 0; i < pt_meas.size(); i++) {
@@ -1462,6 +1465,9 @@ private:
     // §3.2 degeneracy-gate activity (0 axes = gate idle / disabled).
     std::atomic<int> loc_gate_axes_diag_{0};
     std::atomic<uint64_t> loc_gate_updates_diag_{0};
+    // §6.7 advisory cov inflation: largest std-dev (m) currently added to the
+    // published pose covariance along gated axes (0 when the feature is off).
+    std::atomic<double> loc_gate_cov_infl_diag_{0.0};
     double cube_len = 2000; 
     const float MOV_THRESHOLD = 1.5f;
     float det_range = 100.0;
@@ -1790,6 +1796,34 @@ private:
                     "translation directions whose constraint eigenvalue falls below the "
                     "gate; IMU rows and the spline prior keep full authority there "
                     "(degeneracy gate, HARDENING §3.2).", loc_gate);
+            }
+            // Publish-side advisory covariance inflation along persistently-gated
+            // axes (HARDENING §6.7). Grows the REPORTED /odom translation
+            // covariance toward realistic absolute uncertainty in a tunnel; the
+            // internal filter and trajectory are untouched. 0 = off (default).
+            const double cov_rate = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "loc_gate_cov_rate", 0.0);
+            const double cov_decay = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "loc_gate_cov_decay", 0.99);
+            const int cov_persist = CommonUtils::readParam<int>(
+                this->get_node_parameters_interface(), "loc_gate_cov_persist", 5);
+            const double cov_min_eig = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "loc_gate_cov_min_eig", 0.0);
+            estimator_lo.loc_gate_cov_rate = cov_rate;
+            estimator_lio.loc_gate_cov_rate = cov_rate;
+            estimator_lo.loc_gate_cov_decay = cov_decay;
+            estimator_lio.loc_gate_cov_decay = cov_decay;
+            estimator_lo.loc_gate_cov_persist = cov_persist;
+            estimator_lio.loc_gate_cov_persist = cov_persist;
+            estimator_lo.loc_gate_cov_min_eig = cov_min_eig;
+            estimator_lio.loc_gate_cov_min_eig = cov_min_eig;
+            if (cov_rate > 0.0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] loc_gate_cov_rate=%.4g (decay %.3f, persist %d): published "
+                    "pose covariance inflated along gated axes after %d consecutive "
+                    "gated frames; steady-state along-axis var ~%.3g m² (advisory, "
+                    "filter untouched).", cov_rate, cov_decay, cov_persist, cov_persist,
+                    cov_decay < 1.0 ? cov_rate / (1.0 - cov_decay) : 0.0);
             }
         }
 
@@ -2234,6 +2268,7 @@ private:
         stat.add("Localizability Cond (rot)", degen_cond_rot_.load(std::memory_order_relaxed));
         stat.add("Loc Gate Axes (current)", loc_gate_axes_diag_.load(std::memory_order_relaxed));
         stat.add("Loc Gate Updates (cumulative)", static_cast<double>(loc_gate_updates_diag_.load(std::memory_order_relaxed)));
+        stat.add("Loc Gate Cov Infl (max std m)", loc_gate_cov_infl_diag_.load(std::memory_order_relaxed));
         stat.add("Num Match Points", num_match_points_);
 
         // Buffer sizes: read the worker-maintained atomic caches instead of the
@@ -2832,9 +2867,19 @@ private:
         // project it through the spline Jacobian so downstream consumers
         // (robot_localization, sierra) actually see per-step uncertainty
         // rather than the static cov_pose YAML diagonal.
-        const Eigen::Matrix<double, 6, 6> P_pose =
+        Eigen::Matrix<double, 6, 6> P_pose =
             if_lidar_only ? estimator_lo.getLastPoseCovariance()
                           : estimator_lio.getLastPoseCovariance();
+        // Advisory degeneracy inflation: grow the REPORTED translation
+        // uncertainty along axes the gate has suppressed on consecutive frames,
+        // so a downstream EKF sees honest absolute uncertainty in a tunnel (the
+        // raw IEKF posterior only reports cm-scale local uncertainty there).
+        // Publish-side only — the internal filter covariance and the trajectory
+        // are untouched; no-op when loc_gate_cov_rate=0. See
+        // Estimator::accumGateInflation and HARDENING §6.7.
+        P_pose.topLeftCorner<3, 3>() += if_lidar_only
+            ? estimator_lo.locGateCovInfl()
+            : estimator_lio.locGateCovInfl();
         const Eigen::Matrix<double, 6, 6> P_twist =
             if_lidar_only ? estimator_lo.getLastTwistCovariance()
                           : estimator_lio.getLastTwistCovariance();
