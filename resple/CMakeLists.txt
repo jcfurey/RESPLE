@@ -268,6 +268,28 @@ target_link_libraries(${PROJECT_NAME}
 target_link_libraries(RESPLE  ${PROJECT_NAME})
 target_link_libraries(Mapping ${PROJECT_NAME})
 
+# MapSaving — standalone PCD accumulator node pulled in from upstream
+# feature/save_map (commit 4a75095). It does NOT link ${PROJECT_NAME}; it only
+# subscribes to the published `global_map` stream and dumps PCD on the
+# `save_map_node` std_srvs/Empty service. Kept separate from the hardened in-node
+# SaveMap *action* on purpose (see src/MapSaving.cpp header).
+# ament_auto_add_executable auto-links the package.xml build deps (rclcpp,
+# sensor_msgs, std_srvs, pcl_conversions are all declared there) and registers
+# the target for install via ament_auto_package() below. Matches the
+# ament_cmake_auto style used for the library; plain add_executable +
+# ament_target_dependencies is not available in this scope.
+ament_auto_add_executable(MapSaving src/MapSaving.cpp)
+target_link_libraries(MapSaving ${PCL_LIBRARIES})
+# Match the Eigen aligned-allocator ABI pinned on ${PROJECT_NAME} above (see the
+# handmade_aligned_free SIGSEGV comment): PCL clouds allocated/freed here must use
+# the same 16-byte alignment + malloc-already-aligned path, or this node can hit
+# the same fault when interacting with PCL-allocated point vectors.
+target_compile_definitions(MapSaving PRIVATE
+  _GNU_SOURCE
+  EIGEN_MALLOC_ALREADY_ALIGNED=1
+  EIGEN_DEFAULT_ALIGN_BYTES=16
+)
+
 if(ENABLE_OPENMP)
   target_link_libraries(${PROJECT_NAME} OpenMP::OpenMP_CXX)
 endif()
@@ -284,6 +306,7 @@ install(TARGETS RESPLE
   DESTINATION lib/${PROJECT_NAME})
 install(TARGETS Mapping
   DESTINATION lib/${PROJECT_NAME})
+# MapSaving is installed by ament_auto_package() (added via ament_auto_add_executable).
 
 if(BUILD_TESTING)
   # Dependency-light estimator-core unit tests (Eigen + GoogleTest only — no
