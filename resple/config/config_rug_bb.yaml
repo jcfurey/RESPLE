@@ -1,18 +1,20 @@
+# RESPLE config — RUG_BB dataset (Livox Mid360), LIO mode.
+# Own benchmark dataset.
 /**:
   ros__parameters:
     # Frame IDs for TF tree
-    odom/frame_id: odom
-    map/frame_id: map
-    frame_id: base_link
+    odom/frame_id: odom              # Odom (odometry frame_id) frame
+    map/frame_id: map                # Map frame (Mapping node publications)
+    frame_id: base_link              # Robot (odometry child_frame_id) frame
 
-    odom/publish_tf: True
-    odom/invert_tf: False
-    map/publish_tf: True
-    map/invert_tf: False
+    odom/publish_tf: True            # RESPLE broadcasts the odom->base_link TF
+    odom/invert_tf: False             # invert the odom->base_link broadcast direction
+    map/publish_tf: True             # Mapping node broadcasts the map->odom TF
+    map/invert_tf: False              # invert the map->odom broadcast direction
 
-    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-    publish_tf: true
+    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
+    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
+    publish_tf: true            # DEAD param (unused no-op); real toggles are odom/publish_tf and map/publish_tf
 
     topic_imu: /imu/data
     acc_ratio: true
@@ -28,7 +30,7 @@
     lidar_time_offset: 0.0
 
     knot_hz: 100
-    if_lidar_only: false
+    if_lidar_only: false            # LIO mode (LiDAR-inertial)
 
     ds_scan_voxel: 0.2
     point_filter_num: 1

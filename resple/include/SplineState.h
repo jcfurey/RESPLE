@@ -434,10 +434,18 @@ class SplineState
                 Quater::Qleft(q_itps[2], Q_l_all[3]);
                 J_q->d_val_d_knot.resize(size_J);
                 J_q->start_idx = idx0;
+                // Bug A3: map output entry i -> window SLOT (4-size_J)+i (= idx_window+i),
+                // the slot holding deque knot idx0+i — mirroring the position Jacobian
+                // (itpEuclidean/itpPose position use coeff[4-size_J+i]). Indexing the slot
+                // by i directly is correct only when size_J==4; for size_J<4 (a query in the
+                // first two knot-intervals of the spline start) it read idle-knot
+                // derivatives and misattributed the orientation sensitivity by idx_window
+                // knots, dropping the last real knot's contribution.
                 for (int i = size_J - 1; i >= 0; i--) {
+                    const int s = (4 - size_J) + i;
                     Eigen::Matrix4d Q_r_all;
-                    Quater::Qright(q_r_all[i], Q_r_all);
-                    J_q->d_val_d_knot[i].noalias() = coeff[i] * Q_r_all * Q_l_all[i] * dexp_dt[i];
+                    Quater::Qright(q_r_all[s], Q_r_all);
+                    J_q->d_val_d_knot[i].noalias() = coeff[s] * Q_r_all * Q_l_all[s] * dexp_dt[s];
                 }
             }
             if (J_w) {
@@ -453,17 +461,22 @@ class SplineState
                 Quater::drot(w_itps[2], q_delta_scale[3], drot_dq[1]);
                 J_w->d_val_d_knot.resize(size_J);
                 J_w->start_idx = idx0;
-                J_w->d_val_d_knot[0].setZero();           
-                if (size_J > 1) {
-                    J_w->d_val_d_knot[1] = 2 * dcoeff[1] * q_delta_scale[3].inverse().toRotationMatrix() * q_delta_scale[2].inverse().toRotationMatrix();
-                    if (size_J > 2) {
-                        Eigen::Matrix3d tmp = coeff[2] * drot_dq[0] * dexp_dt[2];
-                        J_w->d_val_d_knot[2] = q_delta_scale[3].inverse().toRotationMatrix() * (tmp + 2 * dcoeff[2] * Eigen::Matrix3d::Identity());
-                        if (size_J > 3) {
-                            J_w->d_val_d_knot[3] = coeff[3] * drot_dq[1] * dexp_dt[3] + 2 * dcoeff[3] * Eigen::Matrix3d::Identity();
-                        }
-                    }
-
+                // Bug A3: angular velocity depends on slots 1..3 only (slot 0 has
+                // zero derivative). Compute the per-SLOT derivatives, then map
+                // output entry i -> slot (4-size_J)+i (the slot holding deque knot
+                // idx0+i), mirroring the J_q / position fix. The old hard-coded
+                // d_val_d_knot[k]=slot-k assignment was correct only for size_J==4;
+                // for size_J<4 it shifted the attribution by idx_window knots.
+                Eigen::Matrix3d dw_dslot[4];
+                dw_dslot[0].setZero();
+                dw_dslot[1] = 2 * dcoeff[1] * q_delta_scale[3].inverse().toRotationMatrix() * q_delta_scale[2].inverse().toRotationMatrix();
+                {
+                    Eigen::Matrix3d tmp = coeff[2] * drot_dq[0] * dexp_dt[2];
+                    dw_dslot[2] = q_delta_scale[3].inverse().toRotationMatrix() * (tmp + 2 * dcoeff[2] * Eigen::Matrix3d::Identity());
+                }
+                dw_dslot[3] = coeff[3] * drot_dq[1] * dexp_dt[3] + 2 * dcoeff[3] * Eigen::Matrix3d::Identity();
+                for (int i = 0; i < size_J; i++) {
+                    J_w->d_val_d_knot[i] = dw_dslot[(4 - size_J) + i];
                 }
 
             }
@@ -618,10 +631,18 @@ class SplineState
                 Quater::Qleft(q_itps[2], Q_l_all[3]);
                 J_q->d_val_d_knot.resize(size_J);
                 J_q->start_idx = idx0;
+                // Bug A3: map output entry i -> window SLOT (4-size_J)+i (= idx_window+i),
+                // the slot holding deque knot idx0+i — mirroring the position Jacobian
+                // (itpEuclidean/itpPose position use coeff[4-size_J+i]). Indexing the slot
+                // by i directly is correct only when size_J==4; for size_J<4 (a query in the
+                // first two knot-intervals of the spline start) it read idle-knot
+                // derivatives and misattributed the orientation sensitivity by idx_window
+                // knots, dropping the last real knot's contribution.
                 for (int i = size_J - 1; i >= 0; i--) {
+                    const int s = (4 - size_J) + i;
                     Eigen::Matrix4d Q_r_all;
-                    Quater::Qright(q_r_all[i], Q_r_all);
-                    J_q->d_val_d_knot[i].noalias() = coeff[i] * Q_r_all * Q_l_all[i] * dexp_dt[i];
+                    Quater::Qright(q_r_all[s], Q_r_all);
+                    J_q->d_val_d_knot[i].noalias() = coeff[s] * Q_r_all * Q_l_all[s] * dexp_dt[s];
                 }
             } else {
                 Quater::exp(t_delta_scale[0], q_delta_scale[0]);

@@ -809,23 +809,25 @@ public:
                         break;
                     case NisRecoveryMode::RESET:
                         if (fh_state == resple::health::FilterState::DIVERGED) {
-                            // Reinflate the IEKF covariance to the configure-
-                            // time prior, keeping the state (spline + biases):
-                            // an over-confident covariance is exactly what the
-                            // NIS verdict detects, and reinflation lets new
-                            // measurements re-correct the state. Restart the
-                            // detector window so the next verdict reflects the
-                            // post-reset filter.
+                            // Reinflate the IEKF covariance to the recovery
+                            // covariance (nis_reset_cov), keeping the state
+                            // (spline + biases): an over-confident covariance is
+                            // exactly what the NIS verdict detects, and a LARGE
+                            // reinflation lets new measurements re-correct the
+                            // state (bug A2 — the old path reset to the tiny
+                            // startup prior, which deflated and froze the filter).
+                            // Restart the detector window so the next verdict
+                            // reflects the post-reset filter.
                             if (if_lidar_only) {
-                                estimator_lo.resetCovarianceToPrior();
+                                estimator_lo.reinflateCovariance();
                             } else {
-                                estimator_lio.resetCovarianceToPrior();
+                                estimator_lio.reinflateCovariance();
                             }
                             nis_detector_.reset();
                             nis_resets_.fetch_add(1, std::memory_order_relaxed);
                             RCLCPP_ERROR(this->get_logger(),
                                 "[RESPLE] nis_recovery_mode=reset: IEKF covariance reinflated "
-                                "to the configure-time prior (reset #%lu).",
+                                "to the recovery covariance nis_reset_cov (reset #%lu).",
                                 static_cast<unsigned long>(nis_resets_.load(std::memory_order_relaxed)));
                         }
                         break;
@@ -1320,7 +1322,8 @@ private:
     // HARDENING §3.3 recovery policy. OFF = detection-only (log +
     // diagnostics, legacy); HOLD = gate odometry/TF publication while
     // DIVERGED (released on full OK); RESET = reinflate the IEKF covariance
-    // to the configure-time prior on DIVERGED. nis_hold_active_ is
+    // to the recovery covariance nis_reset_cov on DIVERGED (bug A2: the old
+    // "configure-time prior" target was tiny and deflated the filter). nis_hold_active_ is
     // worker-thread-only; the reset counter is atomic for diagnostics.
     enum class NisRecoveryMode { OFF, HOLD, RESET };
     NisRecoveryMode nis_recovery_mode_ = NisRecoveryMode::OFF;
@@ -1827,6 +1830,20 @@ private:
             }
         }
 
+        // HARDENING §3.3 (bug A2): covariance the 'reset' recovery reinflates to
+        // on a DIVERGED verdict. NIS divergence signals an OVER-confident
+        // (too-small) covariance, so the recovery target must be LARGE; the old
+        // code reset to the tiny startup prior (cov_P0 ~ 2e-6), which deflated it
+        // further and froze the filter. Default 1.0 (sigma ~1 m / 1 rad). Set on
+        // both estimators so the mode works in LO or LIO; only consulted when
+        // nis_recovery_mode=reset fires. setState() does not touch it.
+        {
+            const double nis_reset_cov = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "nis_reset_cov", 1.0);
+            estimator_lo.setRecoveryCovariance(nis_reset_cov);
+            estimator_lio.setRecoveryCovariance(nis_reset_cov);
+        }
+
         // HARDENING §3.1 sliding-window knot pruning. Default 600 knots
         // (6 s at the canonical knot_hz=100) bounds spline memory while
         // staying far wider than any backward-looking consumer. 0 disables.
@@ -2112,13 +2129,18 @@ private:
         imu->angular_velocity.y = ang_vel_transformed[1];
         imu->angular_velocity.z = ang_vel_transformed[2];
 
-        // Transform linear acceleration (accounting for centripetal acceleration).
-        // r = translation from base_link origin to IMU sensor; correction is ω×(ω×r).
+        // Transform linear acceleration, referring it from the IMU location to
+        // the base_link origin (the spline/estimator reference point).
+        // Rigid-body relation: a_origin = a_imu - alpha x r - omega x (omega x r),
+        // where r = base_link origin -> IMU sensor (transform translation). The
+        // centripetal term must be SUBTRACTED to remove it (bug A4: it was added,
+        // which doubled the term instead of cancelling it). alpha x r (angular
+        // acceleration) is not measured, so it is omitted.
         Eigen::Vector3d lin_accel(imu_raw->linear_acceleration.x,
                                   imu_raw->linear_acceleration.y,
                                   imu_raw->linear_acceleration.z);
         Eigen::Vector3d lin_accel_transformed = transform_eigen.rotation() * lin_accel
-                                               + ang_vel_transformed.cross(ang_vel_transformed.cross(transform_eigen.translation()));
+                                               - ang_vel_transformed.cross(ang_vel_transformed.cross(transform_eigen.translation()));
 
         imu->linear_acceleration.x = lin_accel_transformed[0];
         imu->linear_acceleration.y = lin_accel_transformed[1];

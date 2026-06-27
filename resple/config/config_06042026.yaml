@@ -22,18 +22,18 @@
   ros__parameters:
     # Frame IDs for TF tree
     odom/frame_id: odom              # Odom (odometry frame_id) frame
-    map/frame_id: map                # Odom (odometry frame_id) frame
+    map/frame_id: map                # Map frame (Mapping node publications)
     frame_id: base_link              # Robot (odometry child_frame_id) frame;
                                      # spline body frame (sensors TF'd into this)
 
-    odom/publish_tf: True
-    odom/invert_tf: False
-    map/publish_tf: True
-    map/invert_tf: False
+    odom/publish_tf: True            # RESPLE broadcasts the odom->base_link TF
+    odom/invert_tf: False             # invert the odom->base_link broadcast direction
+    map/publish_tf: True             # Mapping node broadcasts the map->odom TF
+    map/invert_tf: False              # invert the map->odom broadcast direction
 
-    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
-    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
-    publish_tf: true
+    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
+    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
+    publish_tf: true            # DEAD param (unused no-op); real toggles are odom/publish_tf and map/publish_tf
 
     topic_imu: /ouster/imu
     acc_ratio: false                 # Ouster IMU publishes accel in m/s^2
@@ -91,6 +91,7 @@
     nis_diverged_ratio: 4.0        # DIVERGED threshold
     nis_breach_limit: 3            # consecutive breaches before DIVERGED
     nis_recovery_mode: "off"       # off / hold / reset (keep quotes)
+    nis_reset_cov: 1.0             # 'reset' mode reinflation variance (m^2/rad^2); recovery target, must be large
     map_prune_radius: 0.0          # 0 = cube-only (cube_len)
     max_scan_buffer: 0             # per-LiDAR raw-scan cap; 0 = unbounded
     max_imu_staging: 2000          # IMU staging cap (samples, drop-oldest)

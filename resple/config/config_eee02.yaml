@@ -1,18 +1,20 @@
+# RESPLE config — NTU VIRAL dataset, eee_02 sequence (Ouster OS1-16), LO mode.
+# Benchmark config; run via resple_eee_02.launch.py.
 /**:
   ros__parameters:
     # Frame IDs for TF tree
     odom/frame_id: odom              # Odom (odometry frame_id) frame
-    map/frame_id: map                # Odom (odometry frame_id) frame    
+    map/frame_id: map                # Map frame (Mapping node publications)
     frame_id: base_link              # Robot (odometry child_frame_id) frame
 
-    odom/publish_tf: True
-    odom/invert_tf: False
-    map/publish_tf: True
-    map/invert_tf: False
+    odom/publish_tf: True            # RESPLE broadcasts the odom->base_link TF
+    odom/invert_tf: False             # invert the odom->base_link broadcast direction
+    map/publish_tf: True             # Mapping node broadcasts the map->odom TF
+    map/invert_tf: False              # invert the map->odom broadcast direction
 
-    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
-    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # diagonal of covariance published in odom msgs
-    publish_tf: true                
+    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
+    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
+    publish_tf: true            # DEAD param (unused no-op); real toggles are odom/publish_tf and map/publish_tf
     
     topic_imu: /imu/imu
     acc_ratio: false  
@@ -21,14 +23,14 @@
       topic_lidar: /os1_cloud_node1/points
       lidar_type: Ouster
       scan_line: 16
-      blind: 4.0
+      blind: 4.0                # 4 m blind radius (unusually large; intentional for this dataset)
       q_lb: [1.0, 0.0, 0.0, 0.0]      
       t_lb: [0.05, 0.0, -0.055]    
       w_pt: 0.01 
     lidar_time_offset: 0.1
 
     knot_hz: 100
-    if_lidar_only: true  
+    if_lidar_only: true             # LO mode (LiDAR-only; no IMU fusion)
     
     ds_scan_voxel: 0.1
     point_filter_num: 1

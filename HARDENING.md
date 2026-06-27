@@ -932,12 +932,15 @@ Per the operator decision (2026-06-10), both policies are implemented behind
   hysteresis recovery keeps the gate closed. est_window / map updates
   continue so internal estimation keeps running and the detector can observe
   recovery. Logged on entry/exit; `NIS Recovery Hold Active` in diagnostics.
-- **`reset`** — on DIVERGED, reinflate the IEKF covariance to the
-  configure-time prior (`Estimator::resetCovarianceToPrior`), keeping the
+- **`reset`** — on DIVERGED, reinflate the IEKF covariance to the recovery
+  covariance `nis_reset_cov` (`Estimator::reinflateCovariance`), keeping the
   state (spline + biases): an over-confident covariance is exactly what the
-  NIS verdict detects, and reinflation lets new measurements re-correct the
-  state. The detector window restarts so the next verdict reflects the
-  post-reset filter. `NIS Recovery Resets (cumulative)` in diagnostics.
+  NIS verdict detects, and a LARGE reinflation lets new measurements re-correct
+  the state. The target must dominate the diverged covariance — **bug A2**: the
+  original code reset to the ~2e-6 configure-time prior, which deflated the
+  filter further and froze it on the diverged state. The detector window
+  restarts so the next verdict reflects the post-reset filter. `NIS Recovery
+  Resets (cumulative)` in diagnostics.
 
 Note: `reset` deliberately reinflates covariance rather than rewinding the
 state to a stored "last good pose" — a state rewind would need pose history

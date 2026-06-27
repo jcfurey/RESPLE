@@ -337,7 +337,7 @@ reference (status as of latest pass):
 | 4  | Unbounded knot growth | **fixed** (sliding-window prune in both nodes: `SplineState::pruneFrontKnots` slides the idle window so retained-range interpolation is bit-identical; absolute est_window indexing kept via `totalKnots()`; param `spline_prune_keep_knots`, default 600, 0 disables) | 3.1 |
 | 5  | Unbounded input buffers | **capability landed** (`max_scan_buffer` per-LiDAR drop-oldest, default 0=off; `max_imu_staging` default 2000 replaces the old hardcoded cap; drop counters in diagnostics + the Phase 4 msg) | 2.3 |
 | 6  | `assert()` in hot paths → silent UB under `-DNDEBUG` | **fixed** | 1 |
-| 7  | No divergence detection | **fixed** (NIS detector + `nis_recovery_mode` off/hold/reset; hold gates odom/TF while DIVERGED, reset reinflates the IEKF covariance to the prior) | 0 → 3.3 |
+| 7  | No divergence detection | **fixed** (NIS detector + `nis_recovery_mode` off/hold/reset; hold gates odom/TF while DIVERGED, reset reinflates the IEKF covariance to `nis_reset_cov`) | 0 → 3.3 |
 | 8  | Plane-fit outlier rejection incomplete | **instrumented + parameterized** (CorrespConfig: `nn_max_sq_dist`/`plane_fit_thresh`/`plane_min_cond_ratio` params, degeneracy guard off by default pending bag benchmark; per-window funnel counters in diagnostics) | 3.2 |
 | 9  | Deskew out-of-window extrapolation | **fixed (clamp + counter)** | 1 + 1.5 A/B |
 | 10 | `-ffast-math` on | **fixed** | 1 |
@@ -394,7 +394,7 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `plane_fit_thresh` | §3.2 esti_plane residual threshold (m) | `0.1` |
 | `plane_min_cond_ratio` | §3.2 plane-fit degeneracy guard (QR pivot ratio; 0 = off, pending bag benchmark) | `0.0` |
 | `map_prune_radius` | §3.4 keep only map points within this distance (m) of the pose; floored at 2×det_range; 0 = off (cube-only) | `0.0` |
-| `nis_recovery_mode` | §3.3 divergence recovery: `off` (detect-only) / `hold` (gate odom+TF while DIVERGED) / `reset` (reinflate IEKF covariance to prior) | `off` |
+| `nis_recovery_mode` | §3.3 divergence recovery: `off` (detect-only) / `hold` (gate odom+TF while DIVERGED) / `reset` (reinflate IEKF covariance to `nis_reset_cov`) | `off` |
 | `max_scan_buffer` | §2.3 per-LiDAR raw-scan cap (scans, drop-oldest; 0 = unbounded) | `0` |
 | `max_imu_staging` | §2.3 IMU staging cap (samples, drop-oldest; was hardcoded 2000) | `2000` |
 

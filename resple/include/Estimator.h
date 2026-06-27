@@ -111,12 +111,21 @@ class Estimator
     double lastNis() const { return last_nis_; }
     int lastNisDof() const { return last_nis_dof_; }
 
-    // HARDENING SS3.3 'reset' recovery: reinflate the IEKF covariance to the
-    // configure-time prior while keeping the state (spline + biases). NIS
-    // divergence signals an over-confident covariance; reinflation lets
-    // subsequent measurements re-correct the state instead of being
-    // near-ignored. Worker-thread only (same thread as updateIEKF*).
-    void resetCovarianceToPrior() { cov_rcp = cov_prior_; }
+    // HARDENING SS3.3 'reset' recovery (bug A2): reinflate the IEKF covariance
+    // to a genuine recovery covariance while keeping the state (spline +
+    // biases). NIS divergence signals an OVER-confident (too-small) covariance,
+    // so the recovery target must be LARGE — resetting to the tiny startup
+    // prior (cov_P0 ~ 2e-6, sigma ~1.4 mm) would deflate it further, drive the
+    // Kalman gain to ~0, and freeze the filter on the diverged state. cov_reset_
+    // defaults to 1.0·I (sigma ~1 m / 1 rad), tunable via setRecoveryCovariance()
+    // (node param nis_reset_cov). Worker-thread only (same thread as updateIEKF*).
+    void reinflateCovariance() { cov_rcp = cov_reset_; }
+
+    // Set the covariance the 'reset' recovery reinflates to (uniform variance on
+    // the full state). Call once at configure; setState() does not touch it.
+    void setRecoveryCovariance(double var) {
+        cov_reset_ = var * Eigen::Matrix<double, XSIZE, XSIZE>::Identity();
+    }
 
     Estimator() {};
 
@@ -129,7 +138,6 @@ class Estimator
         }        
         cov_sys = Q;
         cov_rcp = P;
-        cov_prior_ = P;
         a_mat = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
         Eigen::Matrix<double, 6, 6> matblock = Eigen::Matrix<double, 6, 6>::Zero();
         matblock.topLeftCorner<3, 3>().setIdentity();
@@ -165,6 +173,15 @@ class Estimator
                           int num_threads = 5, int num_match_points = 5)
     {
         corresp_stats.reset();
+        // HARDENING §3.3 (bug A1): pessimistic per-frame NIS default. last_nis_
+        // is written only inside update(); a frame that finds zero valid
+        // correspondences breaks out below WITHOUT calling update(), so without
+        // this reset lastNis() would return the PREVIOUS frame's (healthy) value
+        // and the divergence detector would miss a lost-correspondence frame —
+        // exactly the case it exists to catch. Reset to NaN so a frame that never
+        // calls update() feeds the detector a breach (its non-finite path).
+        last_nis_ = std::numeric_limits<double>::quiet_NaN();
+        last_nis_dof_ = 0;
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -214,6 +231,15 @@ class Estimator
                          int num_threads = 5, int num_match_points = 5)
     {
         corresp_stats.reset();
+        // HARDENING §3.3 (bug A1): pessimistic per-frame NIS default. last_nis_
+        // is written only inside update(); a frame that finds zero valid
+        // correspondences breaks out below WITHOUT calling update(), so without
+        // this reset lastNis() would return the PREVIOUS frame's (healthy) value
+        // and the divergence detector would miss a lost-correspondence frame —
+        // exactly the case it exists to catch. Reset to NaN so a frame that never
+        // calls update() feeds the detector a breach (its non-finite path).
+        last_nis_ = std::numeric_limits<double>::quiet_NaN();
+        last_nis_dof_ = 0;
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -260,6 +286,15 @@ class Estimator
         int num_threads = 5, int num_match_points = 5)
     {
         corresp_stats.reset();
+        // HARDENING §3.3 (bug A1): pessimistic per-frame NIS default. last_nis_
+        // is written only inside update(); a frame that finds zero valid
+        // correspondences breaks out below WITHOUT calling update(), so without
+        // this reset lastNis() would return the PREVIOUS frame's (healthy) value
+        // and the divergence detector would miss a lost-correspondence frame —
+        // exactly the case it exists to catch. Reset to NaN so a frame that never
+        // calls update() feeds the detector a breach (its non-finite path).
+        last_nis_ = std::numeric_limits<double>::quiet_NaN();
+        last_nis_dof_ = 0;
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -311,6 +346,15 @@ class Estimator
         int num_threads = 5, int num_match_points = 5)
     {
         corresp_stats.reset();
+        // HARDENING §3.3 (bug A1): pessimistic per-frame NIS default. last_nis_
+        // is written only inside update(); a frame that finds zero valid
+        // correspondences breaks out below WITHOUT calling update(), so without
+        // this reset lastNis() would return the PREVIOUS frame's (healthy) value
+        // and the divergence detector would miss a lost-correspondence frame —
+        // exactly the case it exists to catch. Reset to NaN so a frame that never
+        // calls update() feeds the detector a breach (its non-finite path).
+        last_nis_ = std::numeric_limits<double>::quiet_NaN();
+        last_nis_dof_ = 0;
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -493,9 +537,11 @@ class Estimator
     // read before that first write would have been UB. setState() now runs
     // on valid zeros.
     Eigen::Matrix<double, XSIZE, XSIZE> cov_rcp  = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
-    // Initial covariance from setState(), kept for the HARDENING SS3.3
-    // 'reset' recovery mode (resetCovarianceToPrior).
-    Eigen::Matrix<double, XSIZE, XSIZE> cov_prior_ = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
+    // Recovery covariance the HARDENING SS3.3 'reset' mode reinflates to
+    // (reinflateCovariance / bug A2). Defaults to 1.0·I (sigma ~1 m / 1 rad);
+    // override via setRecoveryCovariance() (node param nis_reset_cov). setState()
+    // deliberately does NOT touch it, so a configure-time setter survives init.
+    Eigen::Matrix<double, XSIZE, XSIZE> cov_reset_ = Eigen::Matrix<double, XSIZE, XSIZE>::Identity();
     Eigen::Matrix<double, XSIZE, XSIZE> cov_sys  = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Matrix<double, XSIZE, XSIZE> a_mat    = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
     Eigen::Vector3d bg = Eigen::Vector3d::Zero();

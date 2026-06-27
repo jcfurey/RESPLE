@@ -355,3 +355,93 @@ TEST(SplineMsgProtocol, StaleWindowBeforeReceiverPruneIsIgnored)
         EXPECT_EQ(a.q.coeffs(), b.q.coeffs()) << "t=" << t;
     }
 }
+
+// --- Bug A3 regression: orientation (J_q) and angular-velocity (J_w) Jacobians
+// --- at the spline-START boundary. For idx_l < 2 the interpolation window has
+// --- idle slots at the front (idx_window > 0, size_J < 4); the rotational
+// --- Jacobian loops used to index window slot i instead of (4-size_J)+i, so
+// --- they read idle-knot derivatives and misattributed the sensitivity by
+// --- idx_window knots (and dropped the last real knot). Validate analytic vs
+// --- central-difference numerical Jacobians there; the position Jacobian
+// --- (always correct) is the harness control. The spline's quaternion factors
+// --- are exactly unit, so the final normalize() is a no-op and the analytic
+// --- Jacobian is exact.
+
+namespace
+{
+// Synthetic spline with one knot's position OR ort-delta nudged on one axis,
+// for central-difference numerical Jacobians.
+SplineState makeSplineNudged(int N, int k, bool ort, int axis, double eps)
+{
+    SplineState s;
+    s.init(kDtNs, 0, kStartNs);
+    for (int i = 0; i < N; i++) {
+        Eigen::Vector3d p = knotPos(i);
+        Eigen::Vector3d od = knotOrtDel(i);
+        (ort ? od : p)(axis) += (i == k) ? eps : 0.0;
+        s.addOneStateKnot(p, od);
+    }
+    return s;
+}
+}  // namespace
+
+TEST(SplineJacobianBoundary, RotationJacobiansMatchNumericalNearStart)
+{
+    const int N = 5;
+    SplineState base = makeSpline(N);
+    const double eps = 1e-5;
+    // idx_l = 0 (idx_window 2, size_J 2) and idx_l = 1 (idx_window 1, size_J 3).
+    // Steady state (idx_window 0, size_J 4) is the path left unchanged by the fix.
+    const int64_t times[] = { kStartNs + kDtNs / 2, kStartNs + 3 * kDtNs / 2 };
+    for (int64_t t : times) {
+        Eigen::Vector3d p_base;
+        Eigen::Quaterniond q_base, q_base2;
+        Eigen::Vector3d w_base;
+        Jacobian J_p;
+        Jacobian43 J_q_quat, J_q_pose;
+        Jacobian33 J_w;
+        base.itpQuaternion(t, &q_base, &w_base, &J_q_quat, &J_w);
+        base.itpPose(t, &p_base, &J_p, &q_base2, &J_q_pose);
+        ASSERT_GT(J_q_quat.d_val_d_knot.size(), 0u);
+        ASSERT_LT(J_q_quat.d_val_d_knot.size(), 4u) << "expected a boundary window (size_J<4) at t=" << t;
+        const int idx0 = static_cast<int>(J_q_quat.start_idx);
+        ASSERT_EQ(static_cast<int>(J_p.start_idx), idx0);
+        ASSERT_EQ(J_q_pose.d_val_d_knot.size(), J_q_quat.d_val_d_knot.size());
+        for (size_t e = 0; e < J_q_quat.d_val_d_knot.size(); e++) {
+            const int k = idx0 + static_cast<int>(e);
+            // itpPose and itpQuaternion must agree on the orientation Jacobian
+            // (both carry the same fix).
+            EXPECT_LT((J_q_pose.d_val_d_knot[e] - J_q_quat.d_val_d_knot[e]).norm(), 1e-9)
+                << "itpPose vs itpQuaternion J_q disagree, t=" << t << " knot=" << k;
+            for (int a = 0; a < 3; a++) {
+                SplineState op = makeSplineNudged(N, k, true, a, +eps);
+                SplineState om = makeSplineNudged(N, k, true, a, -eps);
+                Eigen::Quaterniond qp, qm;
+                Eigen::Vector3d wp, wm;
+                op.itpQuaternion(t, &qp, &wp, nullptr, nullptr);
+                om.itpQuaternion(t, &qm, &wm, nullptr, nullptr);
+                Eigen::Vector4d dq_num;  // [w,x,y,z] to match the Jacobian rows
+                dq_num << qp.w() - qm.w(), qp.x() - qm.x(), qp.y() - qm.y(), qp.z() - qm.z();
+                dq_num /= (2 * eps);
+                EXPECT_LT((dq_num - J_q_quat.d_val_d_knot[e].col(a)).norm(), 1e-4)
+                    << "J_q t=" << t << " knot=" << k << " axis=" << a
+                    << "\n  num=" << dq_num.transpose()
+                    << "\n  ana=" << J_q_quat.d_val_d_knot[e].col(a).transpose();
+                Eigen::Vector3d dw_num = (wp - wm) / (2 * eps);
+                EXPECT_LT((dw_num - J_w.d_val_d_knot[e].col(a)).norm(), 1e-4)
+                    << "J_w t=" << t << " knot=" << k << " axis=" << a
+                    << "\n  num=" << dw_num.transpose()
+                    << "\n  ana=" << J_w.d_val_d_knot[e].col(a).transpose();
+                // Position control (J_p always correct): ∂p/∂(knot-pos axis a) =
+                // blend-coeff · e_a. Linear, so central difference is exact.
+                SplineState pp = makeSplineNudged(N, k, false, a, +eps);
+                SplineState pm = makeSplineNudged(N, k, false, a, -eps);
+                Eigen::Vector3d dp_num = (pp.itpPosition(t) - pm.itpPosition(t)) / (2 * eps);
+                Eigen::Vector3d dp_ana = Eigen::Vector3d::Zero();
+                dp_ana(a) = J_p.d_val_d_knot[e];
+                EXPECT_LT((dp_num - dp_ana).norm(), 1e-9)
+                    << "J_p control t=" << t << " knot=" << k << " axis=" << a;
+            }
+        }
+    }
+}
