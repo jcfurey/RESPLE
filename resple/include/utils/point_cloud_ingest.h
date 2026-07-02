@@ -24,6 +24,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
+#include <cstring>
 #include <vector>
 
 #include "utils/point_cloud_adapter.h"
@@ -88,8 +89,30 @@ inline bool ingestPointCloud2(const sensor_msgs::msg::PointCloud2& msg,
     return false;
   }
   const uint32_t num_points = msg.width * msg.height;
+  // convertCloud walks the blob at a fixed point_step, which assumes dense
+  // packing. Organized clouds (height > 1) may pad each row to row_step >
+  // width*point_step — repack them densely first, or every point after row 0
+  // is read at the wrong offset (bug-hunt 2026-07-02 finding #26).
+  const uint8_t* data_ptr = msg.data.data();
+  size_t data_size = msg.data.size();
+  std::vector<uint8_t> dense;
+  if (msg.height > 1 &&
+      msg.row_step != msg.width * msg.point_step) {
+    if (static_cast<size_t>(msg.row_step) * msg.height > msg.data.size()) {
+      return false;
+    }
+    dense.resize(static_cast<size_t>(msg.width) * msg.height * msg.point_step);
+    for (uint32_t r = 0; r < msg.height; ++r) {
+      std::memcpy(dense.data() +
+                      static_cast<size_t>(r) * msg.width * msg.point_step,
+                  msg.data.data() + static_cast<size_t>(r) * msg.row_step,
+                  static_cast<size_t>(msg.width) * msg.point_step);
+    }
+    data_ptr = dense.data();
+    data_size = dense.size();
+  }
   std::vector<pc2::OutPoint> pts;
-  if (!pc2::convertCloud(msg.data.data(), msg.data.size(), msg.point_step,
+  if (!pc2::convertCloud(data_ptr, data_size, msg.point_step,
                          num_points, msg.is_bigendian, layout, cfg, pts)) {
     return false;
   }

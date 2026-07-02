@@ -1,10 +1,21 @@
-# RESPLE Bug Hunt & Logic Verification — Findings (INTERIM)
+# RESPLE Bug Hunt & Logic Verification — Findings & Fixes
 
-**Date:** 2026-07-02  ·  **Status: INTERIM — pre-verification snapshot.**
-An adversarial 3/2/1-lens verification pass (scaled by severity) plus a
-completeness critic are still running; every finding below is a *candidate*
-until its verdict lands. This file will be updated in place with verdicts
-(CONFIRMED / PLAUSIBLE / REFUTED) when the pipeline completes.
+**Date:** 2026-07-02  ·  **Status: ALL 30 FINDINGS ADDRESSED (fixed in code,
+config/launch, or docs).** Each finding below carries its **Verification**
+verdict and its **Outcome**.
+
+Verification history: an adversarial panel (3 lenses for critical/high,
+2 for medium, 1 refuter for low) verified findings in workflow order and
+CONFIRMED all 15 it completed (one — the double-extrinsic finding — contested
+2-1, resolved in its Outcome) before hitting a session token limit; the
+remaining 15 were then triaged manually against the code during fixing, per
+operator direction. One finding (the ikd-Tree ABBA deadlock) was additionally
+confirmed *empirically*: an intermediate fix variant reproduced the deadlock
+in the ParallelSearchPushDownRace stress test.
+
+Validation: full colcon build clean; ROS-free unit suite 50/50 (including a
+new q_out regression test); ikd-Tree concurrency stress tests pass under
+ThreadSanitizer with zero warnings (empty suppressions file).
 
 ## Method
 
@@ -71,7 +82,8 @@ the final verified report.
 
 - **Location:** `resple/include/Estimator.h:502`
 - **Found by:** numerics, spline-math  ·  **Finder confidence:** 0.93
-- **Verification:** _pending_
+- **Verification:** unverified by panel
+- **Outcome:** **FIXED** — non-positive `ds_scan_voxel`/`ds_lm_voxel`/`nn_thresh` fall back to the canonical values (0.2 m / 0.2 m / 0.5 m) with a loud warning.
 
 **Description.** Estimator::getLastTwistCovariance() calls `spl.itpQuaternion(t, &q_out, &w_out, nullptr, &J_w)` (Estimator.h:502) with q_out requested, J_q=nullptr, J_w non-null. In SplineState::itpQuaternion, the `(J_q || J_w)` branch is taken, but the ONLY assignment to *q_out in that branch is inside `if (J_q)` (SplineState.h:429 `*q_out = q_itps[3];`); the `else` branch that would also assign q_out (SplineState.h:492-499) is never reached. So q_out — a default-constructed Eigen::Quaterniond, which Eigen leaves UNINITIALIZED (and EIGEN_INITIALIZE_MATRICES_BY_NAN is Debug-only per CMakeLists) — is consumed at Estimator.h:521 `const Eigen::Matrix3d R = q_out.toRotationMatrix();` and used to rotate the world-frame linear-velocity covariance into the body frame (P_v_body = R^T P_vw R). getLastTwistCovariance is called on every publish in publishPoseAndTf (RESPLE.cpp:2905-2907, both LO and LIO default paths), so the odometry message's twist.covariance linear-velocity 3x3 block is computed from stack garbage every frame: nondeterministic, unnormalized (toRotationMatrix of a non-unit quaternion scales by |q|^2), potentially huge/NaN. The downstream odom EKF (robot_localization odom1 input per CLAUDE.md) fuses body-frame velocity weighted by exactly this block. The angular block (Jw path) and the pose covariance (getLastPoseCovariance passes a non-null J_q) are unaffected. This is a locally-added function (not upstream) violating upstream itpQuaternion's implicit contract; it is not among CLAUDE.md hazards 1-38 nor REVIEW A1-A4.
 
@@ -89,7 +101,8 @@ Estimator.h:500-502: `Eigen::Quaterniond q_out; Eigen::Vector3d w_out; spl.itpQu
 
 - **Location:** `resple/include/Estimator.h:502`
 - **Found by:** iekf, recent-commits  ·  **Finder confidence:** 0.92
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (2/2: refute, reference; impact verifier lost to session limit)
+- **Outcome:** **FIXED** — same defect as #1 (duplicate entry); covered by the same fix and test.
 
 **Description.** SplineState::itpQuaternion has two output paths: in the Jacobian branch (entered when J_q || J_w), *q_out is assigned only inside `if (J_q)` (SplineState.h:423-429); the no-Jacobian else branch writes it under `if (q_out)`. The locally-added Estimator::getLastTwistCovariance calls `spl.itpQuaternion(t, &q_out, &w_out, nullptr, &J_w)` — J_q is nullptr and J_w is non-null, so the Jacobian branch runs and q_out (a default-constructed Eigen::Quaterniond, which Eigen leaves UNINITIALIZED) is never written. Line 521 then computes `R = q_out.toRotationMatrix()` from stack garbage and uses it to rotate the world-frame linear-velocity covariance into the body frame: `P_v_body = R.transpose() * P_vw * R`. Since R is built from an arbitrary non-unit quaternion it has arbitrary scale (~|q|^2 per axis) and orientation, so the published twist linear covariance is garbage (arbitrarily scaled, possibly enormous or NaN if the stack holds NaN patterns). This runs on every publishPoseAndTf cycle (RESPLE.cpp:2905-2907, 2940-2942) and the result is published in /localization/resple/odometry twist.covariance, feeding the downstream robot_localization odom EKF whenever RESPLE is enabled (the supported one-line-revert LIO config). The angular block (Jw·P·Jwᵀ) and the twist values themselves are unaffected; only the linear 3x3 covariance block is corrupted. Empirically confirmed: compiled a standalone repro against SplineState.h — after `itpQuaternion(t, &q, &w, nullptr, &J_w)` the pre-poisoned q (1234.5, -7, 8, 9) was returned unchanged, and toRotationMatrix() gave entries like -289.0. Not among CLAUDE.md hazards 1-38 nor A1-A4.
 
@@ -107,7 +120,8 @@ Estimator.h:499-502: `Jacobian33 J_w; Eigen::Quaterniond q_out; Eigen::Vector3d 
 
 - **Location:** `resple/src/RESPLE.cpp:611`
 - **Found by:** config-units, association, node-logic  ·  **Finder confidence:** 0.8
-- **Verification:** _pending_
+- **Verification:** CONTESTED (reference + impact CONFIRMED the mechanics and the dataset-launch damage; refute lens showed line 611 is the fork's documented convention with identity YAML in production, so default-config damage is zero)
+- **Outcome:** **FIXED (config + guardrails)** — the code convention stands (TF carries the extrinsic, YAML is an extra offset). Added: per-LiDAR TF cache, `tf_extrinsics` mode param, a WARN tripwire when TF and YAML extrinsics are both non-identity, and the dataset launches were switched to YAML-only mode with their wrong-direction (verbatim-`q_lb`) static TFs removed, so every replay launch now applies the calibrated extrinsic exactly once.
 
 **Description.** Every sensor callback now pre-transforms the cloud into base_link via TF (e.g. RESPLE.cpp:2474/2803 pcl::transformPointCloud(..., lidar_to_baselink_)), but processData still constructs PointData with the YAML extrinsic (line 611: 'PointData pt(pc_last_ds->points[i], time_begin, lidar.q_bl, lidar.t_bl, ...)') and Association::pointBodyToWorld (Association.h:96) applies q_bl/t_bl AGAIN: p_global = q * (q_bl*p_body + t_bl) + pos. Upstream applied q_bl/t_bl to RAW lidar-frame points (upstream_RESPLE.cpp has no TF transform at all), so applying it to already-base_link points is a second application. The shipped dataset launches set the static TF equal to (q_lb, t_lb) verbatim (e.g. resple_heap launch hesai_tf qx/qy/qz/qw = config hesai q_lb reordered; resple_r_campus/helmdyn/nc_short TF translation == YAML t_lb), so the composition q_bl*(q_lb*p_l + t_lb) + t_bl collapses to exactly p_l — the extrinsic is silently NULLED and each cloud enters the estimator in its own raw sensor frame. Single-LiDAR datasets get a lidar-frame trajectory with an IMU/LiDAR frame mismatch in LIO (nc_short's q_lb=[0,0,0,1] is a 180-deg yaw that the IMU path does not see — updateImuTransform falls back to pass-through); the two-LiDAR heap MLO/LO config is worse: livox and hesai are physically ~90 deg apart (hesai q_lb w~0.0008), and with both nets collapsing to identity the two clouds are inserted into ONE map in frames rotated 90 deg from each other. The Mapping node explicitly avoids this (Mapping.cpp:313-320: 'Applying lidar->IMU (lidar.q_bl/t_bl) here would double-count the extrinsic') and composes TF*imu_to_lidar correctly (Mapping.cpp:281-284), so RESPLE and Mapping also disagree by q_bl*t_lb whenever the extrinsic is non-identity.
 
@@ -125,7 +139,8 @@ RESPLE.cpp:611 'PointData pt(pc_last_ds->points[i], time_begin, lidar.q_bl, lida
 
 - **Location:** `resple/src/RESPLE.cpp:3053`
 - **Found by:** node-logic  ·  **Finder confidence:** 0.8
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (3/3)
+- **Outcome:** **FIXED** — emptiness re-checked after the stale-backlog drop; init retries next cycle instead of UB.
 
 **Description.** The pre-init 'discard stale backlog' block (lines 3012-3050, a workspace-local addition not in upstream) computes a single global cutoff = latest_t_ns - 200ms across ALL lidars and then pops every pt_buff entry older than that cutoff. The non-empty guard for pt_buff runs at lines 2993-2997, BEFORE the drop, and emptiness is never re-checked. Immediately after the drop, line 3053 dereferences lidar_data.pt_buff.front() for every lidar. In a multi-lidar (MLO/MLIO, supported by the 'lidars' list param and upstream modes) configuration where one lidar lags more than 200 ms behind the freshest one (driver hiccup, decimated topic, low-rate sensor), that lidar's entire pt_buff is dropped and front() is called on an empty Eigen::aligned_deque — undefined behavior (garbage start_t_ns anchoring the spline, or SIGSEGV; the worker's try/catch cannot catch UB). A single lidar with scan period > 200 ms (< 5 Hz) can also trigger it when a new scan lands in t_buff between the drain and initialization().
 
@@ -143,7 +158,8 @@ Lines 3029-3034: `while (!lidar_data.pt_buff.empty() && lidar_data.pt_buff.front
 
 - **Location:** `resple/launch/resple_ntu_day_01_ouster.launch.py:57`
 - **Found by:** config-units  ·  **Finder confidence:** 0.75
-- **Verification:** _pending_
+- **Verification:** unverified (verifiers lost to session limit); mechanics re-confirmed manually
+- **Outcome:** **FIXED** — dataset launches pass `tf_extrinsics: false` (upstream YAML-only convention); additionally a `tf_wait_timeout` (10 s) fallback in both nodes degrades to YAML-only instead of dropping scans forever in any config.
 
 **Description.** resple_ntu_day_01_ouster.launch.py:57, resple_ntu_day_01_livox.launch.py:57 and resple_kth_day_06_ouster.launch.py:57 publish only the upstream leftover static TF ['0','0','0','0','0','0','map','my_frame'] — no base_link->(cloud frame_id) transform. The locally-added updateLidarTransform gate (RESPLE.cpp:2060-2100) is called at the top of every LiDAR callback and returns false (dropping the whole scan) until base_link->cloud-frame resolves. Worse, the _frameExists pre-check (RESPLE.cpp:2067-2069) returns false BEFORE the throttled 'Waiting for LiDAR transform' warning, and 'base_link' only ever enters the TF tree via RESPLE's own odom->base_link broadcast, which happens post-initialization — which needs scans. So these three launches deadlock silently: all scans dropped forever, no odometry, no log line explaining why. Their configs carry non-identity extrinsics (ntu ouster q_lb ~180deg roll) that were previously honored by the upstream code path without any TF.
 
@@ -161,7 +177,8 @@ resple_ntu_day_01_ouster.launch.py:57 "arguments=['0', '0', '0', '0', '0', '0', 
 
 - **Location:** `resple/src/Mapping.cpp:320`
 - **Found by:** mapping-node  ·  **Finder confidence:** 0.72
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (refute lens; others lost to session limit)
+- **Outcome:** **FIXED** — `transformPoint` now mirrors `Association::pointBodyToWorld` exactly (`q_itp·(q_bl·p + t_bl) + t_itp`); the `baselink_to_imu_` hop that re-applied the inverse TF extrinsic is gone.
 
 **Description.** The estimator's spline is trained on base_link-frame points: every RESPLE.cpp sensor callback pre-transforms the cloud via TF (pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_), RESPLE.cpp:2474) and Association::pointBodyToWorld then applies only the YAML extrinsic (q_bl*p + t_bl, Association.h:96; PointData built with lidar.q_bl/t_bl at RESPLE.cpp:611). So the frame the spline transforms is F_est(p_base) = q_bl*p_base + t_bl = M^{-1}(p_base), where M = Translation(t_lb)*q_lb. The Mapping node's clouds are likewise pre-transformed to base_link, but transformPoint maps them p_imu = baselink_to_imu_ * p_base where baselink_to_imu_ = (lidar_to_baselink_ * M)^{-1} (Mapping.cpp:281-284), i.e. F_map = M^{-1} ∘ L^{-1} with L = the TF lidar→base_link extrinsic. F_map == F_est only when L is identity. In the workspace's production-style configs the YAML is deliberately identity and the whole extrinsic lives in TF (config_06042026.yaml header: "EXTRINSICS COME FROM TF, NOT q_lb/t_lb"), so every /global_map point is first mapped base_link→lidar and then splined: the accumulated map is rigidly displaced (and, for a rotated mount such as an Ouster os_lidar frame, rotated) by the full inverse mount extrinsic relative to the estimator's own world points (/current_scan, the ikd-tree map, and the traj_path/odometry poses published by this same node). The in-code comment claiming that applying q_bl/t_bl "would double-count the extrinsic" is backwards: pointBodyToWorld applies exactly q_bl/t_bl to the identically pre-transformed base_link cloud. The upstream dataset configs are unaffected only because there L is identity (extrinsic in q_lb, TF identity), which is why benchmark replays never surfaced it.
 
@@ -179,7 +196,8 @@ Mapping.cpp:319-321: `Eigen::Vector3d p_body(pt_in.x, pt_in.y, pt_in.z); Eigen::
 
 - **Location:** `resple/include/ikd-Tree/ikd_Tree.cpp:1382`
 - **Found by:** ikdtree  ·  **Finder confidence:** 0.7
-- **Verification:** _pending_
+- **Verification:** unverified by panel; CONFIRMED empirically during the fix — a first-cut variant that kept working_flag in Push_Down deadlocked/timed out the ParallelSearchPushDownRace stress test
+- **Outcome:** **FIXED (redesign)** — `Push_Down` no longer touches `working_flag_mutex` at all: search-path exclusion against flatten/swap already comes from `search_rw` shared vs unique, mutator-path exclusion from the whole-op `working_flag`; only the op-log push (own mutex, gated on the now-atomic `rebuild_flag`) remains. Validated: stress tests pass (RebuildVsMutatorRace 4x faster) and TSan-clean (0 warnings).
 
 **Description.** The Phase 2.5 #2 fix for hazard 34 removed search_rw_mutex_ from the five mutating fast paths but explicitly kept the shared lock on the search functions (Nearest_Search line 452, Box_Search 476, Radius_Search 485, flatten_safe in ikd_Tree.h:399-402). All of those call Push_Down, whose rebuild branch still does a blocking pthread_mutex_lock(&working_flag_mutex) at lines 1382 and 1436 (the Phase 2.4 comment at lines 1322-1324 says this handling was 'preserved', analyzing only the node->working_flag order, not search_rw->working_flag). The rebuild thread takes working_flag_mutex first (line 262, and holds it from line 295 through the swap) and then search_rw_mutex_ UNIQUE (lines 282 and 316). So: search thread holds search_rw shared, blocks on working_flag in Push_Down; rebuild thread holds working_flag, blocks on search_rw unique waiting for the shared holder -> permanent deadlock. This is exactly the inversion class hazard 34 fixed for the mutators, left in place on the reader side. Reachability in the default LIO config: flatten (line 1641) calls Push_Down on every node including tree_deleted ones, and each Push_Down re-creates pending need_push_down flags on the children, so flatten_safe (called from the async map-publish path, RESPLE.cpp:1142/1651/3239) descending through a lasermapFovSegment-deleted region whose interior contains the current *Rebuild_Ptr target hits the rebuild branch while the rebuild thread is between its working_flag acquisition and its search_rw-unique acquisition. FOV box deletes are precisely what trips the delete criterion and schedules background rebuilds, so the two coincide. The async lambda then hangs holding mtx_map_ unique, the IEKF worker blocks on mtx_map_ shared, and the node goes permanently silent.
 
@@ -197,7 +215,8 @@ Push_Down else-branch (search path, no working_flag held by caller): line 1381-1
 
 - **Location:** `resple/include/ikd-Tree/ikd_Tree.cpp:291`
 - **Found by:** ikdtree  ·  **Finder confidence:** 0.55
-- **Verification:** _pending_
+- **Verification:** unverified by panel; code-path re-confirmed manually
+- **Outcome:** **FIXED** — `working_flag_mutex` is now acquired on BOTH branches before the swap (the empty-rebuild path also drains stale logger ops that had no rebuilt copy to replay into, which also removes the bogus unlock-without-lock and the stuck-logger warning).
 
 **Description.** multi_thread_rebuild unlocks working_flag_mutex at line 287 after flattening, and only re-acquires it at line 295 INSIDE 'if (int(Rebuild_PCL_Storage.size()) > 0)'. If the rebuild target subtree flattens to zero live points, the subtree swap (lines 315-346: father_ptr->left/right_son_ptr write, Root_Node update, ancestor Update() walk), the 'Rebuild_Ptr = nullptr' write (347) and delete_tree_nodes(&old_root_node) (351) all execute WITHOUT working_flag_mutex. The Phase 2.5 #1 fix (hazard 35) makes mutator-vs-rebuild exclusion depend entirely on the mutators' whole-op working_flag_mutex plus the rebuild thread holding it across the father_ptr read + swap + ancestor walk — this path bypasses that entirely, and Phase 2.5 #2 removed search_rw from the mutating paths, so nothing excludes a concurrent Add_Points/Delete_Point_Boxes: it can read the stale child pointer, descend into the old subtree, and race the swap and the free (UAF), and its ancestor Update() calls race the rebuild's ancestor walk. The empty case is reachable in the default LIO config: Rebuild_Ptr requires TreeSize >= 1500 at scheduling, and lazy box deletion (lasermapFovSegment's Delete_Point_Boxes full-cover branch) marks points deleted WITHOUT reducing TreeSize and without clearing Rebuild_Ptr, so a scheduled target fully covered by subsequent FOV deletes flattens to 0 points. Additionally line 348 then unlocks a mutex this thread does not own — harmless only because Phase 2.5 made it recursive (EPERM), but it documents that the original author assumed the lock was held here.
 
@@ -215,7 +234,8 @@ Line 287 'pthread_mutex_unlock(&working_flag_mutex);' -> line 291 'if (int(Rebui
 
 - **Location:** `resple/src/RESPLE.cpp:559`
 - **Found by:** concurrency-fresh  ·  **Finder confidence:** 0.85
-- **Verification:** _pending_
+- **Verification:** unverified by panel; pattern identical to the fixed hazard 36
+- **Outcome:** **FIXED** — heartbeat reads `pc_buff.size()` under `mtx_pc`, matching the adjacent diagnostics block.
 
 **Description.** The ~2 s heartbeat block in processData() (worker thread) iterates lidars_data and reads d.pc_buff.size() with NO lock, while every sensor callback concurrently mutates the same deque under lidar_data.mtx_pc via pushScanBounded (RESPLE.cpp:1505-1514, push_back/pop_front). This is exactly the deque-internals data race class fixed as hazard 36 (Phase 2.6, commit 80d9980 'two data-path races found by live TSan sweep') — that commit fixed the drain loop's unlocked empty() check in the SAME function (RESPLE.cpp:590-596) and the diagnostic cache block ten lines above the heartbeat correctly takes mtx_pc for the identical read (RESPLE.cpp:543-546, comment: 'pc_buff is callback-written -> read under mtx_pc'), but the heartbeat read (added earlier, commit 181800d) was missed. The block's own comment ('Diagnostic only — read-only, no lock-order interactions') is wrong: a lock-free size() read racing a locked push_back is still UB. This makes the hazard-36 fix incomplete, which the task brief explicitly flags as a valid finding.
 
@@ -246,7 +266,8 @@ Sensor callbacks run on the executor's sensor_cb_group thread; the heartbeat run
 
 - **Location:** `resple/src/RESPLE.cpp:2142`
 - **Found by:** imu-path  ·  **Finder confidence:** 0.75
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (2/2)
+- **Outcome:** **FIXED** — the centripetal correction is expressed in the message's unit (divided by 9.81 when `acc_ratio`), so the worker's later 9.81x scaling reproduces the correct metric value.
 
 **Description.** transformImu() runs in getImuCallback on the RAW IMU message, before the acc_ratio g-to-m/s^2 scaling that the worker applies when draining the staging buffer. It subtracts the centripetal term omega x (omega x r), which is intrinsically in m/s^2 (rad/s and meters), from an accelerometer vector that is still in g-units when acc_ratio=true. The worker then multiplies the whole transformed vector by 9.81 (RESPLE.cpp:643 'if (acc_ratio) acc *= 9.81;'), so the fused accel becomes 9.81*R*a - 9.81*omega x (omega x r) instead of 9.81*R*a - omega x (omega x r): the lever-arm correction is inflated 9.81x. Every acc_ratio=true LIO config (config_helmdyn01/tudorun01/rcampus/rug_bb/demonstrator/heap_testsite, i.e. Livox built-in IMUs) hits this whenever a TF from the IMU frame to base_link exists (updateImuTransform succeeds). The production Ouster config (acc_ratio=false) is unaffected.
 
@@ -264,7 +285,8 @@ RESPLE.cpp:2142-2143: 'Eigen::Vector3d lin_accel_transformed = transform_eigen.r
 
 - **Location:** `resple/src/RESPLE.cpp:2877`
 - **Found by:** node-logic, concurrency-fresh  ·  **Finder confidence:** 0.72
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (3/3)
+- **Outcome:** **FIXED** — reset in the lifecycle cleanup block alongside the other worker state (plus the new LO-wait and IMU-frame-id state).
 
 **Description.** publishPoseAndTf() dedups by `if (pose_time_ns <= last_pose_pub_time_ns_) return;`. The member (line 2869) is initialized once and is the ONLY publish-path state not reset in on_cleanup: lines 386-407 reset knot_rot_checked_, if_init_filter/if_init_map, all one-shot log flags, etc., showing the code explicitly supports deactivate→cleanup→configure→activate re-cycles (hazards 17/18 were fixed for exactly this path). After a re-cycle where the new run's sensor timestamps are not strictly greater than the previous run's last published spline time — the standard bag-replay workflow this repo's CLAUDE.md prescribes ('replaying recorded production bags'), a looped bag, or a sim-time reset — every pose_time_ns is <= the stale last_pose_pub_time_ns_, so pub_pose, pub_pose_cov, pub_odom and the odom→base_link TF broadcast are all skipped for the entire overlap. The node looks alive (est_window, diagnostics, current_scan all publish) but produces no odometry.
 
@@ -282,7 +304,8 @@ Line 2869: `int64_t last_pose_pub_time_ns_ = std::numeric_limits<int64_t>::min()
 
 - **Location:** `resple/include/utils/geometry_core.h:67`
 - **Found by:** association  ·  **Finder confidence:** 0.7
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (2/2)
+- **Outcome:** **FIXED** — accumulation and solve now run in double regardless of the instantiation type (allocation-free; `min_cond_ratio` pivot semantics unchanged).
 
 **Description.** esti_plane (Association.h:142 calls it with T=float, pabcd is Vector4f) now delegates to resple::geom::fitPlane, which forms the 3x3 normal-equation matrix ATA = sum(p p^T) in float32 and solves it with colPivHouseholderQr. The vendor-point upstream and FAST-LIO both solve the 5x3 system A n = -1 directly with colPivHouseholderQr on A. Normal equations square the condition number; the rows are UNCENTERED world-frame coordinates, so cond(A) ~ |position|/patch_extent grows with distance from the odom origin, and cond(ATA) grows with its square. In float32 (eps ~ 1.2e-7) this destroys the solve for trajectories a few hundred meters from the start. Monte-Carlo verification (5-point patches, 0.5 m extent, 1 cm noise, float32 both ways): at 300 m median normal error 3.05 deg (QR: 1.45 deg), p95 20.5 deg; at 600 m 17% of fits fail the 0.1 m residual check outright and median error is 11.5 deg; at 1 km 61% rejected, 27.6 deg median. Accepted-but-wrong normals directly corrupt zp and the H row in prepLiDAR; rejected fits starve the IEKF of correspondences exactly at long range. cube_len=1000 in the shipping config indicates km-scale operation is in scope. The comment claiming behaviour is "bit-for-bit identical to the previous inline normal-equation fit" is true only relative to the intermediate commit 0600aad, which itself introduced this regression away from the vendor-point QR.
 
@@ -300,7 +323,8 @@ geometry_core.h:61-70: `Eigen::Matrix<T, 3, 3> ATA = ...Zero(); ... ATA.noalias(
 
 - **Location:** `resple/src/Mapping.cpp:193`
 - **Found by:** mapping-node  ·  **Finder confidence:** 0.7
-- **Verification:** _pending_
+- **Verification:** unverified by panel; VoxelGrid reorder/centroid-averaging re-confirmed manually
+- **Outcome:** **FIXED** — scan end is now the MAX per-point time offset, cached per scan header stamp.
 
 **Description.** Every sensor callback buffers pc_last_ds, the output of pcl::VoxelGrid (ds_filter_each_scan.filter(*pc_last_ds)). VoxelGrid emits one centroid per occupied voxel in ascending leaf-index (spatial) order and, with default downsample_all_data, averages the intensity field (which here encodes per-point relative time in ms). So `front.points.back().intensity` is the mean time of an arbitrary spatial corner voxel — a value anywhere in [0, scan_period], not the scan end. The §6.3 deskew-lag mechanism (be99a7e/fb069df) is built on this: the gate `t_end_ns > spl->maxTimeNs() - lag_ns` is supposed to guarantee the spline edge is deskew_lag_knots (default 8, 80 ms at knot_hz 100) past the scan's END, but with a bogus t_end the true tail can extend up to a full scan period (100 ms for the OS1 at 10 Hz) past the assumed end. Consequences: (a) the lag guarantee is void — tail points are still deskewed with under-converged trailing-edge knots, the exact smear §6.3 set out to fix; (b) tail points whose true t_ns lands beyond spl->maxTimeNs() are silently discarded by transformCloud's window check (line 343), carving time-varying slices out of the published map; (c) the dropped-as-old test (t_end_ns < minTimeNs, line 196) can misclassify. Upstream has the same expression (refs/upstream_Mapping.cpp:47), but upstream only used it as a coarse in-window test; the local lag feature turned it into a correctness-bearing quantity.
 
@@ -318,7 +342,8 @@ Mapping.cpp:193-194: `const int64_t t_end_ns = front.header.stamp + int64_t(fron
 
 - **Location:** `resple/include/ikd-Tree/ikd_Tree.cpp:1661`
 - **Found by:** ikdtree  ·  **Finder confidence:** 0.7
-- **Verification:** _pending_
+- **Verification:** unverified by panel; zero call sites for acquire_removed_points re-confirmed
+- **Outcome:** **FIXED** — both rebuild flattens record with `NOT_RECORD`; live-point collection unaffected, `acquire_removed_points` API retained.
 
 **Description.** flatten() records every lazily-deleted, non-downsample point into member vectors: DELETE_POINTS_REC -> Points_deleted (line 1655, from every inline Rebuild() at line 854) and MULTI_THREAD_REC -> Multithread_Points_deleted (line 1661, from every background rebuild at line 284). The only code that ever clears these vectors is acquire_removed_points (lines 754-769), which has no caller anywhere in the RESPLE workspace (grep over resple/src and resple/include: zero call sites). Delete_Storage_Disabled is set in the destructor (line 42) but never read, so it gates nothing. In the default LIO config, lasermapFovSegment's Delete_Point_Boxes (RESPLE.cpp:3395/3444) lazily deletes every map point that scrolls out of the local cube with is_downsample=false, so point_downsample_deleted stays false and each such point is appended to these vectors when a rebuild later sweeps its subtree. On a long mission the vectors accumulate essentially every point ever dropped from the local map (tens of bytes each, millions of points) — a monotonic memory leak in a node that is expected to run for hours. This is inherited from the vendor point but is not in the 38-hazard list, and the Phase 5 LeakSanitizer gate cannot see it (the memory is still reachable).
 
@@ -336,7 +361,8 @@ flatten lines 1652-1662: 'case DELETE_POINTS_REC: if (root->point_deleted && !ro
 
 - **Location:** `doc/PARAMETERS.md:93`
 - **Found by:** config-units  ·  **Finder confidence:** 0.7
-- **Verification:** _pending_
+- **Verification:** unverified by panel; direction re-derived from common_utils.h:336-337
+- **Outcome:** **FIXED (docs)** — PARAMETERS.md now states the body→LiDAR convention with the exact formula and a warning not to supply the LiDAR-pose-in-body.
 
 **Description.** PARAMETERS.md line 93 documents '<name>/q_lb, <name>/t_lb | LiDAR->body extrinsics', and config_pointcloud2.yaml:36 says 'lidar->body extrinsic rotation'. The code's actual convention is the opposite: Mapping.cpp:281-282 builds 'Eigen::Affine3d imu_to_lidar = Translation3d(lidar.t_lb) * lidar.q_lb' (i.e. (q_lb,t_lb) maps IMU/body coords into the lidar frame), and the upstream dataset values confirm it — config_helmdyn01.yaml t_lb [0.011, 0.02329, -0.04412] is exactly the Livox Mid-360 datasheet position of the built-in IMU expressed in the LIDAR/point-cloud frame. common_utils.h:336-337 accordingly inverts it (q_bl = q_lb.inverse(); t_bl = q_lb.inverse()*(-t_lb)) to get lidar->body. A user of the generic PointCloud2 template who follows the written 'lidar->body' direction with a non-trivially-rotated sensor will feed the estimator the inverse extrinsic; for a 90-deg mount that is a 180-deg total error relative to intent. (For the identity extrinsics in the production config this is latent.)
 
@@ -354,7 +380,8 @@ PARAMETERS.md:93 '| `<name>/q_lb`, `<name>/t_lb` | — | LiDAR->body extrinsics 
 
 - **Location:** `resple/include/SplineState.h:239`
 - **Found by:** mapping-node  ·  **Finder confidence:** 0.65
-- **Verification:** _pending_
+- **Verification:** unverified by panel
+- **Outcome:** **FIXED** — mid-run gaps are padded with constant-pose knots so the window lands at its true absolute indices; the error stays bounded to the lost span instead of permanently shifting the replica's time axis. (Startup-origin case intentionally unchanged.)
 
 **Description.** When a window arrives with target = i + other->start_i - num_knots_pruned_ > num_knot (an est_window gap), updateKnots logs and then addOneStateKnot()s anyway, placing absolute knot `target` at local index `num_knot`. Since knot time = start_t_ns + local_index*dt, every knot from then on carries a timestamp gap*dt EARLIER than its true time. The num_knot==0 branch (lines 221-227) declares this "startup origin; expected after (re)start" — but the misalignment is identical: windows published between RESPLE's start_time and the Mapping worker consuming start_pending_ are dropped by design (getEstCallback returns while !if_init_succeed, Mapping.cpp:1323; the worker sleeps up to 100 ms before consuming the staged start, Mapping.cpp:1183-1186), so the first applied window begins at start_idx > 0 and the whole replica runs a few knots (tens of ms) early — a permanent stamp-vs-pose offset in traj_path, /odometry, the map→odom TF pairing, and the deskew. The severe case: a Mapping-only restart mid-run. start_time is transient_local, so startCallBack re-stages with the ORIGINAL bag start (Mapping.cpp:1109 init(1, 0, start_bag_time_pending_, 0)), and the first applied window has start_idx ≈ current totalKnots — the replica's maxTimeNs() is then behind wall time by gap*dt forever (each window only appends ~1 knot), so processScan's gate `t_end_ns > maxTimeNs() - lag_ns` never releases another scan (map silently freezes) and path/odom interpolate poses at times shifted by the entire pre-restart duration. The gap COUNTER (ffac28c) detects but never corrects; the message already carries dt/start_idx/start_t, so resynchronization is trivially possible.
 
@@ -372,7 +399,8 @@ SplineState.h:219-239: `if (target > num_knot) { update_gap_events_++; if (num_k
 
 - **Location:** `resple/src/RESPLE.cpp:2007`
 - **Found by:** imu-path  ·  **Finder confidence:** 0.6
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (2/2; inherited from upstream)
+- **Outcome:** **FIXED** — `Q.block<6,6>(18,18)` gets `Q_block_new` as the param names intend; the bias rows keep their pre-fix magnitude via new explicit params `cov_bias_acc_rw`/`cov_bias_gyro_rw` (defaults preserve LIO bias dynamics).
 
 **Description.** initFilter builds the process-noise matrix Q as 30x30 and writes Q_block_old to blocks (0,0),(6,6),(12,12) and Q_block_new to bottomRightCorner<6,6>() -- which on a 30x30 matrix is rows/cols 24-29, the accel/gyro BIAS block, not rows/cols 18-23 where the newest RCP lives (proven by a_mat: Estimator.h:149-151 sets the new-knot extrapolation rows at block row 18). Consequences: (1) in LIO the newest control point receives zero additive process noise while the IMU biases receive a random walk of cov_RCP_pos_new*cov_sys_pos (position units!) on ba and cov_RCP_ort_new*cov_sys_ort on bg at every knot step (~100 Hz), which is not any documented bias model and lets the estimated biases wander with pose-tuned magnitudes; (2) in LO, setState receives Q.topLeftCorner<24,24>() so Q_block_new vanishes entirely -- the cov_RCP_pos_new/cov_RCP_ort_new parameters that every shipped LO config sets to 1.0 are dead. The 'old'/'new' param naming and the LO dead-parameter effect show the intended target was block (18,18) (bottomRightCorner of the original 24x24 layout).
 
@@ -390,7 +418,8 @@ RESPLE.cpp:1997 'Eigen::Matrix<double, 30, 30> Q = ...Zero();' then 2004-2007: '
 
 - **Location:** `resple/src/RESPLE.cpp:2220`
 - **Found by:** imu-path  ·  **Finder confidence:** 0.6
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (2/2)
+- **Outcome:** **FIXED** — `initialization()` rotates the gravity mean by the base←IMU rotation when the TF is resolvable (frame id captured from the first sample); no-op in YAML-only mode, matching upstream.
 
 **Description.** Pre-init, getImuCallback buffers RAW IMU samples ('if (!init_done) { imu_int_buff.push_back(imu_msg); return; }') on the justification that gravity direction is frame-independent -- which is false when R_base_imu is not identity: the accelerometer measures gravity in the IMU frame, and g2R alignment of that vector yields q_W_IMU, but initFilter (line 3163) installs it as the spline's base_link orientation q_W_B. The initial roll/pitch is therefore wrong by the base_link<-imu mounting rotation, the first map seed is tilted by that amount, and the first post-init IMU measurements consumed by the IEKF are also still raw IMU-frame samples (staged pre-init, drained after the flag flip). In LIO the filter can only slew the tilt out via accel residuals, but updateLiDARInertial gates any per-axis accel residual above 10 m/s^2 (Estimator.h:847) -- a mounting rotation of ~60 degrees or more (e.g. a 90-degree or inverted mount) produces residuals ~sqrt(2)*9.81 that are permanently zeroed, so the tilt is never corrected and the map stays misaligned with gravity. In LO mode there is no correction mechanism at all: the 'ensures the spline starts gravity-aligned (z = up)' goal of the always-use-IMU init (line 3058) silently fails by the mounting rotation.
 
@@ -408,7 +437,8 @@ RESPLE.cpp:2217-2222: '// Pre-init: accept raw IMU for gravity alignment. Gravit
 
 - **Location:** `resple/include/ikd-Tree/ikd_Tree.cpp:1361`
 - **Found by:** ikdtree  ·  **Finder confidence:** 0.6
-- **Verification:** _pending_
+- **Verification:** unverified by panel
+- **Outcome:** **FIXED** — `Rebuild_Ptr` is `std::atomic`, all dereferences load once into a snapshot, and the rebuild thread clears it INSIDE the `search_rw` unique block so searchers cannot observe a stale target across the swap.
 
 **Description.** Push_Down decides its rebuild branch with 'if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != child)' (lines 1361 and 1415). When called from the search path (Search/Search_by_range/Search_by_radius/flatten via Nearest_Search/Box_Search/Radius_Search/flatten_safe), the thread holds only search_rw_mutex_ shared — not working_flag_mutex. The rebuild thread writes 'Rebuild_Ptr = nullptr' at line 347 AFTER its search_rw unique block closes at 346 (holding only working_flag_mutex), and mutators write 'Rebuild_Ptr = root' in Rebuild() at line 844 under working_flag_mutex only. Rebuild_Ptr is a plain KD_TREE_NODE** (ikd_Tree.h:322), so this is a C++ data race (UB, TSan-reportable), and because the two loads in the short-circuit expression are unsynchronized the compiler may legally reload Rebuild_Ptr between the null check and the '*Rebuild_Ptr' dereference — a concurrent 'Rebuild_Ptr = nullptr' then yields a null-pointer dereference in the IEKF's OpenMP Nearest_Search or in the map-publish flatten_safe. The Phase 2.4 hardening made the KD_TREE_NODE flag fields atomic specifically to make search-side lock-free reads defined behaviour, but left this shared pointer non-atomic with the same lock-free readers. (tree_range/validnum/root_alpha at lines 115/155/180 have the same racy pattern but are currently uncalled.)
 
@@ -426,7 +456,8 @@ Line 1361 'if (Rebuild_Ptr == nullptr || *Rebuild_Ptr != child)' executed with o
 
 - **Location:** `resple/include/utils/point_cloud_adapter.h:212`
 - **Found by:** config-units  ·  **Finder confidence:** 0.6
-- **Verification:** _pending_
+- **Verification:** unverified by panel
+- **Outcome:** **FIXED** — `auto` now magnitude-sniffs up to 64 points and classifies absolute-epoch ns/us/ms/s stamps regardless of datatype; relative offsets keep the datatype convention.
 
 **Description.** timeUnitToMs Auto assumes 'Float fields are conventionally seconds; integer fields nanoseconds' (line 212), and the AdapterConfig comment (lines 143-145) claims absolute-epoch 'Livox int64 ns' is handled. But the Livox ROS2 driver's PointCloud2 output stores per-point absolute time as a FLOAT64 field named 'timestamp' holding NANOSECONDS — exactly the convention this repo's own livox_mid360_boxi::Point uses (common_utils.h:95 'double timestamp', consumed as ns at RESPLE.cpp:2841 'rclcpp::Time(static_cast<int64_t>(...timestamp))'). Through the generic path with the default time_unit: auto, FLOAT64 -> scale 1.0e3 (seconds->ms), so after min-normalization the per-point offsets are ns*1e3 'ms' = 1e9x too large. The first scan is accepted (offsets pass >=0 and the last_t_ns gate), but genericLidarCallback then stores last_t_ns = time_begin + max_ofs_ns where max_ofs_ns = ms2ns(offset) ~ 1e17 ns (~3 years in the future) (RESPLE.cpp:2538-2551). Every later scan fails 'ofs + time_begin > last_t_ns' for all points and is dropped entirely — the estimator consumes exactly one scan and then starves, silently.
 
@@ -444,7 +475,8 @@ point_cloud_adapter.h:212 'return (datatype == FLOAT32 || datatype == FLOAT64) ?
 
 - **Location:** `doc/PARAMETERS.md:81`
 - **Found by:** config-units  ·  **Finder confidence:** 0.9
-- **Verification:** _pending_
+- **Verification:** unverified by panel; code default re-confirmed
+- **Outcome:** **FIXED (docs)** — corrected to `[0.2, 0.2, 0.2, 0.1, 0.1, 0.1]`.
 
 **Description.** PARAMETERS.md line 81 states '| `cov_pose`, `cov_twist` | `[0.1 x6]` | Diagonals for the Mapping node's odometry covariance |'. The actual code defaults are {0.2, 0.2, 0.2, 0.1, 0.1, 0.1} in both nodes (RESPLE.cpp:1968 for cov_pose, Mapping.cpp:921 and :924 for cov_pose/cov_twist). A user omitting the parameters (the doc says 'Every parameter is optional — omitting it keeps the listed default') gets 2x the documented translation variances published downstream.
 
@@ -462,7 +494,8 @@ RESPLE.cpp:1968 'readParam<std::vector<double>>(..., "cov_pose", {0.2, 0.2, 0.2,
 
 - **Location:** `resple/include/Estimator.h:877`
 - **Found by:** spline-math  ·  **Finder confidence:** 0.7
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (refute lens)
+- **Outcome:** **FIXED** — `update()` counts only rows with a nonzero H row or innovation toward `last_nis_dof_`.
 
 **Description.** update() sets `last_nis_dof_ = num_pts` where num_pts = innov.rows(). But rows in H_buf_/innv_buf_ are pre-zeroed and remain zero for (a) LiDAR points failing the accept gate `abs(zp) < pt_thresh || lid_cov < var_pt*cov_thresh` (Estimator.h:760-767, 817-825 — the row slot is still consumed via idx_offset++), and (b) IMU axes clamped by the 10 m/s^2 / 5 rad/s outlier check (lines 846-857, innovation and H row zeroed). A zero row contributes exactly 0 to NIS = nu^T S^-1 nu but still counts 1 toward dof, so for a consistent filter E[NIS/dof] = accepted_rows/total_rows < 1 rather than 1. The NisDivergenceDetector thresholds (warn_ratio=2.0, diverged_ratio=4.0 on the windowed mean of NIS/dof, filter_health.h:42-45, 72) are calibrated to 'consistent filter expects ~1.0', so the reject fraction directly dilutes detection sensitivity — and the dilution grows in degraded scenes (more rejects) where detection matters most. The published dmsg.nis_dof (RESPLE.cpp:1205/1209) is likewise inflated. The overconfident-divergence case (small lid_cov lets large-zp rows through) still triggers, so this degrades rather than disables the detector.
 
@@ -480,7 +513,8 @@ Estimator.h:874-877: `int num_pts = innov.rows(); ... last_nis_dof_ = num_pts;`.
 
 - **Location:** `resple/src/MapSaving.cpp:78`
 - **Found by:** concurrency-fresh, mapping-node, recent-commits  ·  **Finder confidence:** 0.7
-- **Verification:** _pending_
+- **Verification:** unverified by panel
+- **Outcome:** **FIXED** — empty-map guard + try/catch around the save (and around the subscription's fromROSMsg); failures log instead of terminating the node.
 
 **Description.** savePCDCallback calls pcl::io::savePCDFileBinary(pcd_save_path, map_copy) with no try/catch. PCDWriter::writeBinary throws pcl::IOException when the output file cannot be opened (nonexistent directory, read-only filesystem — an ordinary parameter misconfiguration, since pcd_save_path is a free-form parameter defaulting to /tmp/global_map.pcd). rclcpp does not catch user-callback exceptions; the throw propagates out of rclcpp::spin() in main() (line 87, also unguarded) to std::terminate -> SIGABRT with no useful log. This directly violates the package's own hardening convention (hazards 14/24: every callback body wrapped in try/catch precisely because an escaping exception terminates the executor), so 'kept verbatim' does not exempt it: the whole point of vendoring it into this hardened package was crash discipline. globalMapCallback's pcl::fromROSMsg (line 65) is similarly unguarded against a malformed /global_map message.
 
@@ -508,7 +542,8 @@ No try/catch anywhere in MapSaving.cpp (unlike every RESPLE/Mapping callback, e.
 
 - **Location:** `resple/src/RESPLE.cpp:3105`
 - **Found by:** node-logic  ·  **Finder confidence:** 0.65
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (refute lens)
+- **Outcome:** **FIXED** — pre-init staging capped at max(4x window, 400) samples drop-oldest, bounding both memory and the per-attempt scan cost.
 
 **Description.** While gravity alignment fails the variance check (robot never stationary, imu_init_max_variance too low), initialization() returns false at line 3132 WITHOUT trimming imu_buff — the only trim (line 3141, pop < start_t_ns) runs after the variance check passes. Meanwhile every worker cycle drains the (capped) imu_int_buff staging into the uncapped imu_buff (lines 632-648), and the best-window search (lines 3105-3121) rescans ALL buff_size-n_imu+1 windows, each summing n_imu=50 samples, i.e. ~50 x buff_size operations 20 times per second. At 100 Hz IMU the cost grows linearly forever (60 min stuck: ~360k samples, ~18M ops per 50 ms iteration, plus ~30 MB/h of ImuData); the §2.3 'bounded input buffers' fix (hazard 5) capped imu_int_buff (max_imu_staging) but not this downstream deque, so the unbounded-buffer hazard survives on the blocked-init path in both LO and LIO modes.
 
@@ -526,7 +561,8 @@ Line 3105-3121: `for (int w = 0; w < n_windows; ++w) { ... for (int i = 0; i < n
 
 - **Location:** `resple/include/SplineState.h:163`
 - **Found by:** iekf, association, numerics  ·  **Finder confidence:** 0.6
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (refute lens; benign today — all callers feed zero deltas)
+- **Outcome:** **FIXED** — `setIdles` now chains under the same 'delta arriving at knot j-3' convention as pruneFrontKnots/prepareInterpolation, and knot 0's quaternion chains from its own `ort_delta[0]`. Identical behaviour for zero deltas.
 
 **Description.** The Phase 3.1 pruning code defines the idle-slot convention explicitly (comment at SplineState.h:248-253 and the pruneFrontKnots slide at 274-285): q_idle[j]/t_idle[j] hold the pose of knot j-3 and ort_delta_idle[j] holds the delta ARRIVING at it (q_{j-3} = q_{j-4} * exp(ort_delta_idle[j])). prepareInterpolation/itpPose read the idles under exactly this convention (cps[i] = knots_idle[i+idx_l+1] with cp0 = q_idle[idx_r-1] as the pre-window quaternion), and the bit-identity prune tests confirm it. setIdles, however, chains with the delta of the slot being set, one index off: setIdles(1) computes q_idle[2] = q_idle[1] * exp(ort_delta_idle[1]) — under the arriving convention it should be exp(ort_delta_idle[2]) — and setIdles(2) overwrites q_knots[0] = q_idle[2] * exp(ort_delta_idle[2]) instead of exp(ort_delta[0]) (knot 0's own arriving delta). setIdles is the receiver-side reconstruction path: Mapping::getEstCallback (Mapping.cpp:1344-1349) rebuilds the window spline's idles from getSplineMsg's raw ort_delta_idle publication, and updateKnots then copies q_idle/ort_delta_idle wholesale into the active spline when `num_knots_pruned_ == 0 && num_knot <= num_knots_other` (SplineState.h:201-205). Today this is benign because that guard restricts the copy to receiver startup, when the sender is also fresh and all idle deltas are zero (both conventions coincide at zero); a pruned sender (nonzero published idles) meeting a fresh receiver only happens in the Mapping-restart-against-running-RESPLE scenario, which is already acknowledged-degraded (updateKnots gap log). But the moment that guard is relaxed, the handshake is fixed, or any new caller feeds setIdles nonzero deltas, the receiver's q_idle chain — and hence orientation interpolation over the first two knot intervals — is silently wrong by one knot's rotation increment. This is a semantic-drift trap created by the pruning feature giving previously-always-zero fields a live meaning.
 
@@ -544,7 +580,8 @@ SplineState.h:158-168: `if (idx == 2) { ... q_knots[0] = q_idle[2] * q_del; } el
 
 - **Location:** `resple/src/RESPLE.cpp:2062`
 - **Found by:** association  ·  **Finder confidence:** 0.6
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (refute lens)
+- **Outcome:** **FIXED** — transform state (TF, latch flags, sensor origin, fallback deadline) moved into `LidarConfig`, per sensor.
 
 **Description.** updateLidarTransform(source_frame_id) caches one Eigen transform (lidar_to_baselink_) guarded by one boolean (have_lidar_transform_). After the first sensor frame resolves, every subsequent call — including from a different LiDAR's callback with a different source_frame_id — returns true without a lookup, and all callbacks use the same lidar_to_baselink_ in pcl::transformPointCloud. sensor_origin_body (used for the point-to-plane range gate `range_sensor > 81*pd2*pd2` and the near-range noise inflation) is likewise set for ALL configured lidars from that single translation (RESPLE.cpp:2081-2083). In the supported multi-LiDAR modes (MLO/MLIO, e.g. the two-sensor heap_testsite config) with TF-based extrinsics, the second sensor's points are transformed with the first sensor's mount transform and its range gate uses the wrong origin.
 
@@ -562,7 +599,8 @@ RESPLE.cpp:2060-2100: `bool updateLidarTransform(std::string source_frame_id) { 
 
 - **Location:** `resple/include/utils/point_cloud_ingest.h:90`
 - **Found by:** config-units  ·  **Finder confidence:** 0.55
-- **Verification:** _pending_
+- **Verification:** unverified by panel
+- **Outcome:** **FIXED** — organized clouds with padded rows are densely repacked before conversion (with a row_step bounds check).
 
 **Description.** ingestPointCloud2 computes num_points = msg.width * msg.height and convertCloud indexes the blob as data + i * point_step (point_cloud_adapter.h:255), never consulting msg.row_step. For an organized cloud (height > 1) whose driver pads rows (row_step > width * point_step), every point after the first row is read at the wrong offset, yielding garbage xyz/time that flow into the estimator (non-finite values are filtered at RESPLE.cpp:2535, but finite-garbage values are not). The size guard at point_cloud_adapter.h:236-237 (num_points * point_step > data_size) does not reject this case because data_size = height * row_step is larger. pcl::fromROSMsg (used by all other callbacks) handles row_step correctly, so only the generic path is affected.
 
@@ -580,7 +618,8 @@ point_cloud_ingest.h:90 'const uint32_t num_points = msg.width * msg.height;' th
 
 - **Location:** `resple/src/RESPLE.cpp:1725`
 - **Found by:** config-units  ·  **Finder confidence:** 0.55
-- **Verification:** _pending_
+- **Verification:** unverified by panel
+- **Outcome:** **FIXED** — non-positive `ds_scan_voxel`/`ds_lm_voxel`/`nn_thresh` fall back to the canonical values (0.2 m / 0.2 m / 0.5 m) with a loud warning.
 
 **Description.** PARAMETERS.md asserts 'Every parameter is optional — omitting it keeps the listed default, and the defaults reproduce the estimator's historical behaviour', but ds_scan_voxel (RESPLE.cpp:1717) and nn_thresh (RESPLE.cpp:1725) default to 0.0. With nn_thresh=0, the IEKF acceptance test 'abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh' (Estimator.h:760, 817) loses its primary branch entirely — acceptance then depends only on the covariance branch with coeff_cov's default 10, silently changing which residuals update the filter. With ds_scan_voxel=0, setLeafSize(0,0,0) makes pcl::VoxelGrid degenerate (PCL emits 'Leaf size is too small' and passes the cloud through unfiltered), silently changing point density and runtime. Both cases emit only a soft 'outside recommended range' WARN and continue. The listed defaults column for these params in PARAMETERS.md is '—', contradicting the header claim.
 
@@ -598,7 +637,8 @@ RESPLE.cpp:1725 'param.nn_thresh = CommonUtils::readParam<double>(..., "nn_thres
 
 - **Location:** `resple/include/Estimator.h:574`
 - **Found by:** concurrency-fresh  ·  **Finder confidence:** 0.55
-- **Verification:** _pending_
+- **Verification:** unverified by panel
+- **Outcome:** **FIXED** — `setState()` zeroes the inflation accumulator, projectors, persistence counter and mask.
 
 **Description.** loc_gate_cov_infl_ (and loc_gate_persist_ctr_, loc_gate_update_count_, loc_gate_VVt_infl_) are only ever decayed/grown by accumGateInflation() and are not touched by setState() (the comment at line 542-543 documents that deliberately only for cov_reset_, but the accumulators fall under the same omission). On a lifecycle re-cycle (deactivate->cleanup->configure->activate) initFilter() -> setState() rebuilds the spline and covariance from scratch, yet publishPoseAndTf immediately adds the stale loc_gate_cov_infl_ from the previous run to the new run's outgoing /odom translation covariance (RESPLE.cpp:2902-2904). With loc_gate_cov_rate enabled and the previous run ending in a degenerate stretch (steady state rate/(1-decay), e.g. the documented tunnel scenario), the new, healthy run reports metres-scale translation variance to the downstream EKF for the first ~100+ frames until the 0.99/frame leak drains it — misweighting fusion exactly when the operator restarted to recover. Only reachable when loc_gate_cov_rate > 0 (default off), hence low severity.
 
@@ -620,7 +660,8 @@ No reset on the re-activate path: on_cleanup (RESPLE.cpp:378-445) touches no est
 
 - **Location:** `resple/src/RESPLE.cpp:3070`
 - **Found by:** imu-path  ·  **Finder confidence:** 0.5
-- **Verification:** _pending_
+- **Verification:** CONFIRMED (refute lens)
+- **Outcome:** **FIXED** — LO waits `lo_imu_wait_timeout` (default 10 s) for IMU, then initializes with identity orientation (upstream behaviour) and a warning; LIO still requires IMU.
 
 **Description.** The workspace-local change 'Always use IMU for gravity alignment, even in LO mode' (line 3058) removed upstream's 'if (!if_lidar_only)' guard around the IMU-based init. initialization() now unconditionally returns false until imu_init_num_samples_ (>=10, default 50) IMU samples arrive AND a window passes the variance check. A LiDAR-only bag or sensor rig with no IMU topic -- the primary use case LO mode exists for -- never initializes: the node spins forever emitting the throttled 'Waiting for 50 IMU samples' warning, publishing nothing. Upstream initialized LO with identity orientation immediately (upstream_RESPLE.cpp:626-647 runs the gravity block only when !if_lidar_only).
 

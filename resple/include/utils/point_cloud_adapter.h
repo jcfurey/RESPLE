@@ -239,8 +239,33 @@ inline bool convertCloud(const uint8_t* data, size_t data_size,
   }
   out.resize(num_points);
 
-  const double t_scale =
+  double t_scale =
       layout.has_time ? timeUnitToMs(cfg.time_unit, layout.time.datatype) : 0.0;
+  // Auto refinement by magnitude (bug-hunt 2026-07-02 finding #23): the
+  // datatype convention alone (float=seconds, int=nanoseconds) misreads
+  // float64 NANOSECOND stamps (e.g. livox_ros_driver2's 'timestamp') as
+  // seconds — a 1e9x deskew-time error. Absolute-epoch stamps are cleanly
+  // separable by magnitude (2026 epoch: ~1.7e18 ns / ~1.7e15 us / ~1.7e12 ms /
+  // ~1.7e9 s), far above any RELATIVE per-point offset (< ~5e8 even for a
+  // 0.5 s scan in ns). Relative offsets keep the datatype convention.
+  if (layout.has_time && cfg.time_unit == TimeUnit::Auto && num_points > 0) {
+    double v_max = 0.0;
+    const uint32_t n_probe = num_points < 64u ? num_points : 64u;
+    for (uint32_t i = 0; i < n_probe; ++i) {
+      const uint8_t* pp = data + static_cast<size_t>(i) * point_step;
+      v_max = std::max(v_max,
+                       std::abs(readFieldAsDouble(pp, layout.time, is_bigendian)));
+    }
+    if (v_max > 1e17) {
+      t_scale = 1.0e-6;  // absolute epoch, nanoseconds
+    } else if (v_max > 1e14) {
+      t_scale = 1.0e-3;  // absolute epoch, microseconds
+    } else if (v_max > 1e11) {
+      t_scale = 1.0;     // absolute epoch, milliseconds
+    } else if (v_max > 5e8) {
+      t_scale = 1.0e3;   // absolute epoch, seconds
+    }
+  }
 
   // Keep per-point time in DOUBLE milliseconds until after normalization: an
   // absolute-epoch field (e.g. ~1.7e12 ms) overflows float32's ~7 significant

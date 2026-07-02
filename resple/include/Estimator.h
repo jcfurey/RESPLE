@@ -148,11 +148,23 @@ class Estimator
         a_mat.block(12, 18, 6, 6) = matblock;
         a_mat.block(18, 0, 3, 3) = - Eigen::Matrix3d::Identity();
         a_mat.block(18, 12, 3, 3) = 2 * Eigen::Matrix3d::Identity();
-        a_mat.block(21, 9, 3, 3) = Eigen::Matrix3d::Identity();   
+        a_mat.block(21, 9, 3, 3) = Eigen::Matrix3d::Identity();
         if constexpr (XSIZE == 30) {
             a_mat.block(BA_OFFSET, BA_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();
-            a_mat.block(BG_OFFSET, BG_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();    
+            a_mat.block(BG_OFFSET, BG_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();
         }
+        // A (re)initialized filter must not inherit the previous run's
+        // degenerate-direction state: a stale loc_gate_cov_infl_ would keep
+        // inflating the published covariance of a fresh, healthy filter until
+        // the leaky integrator drains it.
+        loc_gate_cov_infl_.setZero();
+        loc_gate_VVt_infl_.setZero();
+        loc_gate_VVt_.setZero();
+        loc_gate_persist_ctr_ = 0;
+        loc_gate_infl_axes_ = 0;
+        loc_gate_axes_ = 0;
+        loc_gate_armed_ = false;
+        loc_gate_mask_.resize(0);
     }
 
     Eigen::Matrix<double, XSIZE, 1> getState()
@@ -874,7 +886,17 @@ class Estimator
         int num_pts = innov.rows();
         // Pessimistic default: any early (failure) exit leaves NIS = NaN so the
         // divergence detector counts the skipped update as a breach.
-        last_nis_dof_ = num_pts;
+        // dof counts only rows carrying information: the assemblers emit
+        // all-zero rows for gate-rejected points and outlier-clamped IMU axes
+        // (H row and innovation both zeroed). Those rows contribute 0 to the
+        // NIS sum, so counting them in dof deflates NIS/dof and desensitizes
+        // the §3.3 divergence detector exactly when many measurements are
+        // being rejected.
+        int dof = 0;
+        for (int i = 0; i < num_pts; i++) {
+            if (innov(i) != 0.0 || (H.row(i).array() != 0.0).any()) dof++;
+        }
+        last_nis_dof_ = dof;
         last_nis_ = std::numeric_limits<double>::quiet_NaN();
         Eigen::Matrix<double, XSIZE, 1> RCPs_post;
         Eigen::MatrixXd I_X = Eigen::MatrixXd::Identity(XSIZE, XSIZE);

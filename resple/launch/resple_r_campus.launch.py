@@ -48,15 +48,7 @@ def generate_launch_description():
             msg='Mapping node disabled (use_mapping:=false): no /global_map or '
                 'map->odom TF will be published. Pass use_mapping:=true to enable.'),
         IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(viz_launch)),          
-        launch_ros.actions.Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='lidar_tf',
-            arguments=[
-                '--x', '-0.04165', '--y', '-0.02326', '--z', '0.0284',
-                '--qx', '0.0', '--qy', '0.0', '--qz', '0.0', '--qw', '1.0',
-                '--frame-id', 'base_link', '--child-frame-id', 'livox_frame']),
+            PythonLaunchDescriptionSource(viz_launch)),
         TimerAction(
             period=_start_delay,
             actions=[
@@ -66,7 +58,7 @@ def generate_launch_description():
                 name='RESPLE',
                 emulate_tty=True,
                 output='screen',
-                parameters=[config_yaml_fusion],
+                parameters=[config_yaml_fusion, {'tf_extrinsics': False}],
                 arguments=['--ros-args', '--log-level', 'info'])
             ]),
         TimerAction(
@@ -79,7 +71,7 @@ def generate_launch_description():
                 name='Mapping',
                 emulate_tty=True,
                 output='screen',
-                parameters=[config_yaml_fusion],
+                parameters=[config_yaml_fusion, {'tf_extrinsics': False}],
                 arguments=['--ros-args', '--log-level', 'info'])
             ])                        
   ])

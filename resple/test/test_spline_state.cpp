@@ -445,3 +445,43 @@ TEST(SplineJacobianBoundary, RotationJacobiansMatchNumericalNearStart)
         }
     }
 }
+
+// --- Regression: itpQuaternion must write *q_out for EVERY non-null pointer
+// --- combination. The (q_out, J_q=null, J_w!=null) combination — used by
+// --- Estimator::getLastTwistCovariance — entered the Jacobian branch, whose
+// --- only q_out write was gated on J_q, leaving the caller's (uninitialized)
+// --- quaternion untouched.
+
+TEST(SplineQuery, QOutWrittenForAllPointerCombinations)
+{
+    SplineState s = makeSpline(40);
+    for (int64_t t : {s.minTimeNs(), s.minTimeNs() + 37 * kDtNs / 10,
+                      (s.minTimeNs() + s.maxTimeNs()) / 2, s.maxTimeNs()}) {
+        Eigen::Quaterniond q_ref;
+        s.itpQuaternion(t, &q_ref);  // plain path: known-good
+
+        // Poison sentinel: survives the call only if q_out is never written.
+        const Eigen::Quaterniond poison(1e300, -3.14, 42.0, 7.7);
+
+        Eigen::Vector3d w;
+        Jacobian33 J_w;
+        Eigen::Quaterniond q_jw = poison;
+        s.itpQuaternion(t, &q_jw, &w, nullptr, &J_w);  // the regression combo
+        ASSERT_NE(q_jw.w(), poison.w()) << "q_out not written (J_w-only path) t=" << t;
+        EXPECT_LT(q_jw.angularDistance(q_ref), 1e-12) << "t=" << t;
+
+        Jacobian43 J_q;
+        Eigen::Quaterniond q_jq = poison;
+        s.itpQuaternion(t, &q_jq, nullptr, &J_q);
+        ASSERT_NE(q_jq.w(), poison.w()) << "q_out not written (J_q path) t=" << t;
+        EXPECT_LT(q_jq.angularDistance(q_ref), 1e-12) << "t=" << t;
+
+        Eigen::Quaterniond q_both = poison;
+        Eigen::Vector3d w2;
+        Jacobian43 J_q2;
+        Jacobian33 J_w2;
+        s.itpQuaternion(t, &q_both, &w2, &J_q2, &J_w2);
+        ASSERT_NE(q_both.w(), poison.w()) << "q_out not written (both-J path) t=" << t;
+        EXPECT_LT(q_both.angularDistance(q_ref), 1e-12) << "t=" << t;
+    }
+}

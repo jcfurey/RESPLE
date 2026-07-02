@@ -1,7 +1,9 @@
 // MapSaving — standalone PCD accumulator node.
 //
 // Pulled in from upstream ASIG-X/RESPLE feature/save_map (commit 4a75095,
-// "added map saving feature"). Kept verbatim except for this header.
+// "added map saving feature"). Kept verbatim except for this header and the
+// exception guards in the two callbacks (an uncaught pcl::IOException from
+// savePCDFileBinary — empty cloud / unwritable path — terminated the node).
 //
 // This is intentionally decoupled from the RESPLE library and from the
 // hardened in-node SaveMap *action* (estimate_msgs/action/SaveMap on the
@@ -61,10 +63,15 @@ private:
 
     void globalMapCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     {
-        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>());
-        pcl::fromROSMsg(*msg, *cloud);
-        std::lock_guard<std::mutex> lock(mtx_map);
-        *accumulated_map += *cloud;
+        try {
+            pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>());
+            pcl::fromROSMsg(*msg, *cloud);
+            std::lock_guard<std::mutex> lock(mtx_map);
+            *accumulated_map += *cloud;
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "MapSaving: dropped a global_map message on exception: %s", e.what());
+        }
     }
 
     void savePCDCallback(const std::shared_ptr<std_srvs::srv::Empty::Request>,
@@ -75,9 +82,24 @@ private:
             std::lock_guard<std::mutex> lock(mtx_map);
             map_copy = *accumulated_map;
         }
-        pcl::io::savePCDFileBinary(pcd_save_path, map_copy);
-        RCLCPP_INFO(this->get_logger(), "Saved map to %s (%zu points)",
-            pcd_save_path.c_str(), map_copy.size());
+        // savePCDFileBinary throws pcl::IOException (empty cloud, unwritable
+        // path); uncaught it escapes the service callback and terminates the
+        // node (bug-hunt 2026-07-02 finding #17). std_srvs/Empty has no status
+        // field, so log the failure instead.
+        if (map_copy.empty()) {
+            RCLCPP_WARN(this->get_logger(),
+                "Save requested but no map accumulated yet; nothing written to %s",
+                pcd_save_path.c_str());
+            return;
+        }
+        try {
+            pcl::io::savePCDFileBinary(pcd_save_path, map_copy);
+            RCLCPP_INFO(this->get_logger(), "Saved map to %s (%zu points)",
+                pcd_save_path.c_str(), map_copy.size());
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to save map to %s: %s",
+                pcd_save_path.c_str(), e.what());
+        }
     }
 };
 

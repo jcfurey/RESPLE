@@ -370,6 +370,39 @@ reference (status as of latest pass):
 | 37 | async map-update task read the spline (`lasermapFovSegment → getPositionLiDAR → itpPosition/itpQuaternion`) holding only `mtx_map_`, while the worker grows the spline (`collectMeasurements → addOneStateKnot`) under `spline_mutex_` ALONE (no `mtx_map_`) → race | **fixed** (Phase 2.6: take `spline_mutex_` in `lasermapFovSegment`; order `mtx_map_ → spline_mutex_` preserved). TSan-verified | 2.6 |
 | 38 | `joinProcessingThreadBounded` (both nodes) dispatched `join()` onto a `std::async` task and `detach()`ed from the lifecycle thread on timeout — two threads racing on the same `std::thread` object (UB when the worker exited at the deadline; TSan runtime CHECK-abort in `pthread_detach`), and the async future's dtor un-bounded the wait | **fixed** (worker lambda release-stores `processing_thread_exited_` as its last action; bounded join polls the flag, then join-or-detach single-threaded) | 2.7 |
 
+**2026-07-02 bug hunt (hazards 39–68):** a multi-agent audit against the RESPLE
+paper (arXiv:2504.11580), Sommer et al. 2020 (arXiv:1911.08860), the ASIG-X
+vendor point, hku-mars/ikd-Tree and FAST-LIO conventions found 30 further
+defects — all fixed. Full per-finding write-ups, verdicts and outcomes in
+`doc/REVIEW_2026-07-02_bug_hunt_findings.md`. The ones that change contracts
+documented in this file:
+
+- **`itpQuaternion` writes `*q_out` for every non-null pointer combination**
+  (was: unwritten — i.e. caller-side garbage — when `J_q == nullptr` but
+  `J_w != nullptr`; `getLastTwistCovariance` published a garbage-rotated
+  velocity covariance every frame).
+- **Extrinsic convention is now explicit** (`tf_extrinsics` param, default
+  true): TF carries the mounting extrinsic and YAML `q_lb/t_lb` is an extra
+  offset; `tf_extrinsics=false` (dataset launches) = upstream YAML-only.
+  Per-LiDAR TF cache; 10 s `tf_wait_timeout` fallback instead of dropping
+  scans forever; WARN tripwire when TF and YAML are both non-identity (they
+  compose — a verbatim-copied TF cancels the extrinsic).
+- **ikd-Tree `Push_Down` no longer takes `working_flag_mutex`** (the old
+  rebuild branch blocked on it inside the child node lock — ABBA against both
+  the rebuild thread and whole-op mutators). `Rebuild_Ptr` and `rebuild_flag`
+  are `std::atomic`; the rebuild swap always holds `working_flag` (the
+  empty-flatten path didn't); `Rebuild_Ptr` is cleared inside the
+  `search_rw` unique block; rebuild flattens use `NOT_RECORD` (the
+  deleted-points vectors were an unbounded leak with no consumer).
+- **`initFilter`'s Q indexing fixed** (upstream bug: `bottomRightCorner` on
+  the 30×30 Q put the newest-RCP noise on the bias block); bias random walk
+  now explicit via `cov_bias_acc_rw`/`cov_bias_gyro_rw` (defaults preserve
+  pre-fix LIO magnitudes).
+- **Mapping `transformPoint` mirrors `pointBodyToWorld` exactly**; scan-end
+  times come from the max per-point offset (VoxelGrid reorders and averages);
+  `updateKnots` pads mid-run est_window gaps to keep the replica time axis
+  aligned; `setIdles` follows the arriving-delta convention.
+
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7
 without the Phase 0 bag data — see `HARDENING.md` for decision gates.

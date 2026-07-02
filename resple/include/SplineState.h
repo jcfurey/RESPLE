@@ -145,6 +145,18 @@ class SplineState
         num_knot++;
     }    
 
+    // Receiver-side idle reconstruction (Mapping est_window ingest). Call in
+    // order idx = 0, 1, 2. Chains under the same "delta ARRIVING at knot j-3"
+    // convention pruneFrontKnots and prepareInterpolation use: q_idle[j] =
+    // q_idle[j-1] * exp(ort_delta_idle[j]), and knot 0's quaternion chains
+    // from q_idle[2] via knot 0's OWN delta (ort_delta[0]).
+    //
+    // The previous implementation chained each NEXT slot from the delta being
+    // stored (q_idle[2] = q_idle[1]*exp(delta_of_slot_1), q_knots[0] =
+    // q_idle[2]*exp(delta_of_slot_2)) — one index off the convention (bug-hunt
+    // 2026-07-02 finding #25). Benign while every caller feeds zero deltas
+    // (both conventions coincide at identity), but silently wrong the moment a
+    // pruned sender's nonzero idles reach a fresh receiver.
     void setIdles(int idx, const Eigen::Vector3d& t, const Eigen::Vector3d& ort_del, const Eigen::Quaterniond& q_idle0)
     {
         if (idx < 0 || idx > 2) {
@@ -155,17 +167,21 @@ class SplineState
         ort_delta_idle[idx] = ort_del;
         Eigen::Quaterniond q_del;
         Quater::exp(ort_del, q_del);
+        if (idx == 0) {
+            // Slot 0's arriving delta refers to the (unknown) knot before the
+            // idle window; the anchor quaternion is supplied directly.
+            q_idle[0] = q_idle0;
+        } else {
+            q_idle[idx] = q_idle[idx - 1] * q_del;
+        }
         if (idx == 2) {
             if (num_knot == 0) {
                 RESPLE_LOG_INVARIANT_ONCE("setIdles(idx=2) requires num_knot>0; skipping q_knots[0] write");
                 return;
             }
-            q_knots[0] = q_idle[2] * q_del;
-        } else if (idx == 1) {
-            q_idle[2] = q_idle[1] * q_del;
-        } else if (idx == 0) {
-            q_idle[0] = q_idle0;
-            q_idle[1] = q_idle[0] * q_del;
+            Eigen::Quaterniond q_del0;
+            Quater::exp(ort_delta[0], q_del0);
+            q_knots[0] = q_idle[2] * q_del0;
         }
     }
 
@@ -225,15 +241,28 @@ class SplineState
                         // applied window begins at a nonzero absolute index.
                         std::cerr << "[SplineState] updateKnots: first window begins at absolute idx "
                                   << target << " (startup origin; expected after (re)start)\n";
-                    } else if ((update_gap_events_ & (update_gap_events_ - 1)) == 0) {
-                        // Mid-run gap = real est_window loss (the Mapping
-                        // ingest queue should prevent this); appending
-                        // sequentially misaligns every later knot's time.
-                        // Log counts at powers of two: early visibility
-                        // without per-window log spam.
-                        std::cerr << "[SplineState] updateKnots gap #" << update_gap_events_
-                                  << ": target=" << target << " > num_knot=" << num_knot
-                                  << " (missed est_window); knot times misaligned from here\n";
+                    } else {
+                        if ((update_gap_events_ & (update_gap_events_ - 1)) == 0) {
+                            // Mid-run gap = real est_window loss (the Mapping
+                            // ingest queue should prevent this). Log counts at
+                            // powers of two: early visibility without spam.
+                            std::cerr << "[SplineState] updateKnots gap #" << update_gap_events_
+                                      << ": target=" << target << " > num_knot=" << num_knot
+                                      << " (missed est_window); padding " << (target - num_knot)
+                                      << " knot(s) to keep the time axis aligned\n";
+                        }
+                        // Re-align the time axis (bug-hunt 2026-07-02 finding
+                        // #15): appending the window sequentially at num_knot
+                        // would shift EVERY subsequent knot's time by the gap
+                        // width, permanently skewing the replica. Pad the
+                        // missing indices with constant-pose knots (repeat the
+                        // last position, zero orientation delta) so this
+                        // window's knots land at their true absolute indices —
+                        // the padded span is wrong (its data was lost) but the
+                        // error stays bounded to the gap itself.
+                        while (num_knot < target) {
+                            addOneStateKnot(t_knots.back(), Eigen::Vector3d::Zero());
+                        }
                     }
                 }
                 addOneStateKnot(other->t_knots[i], other->ort_delta[i]);
@@ -447,6 +476,18 @@ class SplineState
                     Quater::Qright(q_r_all[s], Q_r_all);
                     J_q->d_val_d_knot[i].noalias() = coeff[s] * Q_r_all * Q_l_all[s] * dexp_dt[s];
                 }
+            } else if (q_out) {
+                // q_out requested alongside J_w only (e.g. the twist-covariance
+                // path): the write above is gated on J_q, so compose the
+                // interpolated quaternion here from the q_delta_scale chain
+                // dexp already produced. Without this, *q_out kept its
+                // caller-side value — a default-constructed Eigen::Quaterniond
+                // is UNINITIALIZED, and getLastTwistCovariance rotated the
+                // velocity covariance by stack garbage.
+                Eigen::Quaterniond q_itp = cp0 * q_delta_scale[0] * q_delta_scale[1]
+                                               * q_delta_scale[2] * q_delta_scale[3];
+                q_itp.normalize();
+                *q_out = q_itp;
             }
             if (J_w) {
                 baseCoeffsWithTime<1>(p, u);

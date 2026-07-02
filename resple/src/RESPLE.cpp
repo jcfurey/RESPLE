@@ -106,7 +106,6 @@ public:
     on_configure(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Configuring RESPLE...");
-        lidar_to_baselink_ = Eigen::Affine3d::Identity();
         imu_to_baselink_ = geometry_msgs::msg::TransformStamped();
         
         // Parameter validation with constraints
@@ -405,6 +404,13 @@ public:
         init_complete_logged_.store(false);
         iekf_first_logged_.store(false);
         est_window_first_logged_.store(false);
+        // A re-cycled node re-initializes its spline on a fresh timeline; a
+        // stale duplicate-suppression watermark would silently gate pose/odom/
+        // TF until the new timeline overtakes the old one (finding #12). The
+        // LO IMU-wait and frame-id state must restart with it (findings #9/#10).
+        last_pose_pub_time_ns_ = std::numeric_limits<int64_t>::min();
+        lo_imu_wait_started_ = false;
+        imu_frame_id_.clear();
         
         // Reset publishers
         pub_est.reset();
@@ -556,7 +562,13 @@ public:
                         hb_last_log = now_clk;
                         size_t pc_buff_total = 0, pt_buff_total = 0;
                         for (auto& [n, d] : lidars_data) {
-                            pc_buff_total += d.pc_buff.size();
+                            {
+                                // pc_buff is callback-written: size() reads the
+                                // deque internals, so it needs mtx_pc like the
+                                // diagnostics block above (finding #28).
+                                std::lock_guard<std::mutex> lk(d.mtx_pc);
+                                pc_buff_total += d.pc_buff.size();
+                            }
                             pt_buff_total += d.pt_buff.size();
                         }
                         size_t imu_buff_size;
@@ -1385,9 +1397,20 @@ private:
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     bool have_imu_transform_ = false;
-    bool have_lidar_transform_ = false;
-    Eigen::Affine3d lidar_to_baselink_;
     geometry_msgs::msg::TransformStamped imu_to_baselink_;
+    // Extrinsic convention switch (findings #5/#22/#26): true (default) = TF
+    // carries the mounting extrinsic, YAML q_lb/t_lb is an extra offset on
+    // top; false = upstream/dataset mode, no TF consulted, YAML applied once.
+    // Per-LiDAR transform state lives in LidarConfig (sensor cb group only).
+    bool tf_extrinsics_ = true;
+    double tf_wait_timeout_ = 10.0;
+    // IMU frame_id captured from the first sample (under m_buff); used by
+    // initialization() to resolve the mounting rotation for gravity (finding #9).
+    std::string imu_frame_id_;
+    // LO-without-IMU init timeout state (finding #10; worker thread only).
+    bool lo_imu_wait_started_ = false;
+    std::chrono::steady_clock::time_point lo_imu_wait_start_{};
+    double lo_imu_wait_timeout_ = 10.0;
     
     bool publish_tf, invert_tf;
     std::string frame_id;
@@ -1592,8 +1615,12 @@ private:
     double cov_RCP_ort_old = 0.02;
     double cov_RCP_pos_new = 0.1;    
     double cov_RCP_ort_new = 0.1;    
-    double cov_sys_pos = 0.1;    
-    double cov_sys_ort = 0.01;    
+    double cov_sys_pos = 0.1;
+    double cov_sys_ort = 0.01;
+    // Per-knot-step bias random-walk variance (LIO state rows 24-29). Defaults
+    // reproduce the pre-fix accidental Q_block_new magnitude — see initFilter.
+    double cov_bias_acc_rw_ = 0.0;
+    double cov_bias_gyro_rw_ = 0.0;
     Parameters param;
     int64_t dt_ns;
     int num_points_upd;
@@ -1707,24 +1734,55 @@ private:
         invert_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "odom/invert_tf", false);
         frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_link");
         odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom/frame_id", "odom");
-        
-        RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s", 
+
+        RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s",
                     odom_id.c_str(), frame_id.c_str());
+
+        // Extrinsic convention (see updateLidarTransform): default true keeps
+        // the production TF-based flow; dataset replay launches pass false so
+        // the YAML q_lb/t_lb is the single source of truth (upstream parity).
+        tf_extrinsics_ = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "tf_extrinsics", true);
+        tf_wait_timeout_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "tf_wait_timeout", 10.0);
+        lo_imu_wait_timeout_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "lo_imu_wait_timeout", 10.0);
+        if (!tf_extrinsics_) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] tf_extrinsics=false: sensor clouds/IMU stay in their native "
+                "frames; YAML q_lb/t_lb extrinsics applied once (upstream convention)");
+        }
         
+        // Voxel / gating parameters. These were "optional" with a 0.0 default,
+        // but 0.0 is degenerate, not neutral: a zero VoxelGrid leaf makes PCL's
+        // index math divide by zero, a zero ikd-Tree downsample box disables
+        // map sparsification, and nn_thresh=0 rejects every point-to-plane
+        // residual in the primary gate. Fall back to the canonical config
+        // values with a loud warning instead (finding #27).
         ds_lm_voxel = CommonUtils::readParam<float>(this->get_node_parameters_interface(), "ds_lm_voxel", 0.0);
-        
+        if (ds_lm_voxel <= 0.0f) {
+            RCLCPP_WARN(this->get_logger(),
+                "ds_lm_voxel missing or non-positive (%.3f); using 0.2 m", ds_lm_voxel);
+            ds_lm_voxel = 0.2f;
+        }
+
         // Validate ds_scan_voxel parameter
         float ds_scan_voxel = CommonUtils::readParam<float>(this->get_node_parameters_interface(), "ds_scan_voxel", 0.0);
-        if (ds_scan_voxel < 0.01 || ds_scan_voxel > 1.0) {
-            RCLCPP_WARN(this->get_logger(), 
+        if (ds_scan_voxel <= 0.0f) {
+            RCLCPP_WARN(this->get_logger(),
+                "ds_scan_voxel missing or non-positive (%.3f); using 0.2 m", ds_scan_voxel);
+            ds_scan_voxel = 0.2f;
+        } else if (ds_scan_voxel < 0.01 || ds_scan_voxel > 1.0) {
+            RCLCPP_WARN(this->get_logger(),
                 "ds_scan_voxel value %.3f outside recommended range [0.01, 1.0]", ds_scan_voxel);
         }
         ds_filter_body.setLeafSize(ds_scan_voxel, ds_scan_voxel, ds_scan_voxel);
-        
+
         // Validate nn_thresh parameter
         param.nn_thresh = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "nn_thresh", 0.0);
-        if (param.nn_thresh < 0.1 || param.nn_thresh > 5.0) {
-            RCLCPP_WARN(this->get_logger(), 
+        if (param.nn_thresh <= 0.0) {
+            RCLCPP_WARN(this->get_logger(),
+                "nn_thresh missing or non-positive (%.3f); using 0.5 m", param.nn_thresh);
+            param.nn_thresh = 0.5;
+        } else if (param.nn_thresh < 0.1 || param.nn_thresh > 5.0) {
+            RCLCPP_WARN(this->get_logger(),
                 "nn_thresh value %.3f outside recommended range [0.1, 5.0]", param.nn_thresh);
         }
         // HARDENING §3.2 correspondence thresholds. Defaults reproduce the
@@ -1945,6 +2003,12 @@ private:
         double std_ort = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "std_sys_ort", 0.1);
         cov_sys_pos = std_pos*std_pos*dt_s*dt_s;
         cov_sys_ort = std_ort*std_ort*dt_s*dt_s;
+        // Bias random-walk process noise (finding #8): defaults keep the
+        // magnitude the bias block accidentally received before the fix.
+        cov_bias_acc_rw_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(),
+            "cov_bias_acc_rw", cov_RCP_pos_new * cov_sys_pos);
+        cov_bias_gyro_rw_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(),
+            "cov_bias_gyro_rw", cov_RCP_ort_new * cov_sys_ort);
         param.coeff_cov = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "coeff_cov", 10);
 
         cube_len = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "cube_len", 1000.0);
@@ -2004,7 +2068,17 @@ private:
         Q.topLeftCorner<6, 6>() = Q_block_old;
         Q.block<6, 6>(6, 6) = Q_block_old;
         Q.block<6, 6>(12, 12) = Q_block_old;
-        Q.bottomRightCorner<6, 6>() = Q_block_new;
+        // Newest-RCP block. Upstream wrote this via bottomRightCorner<6,6>()
+        // on the 30x30 Q, which lands on the BIAS block (24-29): the newest
+        // knot got ZERO process noise, and in LO mode Q_block_new was
+        // discarded entirely by the topLeftCorner<24,24> slice (bug-hunt
+        // 2026-07-02 finding #8; inherited from upstream).
+        Q.block<6, 6>(18, 18) = Q_block_new;
+        // Bias random walk (LIO state 24-29). Pre-fix, these rows received
+        // Q_block_new by the indexing accident above; the defaults preserve
+        // that magnitude so LIO bias dynamics are unchanged unless retuned.
+        Q.block<3, 3>(24, 24) = cov_bias_acc_rw_ * Eigen::Matrix3d::Identity();
+        Q.block<3, 3>(27, 27) = cov_bias_gyro_rw_ * Eigen::Matrix3d::Identity();
         if (if_lidar_only) {
             estimator_lo.setState(dt_ns, start_t_ns, t_init, q_init, Q.topLeftCorner<24, 24>(), cov_RCPs);
             spline = estimator_lo.getSpline();
@@ -2020,6 +2094,12 @@ private:
 
     bool updateImuTransform(std::string source_frame_id)
     {
+        // YAML-only mode (tf_extrinsics=false): never consult TF; the caller
+        // falls back to pass-through, matching upstream (IMU assumed to be in
+        // the body frame, as the dataset configs are calibrated for).
+        if (!tf_extrinsics_) {
+            return false;
+        }
         if (!have_imu_transform_) {
             try {
                 // Pre-check that both frames are known to the buffer before
@@ -2057,46 +2137,101 @@ private:
         return true;
     }
 
-    bool updateLidarTransform(std::string source_frame_id)
+    // Per-LiDAR extrinsic resolution (bug-hunt 2026-07-02, findings #5/#22/#26).
+    //
+    // Extrinsic contract (documented in config_06042026.yaml): when
+    // tf_extrinsics=true (default) the base_link<-sensor TF carries the
+    // mounting extrinsic, the callback bakes it into the cloud, and the YAML
+    // q_lb/t_lb is an EXTRA offset applied on top (identity in production).
+    // When tf_extrinsics=false (upstream / dataset-replay mode) no TF is
+    // consulted: clouds stay in the raw sensor frame and the YAML q_lb/t_lb
+    // is applied exactly once per point, as upstream RESPLE did.
+    //
+    // Previous defects fixed here:
+    //  * scans were dropped FOREVER when no TF was published (NTU/KTH replay
+    //    launches) — now a timed fallback (tf_wait_timeout, default 10 s)
+    //    degrades to the YAML-only convention with a one-shot warning;
+    //  * a single lidar_to_baselink_ cache was shared across all LiDARs, so
+    //    in multi-LiDAR configs every sensor got whichever frame latched
+    //    first — the cache is now per-LidarConfig;
+    //  * publishing a TF that duplicates a non-identity YAML extrinsic makes
+    //    the two cancel (q_bl∘q_lb = I) — now detected and warned.
+    bool updateLidarTransform(const std::string& source_frame_id, LidarConfig& lidar)
     {
-        if (!have_lidar_transform_) {
-            try {
-                // Same pre-check as updateImuTransform — avoids tf2's
-                // "frame does not exist" warning while the static TF
-                // publisher is still coming up.
-                if (!tf_buffer_->_frameExists(this->frame_id) ||
-                    !tf_buffer_->_frameExists(source_frame_id)) {
-                    return false;
-                }
-                geometry_msgs::msg::TransformStamped transform;
-                if (tf_buffer_->canTransform(this->frame_id, source_frame_id,
-                                                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
-                        transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id, 
-                                                                        rclcpp::Time(0));
-                        lidar_to_baselink_ = tf2::transformToEigen(transform);
-                        
-                        have_lidar_transform_ = true;
-                        // Populate sensor_origin_body for all lidars from the TF-based
-                        // translation — used for true sensor-frame range in outlier gating.
-                        for (auto& [name, lcfg] : lidars) {
-                            lcfg.sensor_origin_body = lidar_to_baselink_.translation();
-                        }
-                        RCLCPP_INFO(this->get_logger(), "[RESPLE] Got LiDAR transform: %s -> %s", 
-                                source_frame_id.c_str(), this->frame_id.c_str());
-                    } else {
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
-                                            "[RESPLE] Waiting for LiDAR transform: %s -> %s", 
-                                            source_frame_id.c_str(), this->frame_id.c_str());
-                        return false;
-                    }
-            } catch (tf2::TransformException& ex) {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
-                                    "[RESPLE] LiDAR transform exception: %s", ex.what());
-                return false;
-            }
+        if (lidar.extrinsic_ready) {
+            return true;
         }
-
-        return true;
+        if (!tf_extrinsics_) {
+            // YAML-only mode: identity TF, raw clouds, q_bl/t_bl applied once
+            // in pointBodyToWorld / prepLiDAR. sensor_origin_body stays zero
+            // (points remain in the sensor frame).
+            lidar.extrinsic_ready = true;
+            return true;
+        }
+        try {
+            // Pre-check avoids tf2's "frame does not exist" warning while the
+            // static TF publisher is still coming up.
+            if (tf_buffer_->_frameExists(this->frame_id) &&
+                tf_buffer_->_frameExists(source_frame_id) &&
+                tf_buffer_->canTransform(this->frame_id, source_frame_id,
+                                         rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
+                const auto transform = tf_buffer_->lookupTransform(
+                    this->frame_id, source_frame_id, rclcpp::Time(0));
+                lidar.lidar_to_baselink = tf2::transformToEigen(transform);
+                lidar.tf_latched = true;
+                lidar.extrinsic_ready = true;
+                // True sensor origin in body frame for the range-based
+                // outlier gate — per-lidar, from THIS frame's TF.
+                lidar.sensor_origin_body = lidar.lidar_to_baselink.translation();
+                RCLCPP_INFO(this->get_logger(), "[RESPLE] Got LiDAR transform: %s -> %s",
+                        source_frame_id.c_str(), this->frame_id.c_str());
+                // Tripwire: TF and YAML both non-identity means the extrinsic
+                // is applied twice (q_bl on an already-transformed cloud). If
+                // the TF was copied from q_lb/t_lb verbatim the two cancel and
+                // the extrinsic is silently NULLED (see doc/PARAMETERS.md).
+                const bool yaml_nontrivial =
+                    lidar.q_bl.angularDistance(Eigen::Quaterniond::Identity()) > 1e-3 ||
+                    lidar.t_bl.norm() > 1e-3;
+                const bool tf_nontrivial =
+                    Eigen::Quaterniond(lidar.lidar_to_baselink.rotation())
+                        .angularDistance(Eigen::Quaterniond::Identity()) > 1e-3 ||
+                    lidar.lidar_to_baselink.translation().norm() > 1e-3;
+                if (yaml_nontrivial && tf_nontrivial) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "[RESPLE] LiDAR '%s': BOTH the TF (%s->%s) and the YAML q_lb/t_lb "
+                        "extrinsics are non-identity. The YAML extrinsic is applied ON TOP "
+                        "of the TF-transformed cloud — if both encode the same mounting "
+                        "transform they cancel out. Set q_lb/t_lb to identity (TF carries "
+                        "the extrinsic) or run with tf_extrinsics:=false (YAML carries it).",
+                        source_frame_id.c_str(), source_frame_id.c_str(), this->frame_id.c_str());
+                }
+                return true;
+            }
+        } catch (tf2::TransformException& ex) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                "[RESPLE] LiDAR transform exception: %s", ex.what());
+        }
+        // TF not available yet: wait up to tf_wait_timeout_ seconds (measured
+        // from this lidar's first attempt), then fall back to the YAML-only
+        // convention instead of dropping scans forever.
+        const auto now_mono = std::chrono::steady_clock::now();
+        if (!lidar.tf_first_attempt_set) {
+            lidar.tf_first_attempt = now_mono;
+            lidar.tf_first_attempt_set = true;
+        } else if (std::chrono::duration<double>(now_mono - lidar.tf_first_attempt).count()
+                       > tf_wait_timeout_) {
+            RCLCPP_WARN(this->get_logger(),
+                "[RESPLE] No TF %s -> %s after %.1f s; falling back to the YAML "
+                "q_lb/t_lb extrinsic only (upstream convention). Publish the TF or "
+                "set tf_extrinsics:=false to silence this.",
+                source_frame_id.c_str(), this->frame_id.c_str(), tf_wait_timeout_);
+            lidar.extrinsic_ready = true;   // identity TF from here on
+            return true;
+        }
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "[RESPLE] Waiting for LiDAR transform: %s -> %s",
+                            source_frame_id.c_str(), this->frame_id.c_str());
+        return false;
     }
 
     sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::ConstSharedPtr& imu_raw, 
@@ -2136,11 +2271,18 @@ private:
         // centripetal term must be SUBTRACTED to remove it (bug A4: it was added,
         // which doubled the term instead of cancelling it). alpha x r (angular
         // acceleration) is not measured, so it is omitted.
+        //
+        // Units: omega x (omega x r) is in m/s^2, but with acc_ratio=true the
+        // message accel is in g and stays in g until the worker scales the
+        // whole vector by 9.81 on consumption. Express the correction in the
+        // message's unit here so that later scaling does not multiply an
+        // already-metric term by 9.81 (bug-hunt 2026-07-02 finding #7).
         Eigen::Vector3d lin_accel(imu_raw->linear_acceleration.x,
                                   imu_raw->linear_acceleration.y,
                                   imu_raw->linear_acceleration.z);
+        const double accel_unit = acc_ratio ? (1.0 / 9.81) : 1.0;
         Eigen::Vector3d lin_accel_transformed = transform_eigen.rotation() * lin_accel
-                                               - ang_vel_transformed.cross(ang_vel_transformed.cross(transform_eigen.translation()));
+                                               - accel_unit * ang_vel_transformed.cross(ang_vel_transformed.cross(transform_eigen.translation()));
 
         imu->linear_acceleration.x = lin_accel_transformed[0];
         imu->linear_acceleration.y = lin_accel_transformed[1];
@@ -2204,6 +2346,11 @@ private:
             RCLCPP_INFO(this->get_logger(),
                 "[RESPLE] First IMU sample received (frame_id='%s')",
                 imu_msg->header.frame_id.c_str());
+        }
+        // Under m_buff (locked above): initialization() resolves the IMU
+        // mounting rotation from this frame for gravity alignment.
+        if (imu_frame_id_.empty()) {
+            imu_frame_id_ = imu_msg->header.frame_id;
         }
 
         // HARDENING §2.3: parameterized staging cap (was hardcoded 2000),
@@ -2436,10 +2583,10 @@ private:
                 }
             }
         }
-        const LidarConfig& lidar = lidars.at(name);
+        LidarConfig& lidar = lidars.at(name);
         
         // Lookup LiDAR transform
-        if(!updateLidarTransform(ouster_msg_in->header.frame_id)) return;
+        if(!updateLidarTransform(ouster_msg_in->header.frame_id, lidar)) return;
         
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         typename pcl::PointCloud<T>::Ptr pc_last_ouster(new typename pcl::PointCloud<T>());
@@ -2470,8 +2617,12 @@ private:
             }
         }
 
-        // Transform point cloud to body frame
-        pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_);
+        // Transform point cloud to body frame (TF mode only; in YAML-only /
+        // fallback mode points stay in the sensor frame and q_bl/t_bl is
+        // applied per point downstream)
+        if (lidar.tf_latched) {
+            pcl::transformPointCloud(*pc_last, *pc_last, lidar.lidar_to_baselink);
+        }
 
         pushScanBounded(lidar_buffs, pc_last->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
@@ -2501,9 +2652,9 @@ private:
                 }
             }
         }
-        const LidarConfig& lidar = lidars.at(name);
+        LidarConfig& lidar = lidars.at(name);
 
-        if(!updateLidarTransform(msg_in->header.frame_id)) return;
+        if(!updateLidarTransform(msg_in->header.frame_id, lidar)) return;
 
         int64_t stamp_ns = rclcpp::Time(msg_in->header.stamp).nanoseconds();
         if (stamp_ns < time_offset) return;  // skip early sim-time messages
@@ -2544,8 +2695,12 @@ private:
         pc_last->points.resize(write_idx);
         if (pc_last->points.empty()) return;
 
-        // Transform point cloud to body frame
-        pcl::transformPointCloud(*pc_last, *pc_last, lidar_to_baselink_);
+        // Transform point cloud to body frame (TF mode only; in YAML-only /
+        // fallback mode points stay in the sensor frame and q_bl/t_bl is
+        // applied per point downstream)
+        if (lidar.tf_latched) {
+            pcl::transformPointCloud(*pc_last, *pc_last, lidar.lidar_to_baselink);
+        }
 
         pushScanBounded(lidar_buffs, pc_last->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
@@ -2560,9 +2715,9 @@ private:
         try {
         noteFirstLidar("Mid70Avia", livox_msg_in->header.frame_id, livox_msg_in->point_num);
         std::string name = "Mid70Avia";
-        const LidarConfig& lidar = lidars.at(name);
+        LidarConfig& lidar = lidars.at(name);
 
-        if(!updateLidarTransform(livox_msg_in->header.frame_id)) return;
+        if(!updateLidarTransform(livox_msg_in->header.frame_id, lidar)) return;
 
         // NOTE (applies to all three livox callbacks): the point loop below
         // intentionally starts at i = 1 — points[0] seeds pt_pre for the
@@ -2613,9 +2768,13 @@ private:
             }
         }
 
-        // Transform point cloud to body frame
+        // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
-        pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
+        if (lidar.tf_latched) {
+            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+        } else {
+            pc_transformed = pc_last;
+        }
 
         pushScanBounded(lidar_buffs, pc_transformed->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
@@ -2630,9 +2789,9 @@ private:
         try {
         noteFirstLidar("HAP360", livox_msg_in->header.frame_id, livox_msg_in->point_num);
         std::string name = "HAP360";
-        const LidarConfig& lidar = lidars.at(name);
+        LidarConfig& lidar = lidars.at(name);
 
-        if(!updateLidarTransform(livox_msg_in->header.frame_id)) return;
+        if(!updateLidarTransform(livox_msg_in->header.frame_id, lidar)) return;
 
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         int plsize = livox_msg_in->point_num;
@@ -2678,9 +2837,13 @@ private:
             }
         }
 
-        // Transform point cloud to body frame
+        // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
-        pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
+        if (lidar.tf_latched) {
+            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+        } else {
+            pc_transformed = pc_last;
+        }
 
         pushScanBounded(lidar_buffs, pc_transformed->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
@@ -2695,9 +2858,9 @@ private:
         try {
         noteFirstLidar("AviaResple", livox_msg_in->header.frame_id, livox_msg_in->point_num);
         std::string name = "AviaResple";
-        const LidarConfig& lidar = lidars.at(name);
+        LidarConfig& lidar = lidars.at(name);
 
-        if(!updateLidarTransform(livox_msg_in->header.frame_id)) return;
+        if(!updateLidarTransform(livox_msg_in->header.frame_id, lidar)) return;
 
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         int plsize = livox_msg_in->point_num;
@@ -2744,9 +2907,13 @@ private:
             }
         }
 
-        // Transform point cloud to body frame
+        // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
-        pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
+        if (lidar.tf_latched) {
+            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+        } else {
+            pc_transformed = pc_last;
+        }
 
         pushScanBounded(lidar_buffs, pc_transformed->points, time_begin);
         lidar_buffs.last_t_ns.store(time_begin + max_ofs_ns);
@@ -2762,9 +2929,9 @@ private:
         noteFirstLidar("Hesai", hesai_msg_in->header.frame_id,
                        hesai_msg_in->width * hesai_msg_in->height);
         std::string name = "Hesai";
-        const LidarConfig& lidar = lidars.at(name);
+        LidarConfig& lidar = lidars.at(name);
 
-        if(!updateLidarTransform(hesai_msg_in->header.frame_id)) return;
+        if(!updateLidarTransform(hesai_msg_in->header.frame_id, lidar)) return;
 
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::PointCloud<hesai_ros::Point>::Ptr pc_last_hesai(new pcl::PointCloud<hesai_ros::Point>());
@@ -2798,9 +2965,13 @@ private:
             }
         }
 
-        // Transform point cloud to body frame
+        // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
-        pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
+        if (lidar.tf_latched) {
+            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+        } else {
+            pc_transformed = pc_last;
+        }
 
         pushScanBounded(lidar_buffs_hesai, pc_transformed->points, time_begin);
         lidar_buffs_hesai.last_t_ns.store(time_begin + max_ofs_ns);
@@ -2816,9 +2987,9 @@ private:
         noteFirstLidar("Mid360Boxi", livox_msg_in->header.frame_id,
                        livox_msg_in->width * livox_msg_in->height);
         std::string name = "Mid360Boxi";
-        const LidarConfig& lidar = lidars.at(name);
+        LidarConfig& lidar = lidars.at(name);
 
-        if(!updateLidarTransform(livox_msg_in->header.frame_id)) return;
+        if(!updateLidarTransform(livox_msg_in->header.frame_id, lidar)) return;
 
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_last(new pcl::PointCloud<pcl::PointXYZINormal>());
         pcl::PointCloud<livox_mid360_boxi::Point>::Ptr pc_last_livox(new pcl::PointCloud<livox_mid360_boxi::Point>());
@@ -2850,9 +3021,13 @@ private:
             }
         }
 
-        // Transform point cloud to body frame
+        // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
-        pcl::transformPointCloud(*pc_last, *pc_transformed, lidar_to_baselink_);
+        if (lidar.tf_latched) {
+            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+        } else {
+            pc_transformed = pc_last;
+        }
 
         pushScanBounded(lidar_buffs_boxi, pc_transformed->points, time_begin);
         lidar_buffs_boxi.last_t_ns.store(time_begin + max_ofs_ns);
@@ -3047,6 +3222,17 @@ private:
                     total_pt_dropped, total_pc_dropped,
                     init_lag_window_ns / 1'000'000, latest_t_ns);
             }
+            // The drop above can empty a lagging lidar's pt_buff entirely (its
+            // whole backlog was older than the global cutoff — e.g. one LiDAR
+            // >200 ms behind the freshest in a multi-LiDAR config, or a
+            // sub-5 Hz sensor whose next scan is still in pc_buff). front()
+            // below would be UB on an empty deque; wait for the next cycle to
+            // refill instead (bug-hunt 2026-07-02 finding #11).
+            for (const auto& [lidar_name, lidar_data] : lidars_data) {
+                if (lidar_data.pt_buff.empty()) {
+                    return false;
+                }
+            }
         }
         int64_t start_t_ns = std::numeric_limits<int64_t>::max();
         for (const auto& [lidar_name, lidar_data] : lidars_data) {
@@ -3055,15 +3241,50 @@ private:
         if (!if_init_filter) {
             Eigen::Quaterniond q_WI = Eigen::Quaterniond::Identity();
 
-            // Always use IMU for gravity alignment, even in LO mode.
-            // This ensures the spline starts gravity-aligned (z = up).
-            {
+            // LO mode can run without any IMU (upstream never required one):
+            // if too few samples arrive within lo_imu_wait_timeout_, proceed
+            // with identity orientation instead of blocking initialization
+            // forever (bug-hunt 2026-07-02 finding #10). LIO still requires
+            // IMU unconditionally.
+            bool use_imu_gravity = true;
+            if (if_lidar_only) {
+                std::lock_guard<std::mutex> lk(m_buff);
+                if (static_cast<int>(imu_buff.size()) < imu_init_num_samples_) {
+                    const auto now_mono = std::chrono::steady_clock::now();
+                    if (!lo_imu_wait_started_) {
+                        lo_imu_wait_start_ = now_mono;
+                        lo_imu_wait_started_ = true;
+                    } else if (std::chrono::duration<double>(now_mono - lo_imu_wait_start_).count()
+                                   > lo_imu_wait_timeout_) {
+                        use_imu_gravity = false;
+                        RCLCPP_WARN(this->get_logger(),
+                            "[RESPLE] LO mode: insufficient IMU after %.1f s — initializing "
+                            "without gravity alignment (identity orientation; map z axis "
+                            "is the sensor z axis)", lo_imu_wait_timeout_);
+                    }
+                }
+            }
+
+            // Use IMU for gravity alignment (always in LIO; in LO when IMU
+            // data is available). This ensures the spline starts
+            // gravity-aligned (z = up).
+            if (use_imu_gravity) {
                 int buff_size;
                 int n_imu;
                 Eigen::Vector3d gravity_mean;
                 double accel_variance = 0.0;
                 {
                     std::unique_lock<std::mutex> imu_lock(m_buff);
+                    // Bound the pre-init staging (finding #13): the
+                    // quietest-window scan below is O(windows x n_imu), and
+                    // imu_buff otherwise grows without bound while the
+                    // variance gate keeps failing (robot in motion). Keep a
+                    // recent multiple of the window size — a stationary
+                    // interval must be recent to be a valid gravity anchor.
+                    const int init_buff_cap = std::max(4 * imu_init_num_samples_, 400);
+                    while (static_cast<int>(imu_buff.size()) > init_buff_cap) {
+                        imu_buff.pop_front();
+                    }
                     buff_size = imu_buff.size();
 
                     // Wait for sufficient IMU samples
@@ -3141,6 +3362,18 @@ private:
                     while (!imu_buff.empty() && imu_buff.front().time_ns < start_t_ns) {
                         imu_buff.pop_front();
                     }
+                }
+
+                // Rotate the sensor-frame gravity into base_link when the IMU
+                // mounting rotation is known (finding #9): pre-init samples
+                // are buffered RAW, so a non-identity mounting would tilt the
+                // initial orientation by the mounting angle and disagree with
+                // the post-init (TF-transformed) IMU stream. In YAML-only mode
+                // (tf_extrinsics=false) this is a no-op, matching upstream.
+                if (updateImuTransform(imu_frame_id_)) {
+                    const Eigen::Quaterniond R_bi(
+                        tf2::transformToEigen(imu_to_baselink_).rotation());
+                    gravity_mean = R_bi * gravity_mean;
                 }
 
                 // Initialize orientation from gravity

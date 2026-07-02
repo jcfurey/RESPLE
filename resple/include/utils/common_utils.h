@@ -2,6 +2,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <eigen3/Eigen/Dense>
+#include <chrono>
 #include <fstream>
 #include <filesystem>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -321,7 +322,21 @@ struct LidarConfig {
     std::string intensity_field;  // override reflectivity field name
     // Sensor origin in body (base_link) frame — populated from TF at runtime,
     // NOT from YAML.  Used to compute true sensor-frame range for outlier gating.
+    // Stays zero in YAML-only mode (tf_extrinsics=false), where buffered points
+    // remain in the raw sensor frame and the sensor origin IS the frame origin.
     Eigen::Vector3d sensor_origin_body = Eigen::Vector3d::Zero();
+
+    // Per-LiDAR TF extrinsic state (RESPLE.cpp callbacks). One shared cache
+    // used to serve all LiDARs, so in a multi-LiDAR config every sensor got
+    // whichever frame's transform was latched first. All access is from the
+    // sensor callback group (mutually exclusive) — no locking needed; the
+    // worker only consumes points pushed AFTER these are latched (the buffer
+    // mutex orders the writes).
+    Eigen::Affine3d lidar_to_baselink = Eigen::Affine3d::Identity();
+    bool tf_latched = false;       // TF found and cached for THIS lidar's frame
+    bool extrinsic_ready = false;  // scans may be processed (TF latched, YAML-only mode, or timed fallback)
+    std::chrono::steady_clock::time_point tf_first_attempt{};
+    bool tf_first_attempt_set = false;
 
     LidarConfig() = default;
 

@@ -312,14 +312,22 @@ public:
 private:
     // Multi-thread Tree Rebuild
     bool termination_flag = false;
-    bool rebuild_flag = false;
+    // Atomic: Push_Down's search-path callers read this without
+    // working_flag_mutex (bug-hunt 2026-07-02 finding #18 rework).
+    std::atomic<bool> rebuild_flag{false};
     pthread_t rebuild_thread;
     pthread_mutex_t termination_flag_mutex_lock, rebuild_ptr_mutex_lock, working_flag_mutex;
     pthread_mutex_t rebuild_logger_mutex_lock, points_deleted_rebuild_mutex_lock;
     // queue<Operation_Logger_Type> Rebuild_Logger;
     MANUAL_Q Rebuild_Logger;
     PointVector Rebuild_PCL_Storage;
-    KD_TREE_NODE **Rebuild_Ptr = nullptr;
+    // Atomic (bug-hunt 2026-07-02 finding #21): Push_Down on the search path
+    // reads this holding neither working_flag_mutex nor the rebuild thread's
+    // locks; a plain pointer was a C++ data race, and the short-circuit
+    // `Rebuild_Ptr == nullptr || *Rebuild_Ptr != child` could legally reload
+    // between the null test and the dereference. Readers must snapshot with
+    // .load() once and test the local copy.
+    std::atomic<KD_TREE_NODE **> Rebuild_Ptr{nullptr};
     std::shared_mutex search_rw_mutex_;
     static void *multi_thread_ptr(void *arg);
     void multi_thread_rebuild();

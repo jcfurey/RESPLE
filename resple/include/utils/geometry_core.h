@@ -58,37 +58,46 @@ inline bool fitPlane(int num_pts, Accessor&& get_xyz, T threshold,
   if (num_pts < 3) {
     return false;
   }
-  Eigen::Matrix<T, 3, 3> ATA = Eigen::Matrix<T, 3, 3>::Zero();
-  Eigen::Matrix<T, 3, 1> ATb = Eigen::Matrix<T, 3, 1>::Zero();
+  // Accumulate and solve in DOUBLE regardless of T. The float instantiation
+  // (esti_plane's Vector4f path) previously formed A^T A in float32: the
+  // normal equations square the condition number, and for world-frame patches
+  // far from the origin (coords ~1e2-1e3 m, patch extent ~0.1 m) the
+  // informative variation fell below float's ~7 significant digits, degrading
+  // the fitted normal exactly where the map is sparsest. Double accumulation
+  // keeps 16 digits through the squaring; the rank guard and the residual
+  // gate below still reject genuinely degenerate patches.
+  Eigen::Matrix3d ATA = Eigen::Matrix3d::Zero();
+  Eigen::Vector3d ATb = Eigen::Vector3d::Zero();
   for (int j = 0; j < num_pts; ++j) {
     T x, y, z;
     get_xyz(j, x, y, z);
-    Eigen::Matrix<T, 3, 1> row(x, y, z);
+    Eigen::Vector3d row(static_cast<double>(x), static_cast<double>(y),
+                        static_cast<double>(z));
     ATA.noalias() += row * row.transpose();
     ATb.noalias() -= row;
   }
-  Eigen::ColPivHouseholderQR<Eigen::Matrix<T, 3, 3>> qr(ATA);
+  Eigen::ColPivHouseholderQR<Eigen::Matrix3d> qr(ATA);
   if (min_cond_ratio > static_cast<T>(0)) {
     // Threshold is relative to the largest pivot, so the rank test is
     // scale-invariant.  rank < 3 ⇒ the points do not span a well-defined plane.
-    qr.setThreshold(min_cond_ratio);
+    qr.setThreshold(static_cast<double>(min_cond_ratio));
     if (qr.rank() < 3) {
       return false;
     }
   }
-  Eigen::Matrix<T, 3, 1> normvec = qr.solve(ATb);
+  const Eigen::Vector3d normvec = qr.solve(ATb);
   if (!normvec.allFinite()) {
     return false;
   }
-  const T n = normvec.norm();
-  if (n < static_cast<T>(1e-12)) {
+  const double n = normvec.norm();
+  if (n < 1e-12) {
     return false;
   }
-  const T n_inv = static_cast<T>(1.0) / n;
-  out(0) = normvec(0) * n_inv;
-  out(1) = normvec(1) * n_inv;
-  out(2) = normvec(2) * n_inv;
-  out(3) = n_inv;
+  const double n_inv = 1.0 / n;
+  out(0) = static_cast<T>(normvec(0) * n_inv);
+  out(1) = static_cast<T>(normvec(1) * n_inv);
+  out(2) = static_cast<T>(normvec(2) * n_inv);
+  out(3) = static_cast<T>(n_inv);
   for (int j = 0; j < num_pts; ++j) {
     T x, y, z;
     get_xyz(j, x, y, z);

@@ -47,22 +47,6 @@ def generate_launch_description():
             condition=UnlessCondition(LaunchConfiguration('use_mapping')),
             msg='Mapping node disabled (use_mapping:=false): no /global_map or '
                 'map->odom TF will be published. Pass use_mapping:=true to enable.'),
-        launch_ros.actions.Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='livox_tf',
-            arguments=[
-                '--x', '0.010345', '--y', '0.022305', '--z', '-0.033211',
-                '--qx', '0.000002', '--qy', '0.000670', '--qz', '0.006906', '--qw', '0.999976',
-                '--frame-id', 'base_link', '--child-frame-id', 'livox_frame']),
-        launch_ros.actions.Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='hesai_tf',
-            arguments=[
-                '--x', '-0.016286160655580', '--y', '-0.010352248240829', '--z', '0.128925315833111',
-                '--qx', '-0.703743110426531', '--qy', '0.710453977622183', '--qz', '-0.000387167175118', '--qw', '0.000793920391926',
-                '--frame-id', 'base_link', '--child-frame-id', 'hesai_lidar']),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(viz_launch)),
         TimerAction(
@@ -74,7 +58,7 @@ def generate_launch_description():
                 name='RESPLE',
                 emulate_tty=True,
                 output='both',
-                parameters=[config_yaml_fusion],
+                parameters=[config_yaml_fusion, {'tf_extrinsics': False}],
                 arguments=['--ros-args', '--log-level', 'info'])
             ]),                 
         TimerAction(
@@ -87,7 +71,7 @@ def generate_launch_description():
                 name='Mapping',
                 emulate_tty=True,
                 output='both',
-                parameters=[config_yaml_fusion],
+                parameters=[config_yaml_fusion, {'tf_extrinsics': False}],
                 arguments=['--ros-args', '--log-level', 'info'])
             ])                
   ])

@@ -78,7 +78,9 @@ for the authoritative field list.
 | `odom/publish_tf` | `true` | RESPLE broadcasts `odom → base_link` |
 | `odom/invert_tf` | `false` | Invert the broadcast direction |
 | `map/publish_tf`, `map/invert_tf` | `true`, `false` | Same, Mapping node |
-| `cov_pose`, `cov_twist` | `[0.1 ×6]` | Diagonals for the Mapping node's odometry covariance |
+| `cov_pose`, `cov_twist` | `[0.2, 0.2, 0.2, 0.1, 0.1, 0.1]` | Diagonals for the Mapping node's odometry covariance (position/linear first three, orientation/angular last three) |
+| `tf_extrinsics` | `true` | `true`: the `base_link ← sensor` TF carries the mounting extrinsic (production convention; YAML `q_lb`/`t_lb` is an *extra* offset, normally identity). `false`: no TF consulted; clouds/IMU stay in their native frames and YAML `q_lb`/`t_lb` is the single extrinsic (upstream/dataset-replay convention — set by the dataset launches). Never publish a TF that duplicates a non-identity YAML extrinsic: the two compose and cancel. |
+| `tf_wait_timeout` | `10.0` | Seconds to wait for the sensor TF before falling back to the YAML-only convention (was: scans dropped forever) |
 
 ### Sensors
 
@@ -90,7 +92,7 @@ for the authoritative field list.
 | `<name>/topic_lidar` | — | Point cloud topic |
 | `<name>/lidar_type` | — | `Ouster`, `Hesai`, `Mid360Boxi`, `HAP360`, `Mid70Avia`, `AviaResple`, or **`PointCloud2`** (generic: field layout introspected at runtime — works with any driver) |
 | `<name>/blind` | — | Drop points within this radius (m) of the sensor |
-| `<name>/q_lb`, `<name>/t_lb` | — | LiDAR→body extrinsics (quaternion `w,x,y,z`; translation m) |
+| `<name>/q_lb`, `<name>/t_lb` | — | body→LiDAR extrinsics: `p_lidar = q_lb · p_body + t_lb` (quaternion `w,x,y,z`; translation m). The code inverts them (`q_bl = q_lb⁻¹`, `t_bl = q_lb⁻¹·(−t_lb)`) to map LiDAR points into the body frame — do **not** supply the LiDAR-pose-in-body here, it is the inverse of that |
 | `<name>/w_pt` | — | Per-point measurement weight |
 | `<name>/time_field` | `""` (auto) | `PointCloud2` type only: per-point time field name override |
 | `<name>/time_unit` | `auto` | `auto` \| `s` \| `ms` \| `us` \| `ns` |
@@ -98,6 +100,8 @@ for the authoritative field list.
 | `lidar_time_offset` | `0.0` | Constant offset (s) added to LiDAR stamps |
 | `imu_init_num_samples` | `50` | Stationary samples for gravity alignment |
 | `imu_init_max_variance` | `5.0` | Reject init if accel variance exceeds this (m/s²)² |
+| `lo_imu_wait_timeout` | `10.0` | LO mode only: seconds to wait for IMU before initializing without gravity alignment (identity orientation). LIO always requires IMU |
+| `cov_bias_acc_rw`, `cov_bias_gyro_rw` | `cov_RCP_pos_new·cov_sys_pos`, `cov_RCP_ort_new·cov_sys_ort` | LIO bias random-walk variance per knot step (rows 24–29 of Q). Defaults reproduce the magnitude the bias block received before the 2026-07-02 Q-indexing fix |
 
 ### Estimator core
 

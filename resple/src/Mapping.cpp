@@ -119,6 +119,11 @@ class MappingBase
         lidar_to_baselink_ = Eigen::Affine3d::Identity();
         imu_to_baselink_ = Eigen::Affine3d::Identity();
         baselink_to_imu_ = Eigen::Affine3d::Identity();
+        // Same extrinsic convention switch as the RESPLE node (findings
+        // #14/#22): the dataset launches pass tf_extrinsics=false so both
+        // nodes apply the YAML extrinsic once, to raw sensor-frame clouds.
+        tf_extrinsics_ = CommonUtils::readParam<bool>(nh->get_node_parameters_interface(), "tf_extrinsics", true);
+        tf_wait_timeout_ = CommonUtils::readParam<double>(nh->get_node_parameters_interface(), "tf_wait_timeout", 10.0);
 
         pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("global_map",
             rclcpp::QoS(2).reliable());
@@ -190,8 +195,25 @@ class MappingBase
                     pc_L_buff.pop_front();
                     continue;
                 }
-                const int64_t t_end_ns = front.header.stamp +
-                    int64_t(front.points.back().intensity * float(1e6));
+                // Scan end = MAX per-point time offset. The buffered cloud is
+                // VoxelGrid-filtered: points are re-ordered by voxel index and
+                // fields are centroid-averaged, so back().intensity is neither
+                // the last point nor a raw timestamp (finding #16). Cache per
+                // scan — the lag gate below re-tests the same front for many
+                // worker cycles.
+                int64_t t_end_ns;
+                if (front.header.stamp == t_end_cache_stamp_) {
+                    t_end_ns = t_end_cache_;
+                } else {
+                    float max_ofs_ms = 0.f;
+                    for (const auto& p : front.points) {
+                        max_ofs_ms = std::max(max_ofs_ms, p.intensity);
+                    }
+                    t_end_ns = int64_t(front.header.stamp) +
+                        int64_t(max_ofs_ms * float(1e6));
+                    t_end_cache_stamp_ = front.header.stamp;
+                    t_end_cache_ = t_end_ns;
+                }
                 last_t_end_ns = t_end_ns;
                 if (t_end_ns < spl->minTimeNs()) {
                     pc_L_buff.pop_front();
@@ -263,39 +285,59 @@ class MappingBase
     bool updateTransform(std::string source_frame_id)
     {
         if (!have_lidar_transform_) {
+            // YAML-only mode (tf_extrinsics=false): identity TF; the YAML
+            // q_lb/t_lb is applied once in transformPoint (findings #14/#22).
+            if (!tf_extrinsics_) {
+                have_lidar_transform_ = true;
+                have_imu_transform_ = true;
+                return true;
+            }
             try {
                 // Pre-check both frames exist in the buffer to avoid tf2's
                 // "Invalid frame ID … - frame does not exist" warning
                 // before the static TF publisher has propagated.
-                if (!tf_buffer_->_frameExists(this->frame_id) ||
-                    !tf_buffer_->_frameExists(source_frame_id)) {
-                    return false;
+                if (tf_buffer_->_frameExists(this->frame_id) &&
+                    tf_buffer_->_frameExists(source_frame_id) &&
+                    tf_buffer_->canTransform(this->frame_id, source_frame_id,
+                                             rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
+                    const auto transform = tf_buffer_->lookupTransform(
+                        this->frame_id, source_frame_id, rclcpp::Time(0));
+                    lidar_to_baselink_ = tf2::transformToEigen(transform);
+                    have_lidar_transform_ = true;
+                    Eigen::Translation3d translation(lidar.t_lb);
+                    Eigen::Affine3d imu_to_lidar = translation * lidar.q_lb;
+                    imu_to_baselink_ = lidar_to_baselink_ * imu_to_lidar;
+                    baselink_to_imu_ = imu_to_baselink_.inverse();
+                    have_imu_transform_ = true;
+                    RCLCPP_INFO(node_handle_->get_logger(), "[Mapping] Got LiDAR transform: %s -> %s",
+                            source_frame_id.c_str(), this->frame_id.c_str());
+                    return true;
                 }
-                geometry_msgs::msg::TransformStamped transform;
-                if (tf_buffer_->canTransform(this->frame_id, source_frame_id,
-                                                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
-                        transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id, 
-                                                                        rclcpp::Time(0));
-                        lidar_to_baselink_ = tf2::transformToEigen(transform);
-                        have_lidar_transform_ = true;
-                        Eigen::Translation3d translation(lidar.t_lb);
-                        Eigen::Affine3d imu_to_lidar = translation * lidar.q_lb;
-                        imu_to_baselink_ = lidar_to_baselink_ * imu_to_lidar;
-                        baselink_to_imu_ = imu_to_baselink_.inverse();
-                        have_imu_transform_ = true;
-                        RCLCPP_INFO(node_handle_->get_logger(), "[Mapping] Got LiDAR transform: %s -> %s", 
-                                source_frame_id.c_str(), this->frame_id.c_str());
-                    } else {
-                        RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000, 
-                                            "[Mapping] Waiting for LiDAR transform: %s -> %s", 
-                                            source_frame_id.c_str(), this->frame_id.c_str());
-                        return false;
-                    }
             } catch (tf2::TransformException& ex) {
-                RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000, 
+                RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
                                     "[Mapping] LiDAR transform exception: %s", ex.what());
-                return false;
             }
+            // Timed fallback (mirrors RESPLE's updateLidarTransform, finding
+            // #22): degrade to the YAML-only convention instead of dropping
+            // scans forever when no TF is ever published.
+            const auto now_mono = std::chrono::steady_clock::now();
+            if (!tf_first_attempt_set_) {
+                tf_first_attempt_ = now_mono;
+                tf_first_attempt_set_ = true;
+            } else if (std::chrono::duration<double>(now_mono - tf_first_attempt_).count()
+                           > tf_wait_timeout_) {
+                RCLCPP_WARN(node_handle_->get_logger(),
+                    "[Mapping] No TF %s -> %s after %.1f s; falling back to the YAML "
+                    "q_lb/t_lb extrinsic only (identity TF).",
+                    source_frame_id.c_str(), this->frame_id.c_str(), tf_wait_timeout_);
+                have_lidar_transform_ = true;
+                have_imu_transform_ = true;
+                return true;
+            }
+            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
+                                "[Mapping] Waiting for LiDAR transform: %s -> %s",
+                                source_frame_id.c_str(), this->frame_id.c_str());
+            return false;
         }
 
         return true;
@@ -310,15 +352,18 @@ class MappingBase
         Eigen::Vector3d t_itp;
         spl->itpQuaternion(time_ns, &q_itp);
         t_itp = spl->itpPosition(time_ns);
-        // pt_in is already in base_link (the sensor callbacks pre-transform
-        // the cloud via lidar_to_baselink_). The spline pose (q_itp, t_itp) is
-        // the IMU/body trajectory in world (same convention as RESPLE's
-        // Association::pointBodyToWorld). So go base_link -> IMU -> world.
-        // Applying lidar->IMU (lidar.q_bl/t_bl) here would double-count the
-        // extrinsic, since the point is no longer in the lidar frame.
+        // Mirror RESPLE's Association::pointBodyToWorld EXACTLY: the spline is
+        // the world<-base_link trajectory (RESPLE applies it to TF-transformed
+        // base_link points, with the YAML q_bl/t_bl as an extra offset that is
+        // identity in TF mode). The previous base_link -> "IMU" hop through
+        // baselink_to_imu_ = (TF * (t_lb,q_lb))^-1 re-applied the inverse TF
+        // extrinsic, rotating the whole map by the mounting transform relative
+        // to RESPLE's odometry whenever the TF is non-identity (bug-hunt
+        // 2026-07-02 finding #14). In YAML-only mode (tf_extrinsics=false) the
+        // buffered points are raw sensor-frame and q_bl/t_bl applies once,
+        // exactly like RESPLE.
         Eigen::Vector3d p_body(pt_in.x, pt_in.y, pt_in.z);
-        Eigen::Vector3d p_imu(baselink_to_imu_ * p_body);
-        Eigen::Vector3d p_global(q_itp * p_imu + t_itp);
+        Eigen::Vector3d p_global(q_itp * (lidar.q_bl * p_body + lidar.t_bl) + t_itp);
         PointType point_world;
         point_world.x = p_global(0);
         point_world.y = p_global(1);
@@ -386,6 +431,15 @@ class MappingBase
     Eigen::Affine3d lidar_to_baselink_;
     Eigen::Affine3d imu_to_baselink_;
     Eigen::Affine3d baselink_to_imu_;
+    // Extrinsic convention switch — mirrors RESPLE's (findings #14/#22):
+    // false = dataset/upstream mode, no TF consulted, YAML q_lb/t_lb only.
+    bool tf_extrinsics_ = true;
+    double tf_wait_timeout_ = 10.0;
+    std::chrono::steady_clock::time_point tf_first_attempt_{};
+    bool tf_first_attempt_set_ = false;
+    // Per-scan cache for the max-point-time scan end (finding #16).
+    std::uint64_t t_end_cache_stamp_ = 0;
+    int64_t t_end_cache_ = 0;
 
     typename pcl::PointCloud<PointType>::Ptr pc;
 };
