@@ -98,6 +98,28 @@ class Estimator
         return 1.0;
     }
 
+    // Close-range measurement down-weighting (commit 3bffada): variance is
+    // inflated by (range_ref/r)^2 below range_ref so one nearby surface
+    // cannot dominate H^T R^{-1} H in an otherwise-open scene. Parameterized
+    // (2026-07-02 narrow-tunnel follow-up): the protection is ABSOLUTE, so in
+    // a narrow tunnel where every return is close it degenerates into uniform
+    // information starvation — walls at 1 m cut ALL LiDAR information 9x, at
+    // 0.5 m 36x, and the filter coasts on the prior/IMU then snaps ("freaks
+    // out"). Narrow-space configs should lower range_ref (or set 0 = off).
+    // range_noise_scale_max bounds the inflation; the default 900 reproduces
+    // the old implicit (3/0.1)^2 ceiling from the 0.1 m range floor. Set once
+    // at configure (like corresp_cfg); worker-thread reads only.
+    double range_ref = 3.0;
+    double range_noise_scale_max = 900.0;
+
+    double rangeNoiseScale(float range_sensor) const
+    {
+        if (range_ref <= 0.0) return 1.0;
+        const double r = std::max(static_cast<double>(range_sensor), 0.1);
+        if (r >= range_ref) return 1.0;
+        return std::min((range_ref * range_ref) / (r * r), range_noise_scale_max);
+    }
+
     // Atomic because updateDiagnostics may read these from the ROS executor
     // thread while the worker is mid-IEKF. Monotonic; no reset — the diagnostics
     // publisher snapshots deltas.
@@ -611,19 +633,23 @@ class Estimator
     }
 
     // Decide whether this update's LiDAR constraint set is degenerate and
-    // cache the projector. Ett_sum = Σ n nᵀ over the rows actually filled.
-    void armLocGate(const Eigen::Matrix3d& Ett_sum, int n_used)
+    // cache the projector. Ett_sum = Σ w·n nᵀ over the rows actually filled,
+    // with w the relative information weight (1/rangeNoiseScale) so the gate
+    // sees the same starvation the filter does; w_sum normalizes so the
+    // eigenvalues still sum to 1 (unit normals), keeping the calibrated
+    // thresholds valid. All-far scenes (w == 1) reduce to the old Σ/n form.
+    void armLocGate(const Eigen::Matrix3d& Ett_sum, double w_sum, int n_used)
     {
         loc_gate_armed_ = false;
         loc_gate_axes_ = 0;
         loc_gate_infl_axes_ = 0;
-        if (loc_gate_trans_min_eig <= 0.0 || n_used < 20) return;
+        if (loc_gate_trans_min_eig <= 0.0 || n_used < 20 || w_sum <= 0.0) return;
         // Stricter, separate threshold for the advisory covariance inflation
         // (default: an order below the projection gate). Keeps healthy geometry
         // that merely trips the lenient gate from inflating the published cov.
         const double infl_thresh = loc_gate_cov_min_eig > 0.0
             ? loc_gate_cov_min_eig : 0.1 * loc_gate_trans_min_eig;
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(Ett_sum / static_cast<double>(n_used));
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(Ett_sum / w_sum);
         Eigen::Matrix3d VVt = Eigen::Matrix3d::Zero();
         Eigen::Matrix3d VVt_infl = Eigen::Matrix3d::Zero();
         for (int i = 0; i < 3; i++) {
@@ -759,6 +785,7 @@ class Estimator
         }
         int idx_offset = 0;
         Eigen::Matrix3d gate_Ett = Eigen::Matrix3d::Zero();
+        double gate_w = 0.0;
         int gate_n = 0;
         if (loc_gate_trans_min_eig > 0.0) {
             loc_gate_mask_ = Eigen::ArrayXd::Ones(num_valid);  // LO: all rows LiDAR
@@ -769,23 +796,30 @@ class Estimator
                 Eigen::Matrix<double, 1, XSIZE> Hi = Eigen::Matrix<double, 1, XSIZE>::Zero();
                 Hi.template leftCols<24>() = pt_data.H;
                 double lid_cov = Hi*cov_rcp*Hi.transpose() + pt_data.var_pt;
+                const double noise_scale = rangeNoiseScale(pt_data.range_sensor);
                 if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
                     innv_buf_(idx_offset) = - pt_data.zp;
                     H_buf_.row(idx_offset) = Hi;
                     if (loc_gate_trans_min_eig > 0.0) {
-                        gate_Ett.noalias() += pt_data.normvec * pt_data.normvec.transpose();
+                        // Weight E_tt by the row's RELATIVE information weight
+                        // (1/noise_scale): with the close-range down-weighting
+                        // active, an unweighted E_tt reads well-constrained
+                        // geometry while the weighted information matrix the
+                        // filter actually uses is starved — exactly the narrow
+                        // -tunnel case the gate exists for. Far points
+                        // (weight 1) reproduce the old accumulation exactly.
+                        const double w = 1.0 / noise_scale;
+                        gate_Ett.noalias() += w * (pt_data.normvec * pt_data.normvec.transpose());
+                        gate_w += w;
                         gate_n++;
                     }
                 }
-                constexpr double range_ref = 3.0;
-                double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
-                double noise_scale = (r < range_ref) ? (range_ref * range_ref) / (r * r) : 1.0;
                 cov_inv_buf_(idx_offset) =
                     robustWeight(pt_data.zp) / (pt_data.var_pt * noise_scale);
                 idx_offset++;
             }
         }
-        armLocGate(gate_Ett, gate_n);
+        armLocGate(gate_Ett, gate_w, gate_n);
         return update(innv_buf_, cov_inv_buf_, H_buf_, x_prop, P_prop);
     }
 
@@ -813,6 +847,7 @@ class Estimator
         size_t id_imu = 0;
         size_t id_pt = 0;
         Eigen::Matrix3d gate_Ett = Eigen::Matrix3d::Zero();
+        double gate_w = 0.0;
         int gate_n = 0;
         // LiDAR and IMU rows interleave by timestamp below; the gate needs to
         // know which gain columns belong to LiDAR (IMU keeps full authority).
@@ -826,18 +861,19 @@ class Estimator
                     if (pt_data.if_valid) {
                         Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
                         double lid_cov = pt_data.H*cov*pt_data.H.transpose() + pt_data.var_pt;
+                        const double noise_scale = rangeNoiseScale(pt_data.range_sensor);
                         if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
                             innv_buf_(idx_offset) = - pt_data.zp;
                             H_buf_.block(idx_offset, 0, 1, 24) = pt_data.H;
                             if (loc_gate_trans_min_eig > 0.0) {
                                 loc_gate_mask_(idx_offset) = 1.0;
-                                gate_Ett.noalias() += pt_data.normvec * pt_data.normvec.transpose();
+                                // Relative information weight — see updateLiDAR.
+                                const double w = 1.0 / noise_scale;
+                                gate_Ett.noalias() += w * (pt_data.normvec * pt_data.normvec.transpose());
+                                gate_w += w;
                                 gate_n++;
                             }
                         }
-                        constexpr double range_ref = 3.0;
-                        double r = std::max(static_cast<double>(pt_data.range_sensor), 0.1);
-                        double noise_scale = (r < range_ref) ? (range_ref * range_ref) / (r * r) : 1.0;
                         cov_inv_buf_(idx_offset) =
                             robustWeight(pt_data.zp) / (pt_data.var_pt * noise_scale);
                         idx_offset++;
@@ -874,7 +910,7 @@ class Estimator
                     id_imu++;
             }
         }
-        armLocGate(gate_Ett, gate_n);
+        armLocGate(gate_Ett, gate_w, gate_n);
         return update(innv_buf_, cov_inv_buf_, H_buf_, x_prop, P_prop);
     }
 

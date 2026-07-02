@@ -101,6 +101,8 @@ for the authoritative field list.
 | `imu_init_num_samples` | `50` | Stationary samples for gravity alignment |
 | `imu_init_max_variance` | `5.0` | Reject init if accel variance exceeds this (m/s²)² |
 | `lo_imu_wait_timeout` | `10.0` | LO mode only: seconds to wait for IMU before initializing without gravity alignment (identity orientation). LIO always requires IMU |
+| `range_ref` | `3.0` | Close-range down-weighting reference (m): point variance is inflated by `(range_ref/r)²` for `r < range_ref` so one nearby surface cannot dominate the update. **Absolute, not relative** — in a narrow space where every return is close it starves the whole update (9× at 1 m walls, 36× at 0.5 m) and the estimator gets jittery. Lower it (e.g. `1.0`) or set `0` (off) for narrow-tunnel missions |
+| `range_noise_scale_max` | `900.0` | Cap on that variance inflation (default = the old implicit `(3/0.1)²` ceiling) |
 | `cov_bias_acc_rw`, `cov_bias_gyro_rw` | `cov_RCP_pos_new·cov_sys_pos`, `cov_RCP_ort_new·cov_sys_ort` | LIO bias random-walk variance per knot step (rows 24–29 of Q). Defaults reproduce the magnitude the bias block received before the 2026-07-02 Q-indexing fix |
 
 ### Estimator core

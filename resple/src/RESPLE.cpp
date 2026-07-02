@@ -1841,6 +1841,25 @@ private:
             }
         }
 
+        // Close-range measurement down-weighting (commit 3bffada),
+        // parameterized 2026-07-02: the fixed 3 m reference protects against
+        // one nearby dominant surface in open scenes, but in a narrow tunnel
+        // (every return < range_ref) it starves the whole update 9-36x —
+        // observed in the field as jittery/"panicking" behaviour with many
+        // close points. Lower range_ref (e.g. 1.0) or set 0 to disable for
+        // narrow-space missions. Defaults reproduce the previous behaviour
+        // exactly (cap 900 = the old implicit (3/0.1)^2 ceiling).
+        {
+            const double rref = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "range_ref", 3.0);
+            const double rmax = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "range_noise_scale_max", 900.0);
+            estimator_lo.range_ref = rref;
+            estimator_lio.range_ref = rref;
+            estimator_lo.range_noise_scale_max = rmax;
+            estimator_lio.range_noise_scale_max = rmax;
+        }
+
         // §3.2 prototype: X-ICP-style degenerate-direction gate (translation
         // only). 0 disables (default — decision-gate rule: this changes the
         // estimator's update; enable only behind a bag A/B). Recommended
