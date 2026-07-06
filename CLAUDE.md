@@ -403,6 +403,22 @@ documented in this file:
   `updateKnots` pads mid-run est_window gaps to keep the replica time axis
   aligned; `setIdles` follows the arriving-delta convention.
 
+### Initial attitude (world←base_link)
+
+`initialization()` no longer derives the start orientation purely from the
+accelerometer. `init_attitude_source` selects: `gravity` (default, unchanged —
+accel only, blocks until stationary), `tf` (base_link attitude from the TF tree
+`init_attitude_frame → frame_id`; inits while moving), or `tf_gravity_check`
+(TF authoritative, accel cross-checks it when a stationary window exists and
+WARNs on disagreement — a free `imu→base_link` extrinsic check, surfaced as a
+diagnostic delta). **Invariant: the world frame is gravity-aligned (Z up) on
+every path** — TF modes take only roll/pitch (yaw stays a free gauge unless
+`init_yaw_from_tf`), the attitude frame MUST be gravity-aligned, and `gravity`
+is set to `[0,0,gravity_magnitude]` (default 9.81, exactly the old value). The
+pure-Eigen attitude math (`r2ypr`/`ypr2r`/`g2r`) moved to `geometry_core.h`
+(unit-tested: `test_geometry_core.cpp` `Attitude.*`); `CommonUtils::R2ypr/ypr2R/g2R`
+forward to it.
+
 "Measuring" means Phase 0 added a diagnostic metric; the fix is scheduled but
 gated on observing the signal. Do not implement a fix in category 4 / 5 / 7
 without the Phase 0 bag data — see `HARDENING.md` for decision gates.

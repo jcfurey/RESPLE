@@ -169,6 +169,59 @@ inline typename DerivedV::Scalar nis(const Eigen::MatrixBase<DerivedV>& innov,
 }
 
 // ---------------------------------------------------------------------------
+// Attitude helpers (yaw-pitch-roll <-> rotation, gravity alignment).
+//
+// Pure-Eigen so the gravity-init math is unit-testable without ROS.
+// CommonUtils::{R2ypr,ypr2R,g2R} forward here — one definition. Angle
+// convention is DEGREES (historical, matching the node) and the rotation
+// order is R = Rz(yaw)·Ry(pitch)·Rx(roll). Used by the initial-attitude
+// estimation (gravity alignment and the TF-attitude path).
+// ---------------------------------------------------------------------------
+inline Eigen::Vector3d r2ypr(const Eigen::Matrix3d& R) {
+  const Eigen::Vector3d n = R.col(0);
+  const Eigen::Vector3d o = R.col(1);
+  const Eigen::Vector3d a = R.col(2);
+  const double y = std::atan2(n(1), n(0));
+  const double p = std::atan2(-n(2), n(0) * std::cos(y) + n(1) * std::sin(y));
+  const double r = std::atan2(a(0) * std::sin(y) - a(1) * std::cos(y),
+                              -o(0) * std::sin(y) + o(1) * std::cos(y));
+  return Eigen::Vector3d(y, p, r) / M_PI * 180.0;
+}
+
+inline Eigen::Matrix3d ypr2r(const Eigen::Vector3d& ypr) {
+  const double y = ypr(0) / 180.0 * M_PI;
+  const double p = ypr(1) / 180.0 * M_PI;
+  const double r = ypr(2) / 180.0 * M_PI;
+  Eigen::Matrix3d Rz;
+  Rz << std::cos(y), -std::sin(y), 0,
+        std::sin(y),  std::cos(y), 0,
+        0,            0,           1;
+  Eigen::Matrix3d Ry;
+  Ry <<  std::cos(p), 0, std::sin(p),
+         0,           1, 0,
+        -std::sin(p), 0, std::cos(p);
+  Eigen::Matrix3d Rx;
+  Rx << 1, 0,           0,
+        0, std::cos(r), -std::sin(r),
+        0, std::sin(r),  std::cos(r);
+  return Rz * Ry * Rx;
+}
+
+// Rotation taking the measured gravity direction to world +Z, with yaw
+// removed — gravity observes only roll/pitch, never yaw, so the yaw gauge is
+// left free (zeroed). NOTE: FromTwoVectors is ill-conditioned as `g`
+// approaches anti-parallel to +Z (platform inverted); callers on
+// steeply-tilted rigs should prefer the TF-attitude path.
+inline Eigen::Matrix3d g2r(const Eigen::Vector3d& g) {
+  const Eigen::Vector3d ng1 = g.normalized();
+  const Eigen::Vector3d ng2{0, 0, 1.0};
+  Eigen::Matrix3d R0 = Eigen::Quaterniond::FromTwoVectors(ng1, ng2).toRotationMatrix();
+  const double yaw = r2ypr(R0).x();
+  R0 = ypr2r(Eigen::Vector3d{-yaw, 0, 0}) * R0;
+  return R0;
+}
+
+// ---------------------------------------------------------------------------
 // Axis-aligned box subtraction (HARDENING §3.4 radius map pruning).
 //
 // Carves `outer \ inner` into at most 6 axis-aligned slabs. The returned
