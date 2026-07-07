@@ -72,3 +72,15 @@ uint32 cycle_overruns
 # gap_extrap_knots: cumulative knots extrapolated beyond the free window
 # (gap fast-forwards; damped when gap_extrap_decay < 1).
 uint64 gap_extrap_knots
+
+# --- TF ownership guard (2026-07-07) ---
+# Foreign publishers observed on the TF pair this node broadcasts
+# (post-inversion odom->frame_id; self is stamp-matched out). same_pair =
+# another node fighting for the exact pair; other_parent = the child frame
+# claimed by a different parent (broken tree). tf_conflict_active = a foreign
+# observation within the last tf_conflict_quiet_sec; tf_yielding = the
+# 'yield' action is currently suspending our own broadcast.
+uint64 tf_foreign_same_pair
+uint64 tf_foreign_other_parent
+bool tf_conflict_active
+bool tf_yielding

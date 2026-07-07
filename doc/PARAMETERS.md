@@ -62,9 +62,11 @@ DIVERGED), recovery state (hold active, reset count), pose-covariance trace +
 λ_min, the correspondence funnel (`candidates → passed_window →
 passed_distance → passed_plane → used`), deskew out-of-range count, map size,
 prune/drop counters, per-stage frame timings (drain / IEKF / deskew /
-total / async map update), and the overload block (`rt_factor`, `backlog_ms`,
+total / async map update), the overload block (`rt_factor`, `backlog_ms`,
 `latency_wall_ms`, `shed_scans`, `cycle_overruns`, `gap_extrap_knots` — see
-"Resource-limited machines" below). See
+"Resource-limited machines" below), and the TF ownership guard
+(`tf_foreign_same_pair`, `tf_foreign_other_parent`, `tf_conflict_active`,
+`tf_yielding` — see "TF ownership" below). See
 [`estimate_msgs/msg/Diagnostics.msg`](../estimate_msgs/msg/Diagnostics.msg)
 for the authoritative field list.
 
@@ -83,6 +85,54 @@ for the authoritative field list.
 | `cov_pose`, `cov_twist` | `[0.2, 0.2, 0.2, 0.1, 0.1, 0.1]` | Diagonals for the Mapping node's odometry covariance (position/linear first three, orientation/angular last three) |
 | `tf_extrinsics` | `true` | `true`: the `base_link ← sensor` TF carries the mounting extrinsic (production convention; YAML `q_lb`/`t_lb` is an *extra* offset, normally identity). `false`: no TF consulted; clouds/IMU stay in their native frames and YAML `q_lb`/`t_lb` is the single extrinsic (upstream/dataset-replay convention). **Set per-rig in each config YAML** (next to `q_lb`/`t_lb`), not in the launch — the dataset configs ship `false`, the production/template configs ship `true`. Never publish a TF that duplicates a non-identity YAML extrinsic: the two compose and cancel. |
 | `tf_wait_timeout` | `10.0` | Seconds to wait for the sensor TF before falling back to the YAML-only convention (was: scans dropped forever) |
+| `tf_conflict_action` | `"warn"` | TF ownership guard (both nodes, shared name): what to do when **another node** publishes the TF pair this node broadcasts (RESPLE: `odom → frame_id`; Mapping: `map → odom`; post-inversion). `"warn"` = throttled ERROR + diagnostics, transforms unchanged. `"yield"` = keep publishing odometry/path **topics** but suspend our own TF broadcast while the foreign publisher is active — resumes automatically once it goes quiet for `tf_conflict_quiet_sec`. Self-published transforms are recognized by exact stamp match, so the guard never trips on its own DDS loopback. Also detects the watched **child** frame being claimed by a *different* parent (a TF child has exactly one parent — two parents break the tree even without a same-pair collision). See "TF ownership" below. |
+| `tf_conflict_quiet_sec` | `5.0` | How long the foreign publisher must stay quiet before `yield` resumes our broadcast (also the window for the `tf_conflict_active` diagnostic). |
+| `tf_absent_warn_sec` | `10.0` | Reverse misconfiguration check: when `publish_tf` is **false** (an external owner is expected — e.g. the odom EKF), WARN once if *nobody* has published the pair after this many seconds. `0` disables. |
+
+### TF ownership — coexisting with an external localization stack
+
+TF is a tree: every child frame has exactly **one** parent, and tf2 keeps the
+latest transform per pair with no concept of ownership. Two nodes publishing
+the same pair interleave at their two rates and every consumer sees the pose
+flicker/jump between them; a child claimed by two different parents breaks
+lookups outright. The guard above watches the raw `/tf` + `/tf_static` stream
+for exactly these two failures on the pair each node broadcasts, and its
+verdicts surface in `resple_diagnostics` (`tf_foreign_same_pair`,
+`tf_foreign_other_parent`, `tf_conflict_active`, `tf_yielding`) and as
+WARN/ERROR in `/diagnostics`.
+
+Recommended wiring when RESPLE runs inside a larger stack
+(`robot_localization` odom EKF, elevation_mapping, a global localizer):
+
+- **Odometry fusion (robot_localization / odom EKF owns the odom TF).** Set
+  `odom/publish_tf: false` — RESPLE stays a pure odometry *source*: the EKF
+  fuses the `/odometry` topic (whose pose covariance is the live IEKF
+  posterior, plus the §6.7 advisory inflation in degenerate geometry) and
+  owns `odom → base_footprint`. Note the on-robot configs typically set
+  `frame_id: base_footprint`, which makes RESPLE's would-be TF pair *exactly*
+  the EKF's pair — with both `publish_tf` flags on they fight for the same
+  transform, which is precisely the flicker the guard flags. The
+  `tf_absent_warn_sec` check covers the opposite mistake (RESPLE demoted but
+  the EKF never launched: TF consumers starve silently).
+- **elevation_mapping and other TF consumers** publish no TF themselves —
+  no conflict possible; they just need one consistent `odom → base` chain
+  and RESPLE's pose covariance.
+- **Map frame.** The Mapping node is visualization-side and owns
+  `map → odom` (plus a one-shot identity latch on `/tf_static` for the
+  cold-start window). If a global localizer / SLAM owns the map frame, set
+  `map/publish_tf: false` or simply run without Mapping
+  (`use_mapping:=false`, the launch default).
+- **`tf_conflict_action: yield`** is the belt-and-braces option for rigs
+  where the owner set may change at runtime (e.g. an EKF that starts late or
+  restarts): whichever RESPLE/Mapping TF has a live foreign owner is
+  suspended automatically instead of fighting, and resumes when the owner
+  disappears. Default stays `warn` (detect-only).
+
+Two-parent subtlety worth knowing: with `frame_id: base_link` and an EKF
+publishing `odom → base_footprint`, nobody collides on a *pair*, but the URDF
+static `base_footprint → base_link` plus RESPLE's `odom → base_link` give
+`base_link` **two parents** — the tree is just as broken. The guard reports
+this as a foreign-parent claim.
 
 ### Sensors
 

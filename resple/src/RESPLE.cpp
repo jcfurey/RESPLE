@@ -38,6 +38,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 #include <diagnostic_updater/diagnostic_updater.hpp>
 #include <diagnostic_updater/publisher.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
@@ -74,6 +75,7 @@
 #include "utils/point_cloud_ingest.h"
 #include "utils/filter_health.h"
 #include "utils/overload_control.h"
+#include "utils/tf_ownership.h"
 #ifdef RESPLE_USE_CUDA
 #include "gpu/cuda_knn.h"
 #endif
@@ -311,6 +313,20 @@ public:
             }
         }
         
+        // TF ownership guard: raw /tf + /tf_static watchers (absolute topic
+        // names — tf2_ros broadcasters publish there regardless of namespace).
+        // QoS mirrors the tf2_ros listener defaults (KeepLast(100); static is
+        // transient_local so a latched foreign static transform on our pair is
+        // seen even if it was published before we activated). Default callback
+        // group: the callback is O(frames) string compares, no heavy work.
+        sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+            "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
+            std::bind(&RESPLE::tfWatchCallback, this, std::placeholders::_1));
+        sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+            "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
+            std::bind(&RESPLE::tfWatchCallback, this, std::placeholders::_1));
+        tf_watch_start_ = std::chrono::steady_clock::now();
+
         // Start processing thread. The exited-flag store is the lambda's last
         // action so joinProcessingThreadBounded can tell "worker finished,
         // join() will return promptly" from "worker wedged, must detach"
@@ -377,6 +393,8 @@ public:
         sub_hesai.reset();
         sub_livox_mid360_boxi.reset();
         sub_generic.reset();
+        sub_tf_watch_.reset();
+        sub_tf_static_watch_.reset();
 
         // Drain any in-flight callbacks before on_cleanup tears down lidars_data
         // / m_buff state. Subscription::reset() drops the application's strong
@@ -622,6 +640,27 @@ public:
                             }
                             rtf_prev_spline_max_ = spline_max;
                             rtf_prev_wall_ = now_mono;
+                        }
+                        // TF ownership absence check (one-shot): demoted
+                        // (odom/publish_tf=false, external owner expected —
+                        // e.g. the robot_localization odom EKF) but nobody
+                        // has published our pair since activation. Downstream
+                        // TF consumers are silently starving.
+                        if (!publish_tf && tf_absent_warn_sec_ > 0 &&
+                            !tf_absence_warned_.load(std::memory_order_relaxed) &&
+                            !tf_own_monitor_.pairSeen()) {
+                            const double waited = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - tf_watch_start_).count();
+                            if (waited > tf_absent_warn_sec_) {
+                                tf_absence_warned_.store(true, std::memory_order_relaxed);
+                                RCLCPP_WARN(this->get_logger(),
+                                    "[RESPLE] odom/publish_tf=false but NO ONE has published "
+                                    "%s->%s in %.0f s. The external owner (odom EKF?) is not "
+                                    "wired up - TF consumers downstream are starving. Either "
+                                    "start it or set odom/publish_tf: true.",
+                                    tf_own_monitor_.parent().c_str(),
+                                    tf_own_monitor_.child().c_str(), waited);
+                            }
                         }
                         bool map_busy = map_update_pending_.load(std::memory_order_acquire)
                             && map_update_future_.valid()
@@ -1319,6 +1358,12 @@ public:
                     dmsg.gap_extrap_knots = if_lidar_only
                         ? estimator_lo.gapExtrapKnots()
                         : estimator_lio.gapExtrapKnots();
+                    // TF ownership guard.
+                    dmsg.tf_foreign_same_pair = tf_own_monitor_.foreignSamePair();
+                    dmsg.tf_foreign_other_parent = tf_own_monitor_.foreignOtherParent();
+                    dmsg.tf_conflict_active = tf_own_monitor_.foreignActiveWithin(
+                        steadyNowNs(), tf_conflict_quiet_ns_);
+                    dmsg.tf_yielding = tf_yield_active_.load(std::memory_order_relaxed);
                     pub_diag_->publish(dmsg);
                 }
 
@@ -1444,6 +1489,9 @@ private:
     // per-second rate, not a cumulative count).
     uint64_t last_numerical_failures_lo_ = 0;
     uint64_t last_numerical_failures_lio_ = 0;
+    // Per-window baseline for the TF-guard foreign-observation delta
+    // (updateDiagnostics only, executor thread).
+    uint64_t last_tf_foreign_total_ = 0;
     
     // Lifecycle management
     std::atomic<bool> processing_active_;
@@ -1532,6 +1580,69 @@ private:
     bool publish_tf, invert_tf;
     std::string frame_id;
     std::string odom_id;
+
+    // TF ownership guard (2026-07-07): watches the raw /tf (+ /tf_static)
+    // stream for a FOREIGN publisher on the pair this node broadcasts
+    // (post-inversion odom->frame_id). Self-vs-foreign is stamp-matched
+    // (utils/tf_ownership.h); the monitor's mutex is a leaf lock. Action:
+    //   warn  (default) - throttled ERROR + diagnostics, transforms unchanged
+    //   yield           - keep publishing odometry topics but suspend OUR TF
+    //                     broadcast while the foreign publisher was seen
+    //                     within tf_conflict_quiet_sec (auto-demotion; stops
+    //                     the flicker without operator intervention)
+    // When odom/publish_tf=false (external owner expected, e.g. the
+    // robot_localization odom EKF), the guard instead runs the ABSENCE check:
+    // one-shot WARN if nobody publishes the pair within tf_absent_warn_sec.
+    resple::tfown::TfOwnershipMonitor tf_own_monitor_;
+    std::string tf_conflict_action_ = "warn";
+    int64_t tf_conflict_quiet_ns_ = 5000000000LL;
+    double tf_absent_warn_sec_ = 10.0;
+    rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_watch_;
+    rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_static_watch_;
+    std::atomic<bool> tf_absence_warned_{false};
+    std::atomic<bool> tf_yield_active_{false};  // diagnostics: yield currently holding our TF
+    std::chrono::steady_clock::time_point tf_watch_start_{};  // set in on_activate
+
+    static int64_t steadyNowNs() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Raw /tf + /tf_static watcher (default callback group; O(frames) string
+    // compares per message, no allocation). Runs on the executor; the monitor
+    // synchronizes internally against the worker's notePublished.
+    void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg)
+    {
+        const int64_t now_ns = steadyNowNs();
+        for (const auto& ts : msg->transforms) {
+            const int64_t stamp_ns = rclcpp::Time(ts.header.stamp).nanoseconds();
+            const auto v = tf_own_monitor_.classify(
+                ts.header.frame_id, ts.child_frame_id, stamp_ns, now_ns);
+            if (!publish_tf) continue;  // demoted: foreign owner is EXPECTED here
+            if (v == resple::tfown::Verdict::FOREIGN_SAME_PAIR) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] TF ownership conflict: another publisher is broadcasting "
+                    "%s->%s (%lu foreign transforms so far). Two publishers on one TF "
+                    "pair make the pose flicker/jump. Either set odom/publish_tf: false "
+                    "here (RESPLE stays an odometry source for the external EKF) or "
+                    "disable the other publisher.%s",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str(),
+                    static_cast<unsigned long>(tf_own_monitor_.foreignSamePair()),
+                    tf_conflict_action_ == "yield"
+                        ? " tf_conflict_action=yield: suspending our broadcast while "
+                          "the other publisher is active." : "");
+            } else if (v == resple::tfown::Verdict::FOREIGN_OTHER_PARENT) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] TF tree conflict: frame '%s' is also claimed by parent "
+                    "'%s' while we publish %s->%s (%lu so far). A TF child has exactly "
+                    "one parent - the tree is broken and lookups will flap between "
+                    "parents. Fix the URDF/static publisher or our frame_id.",
+                    tf_own_monitor_.child().c_str(), ts.header.frame_id.c_str(),
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str(),
+                    static_cast<unsigned long>(tf_own_monitor_.foreignOtherParent()));
+            }
+        }
+    }
 
     std::map<std::string, LidarConfig> lidars;
     float ds_lm_voxel;
@@ -1907,6 +2018,29 @@ private:
 
         RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s",
                     odom_id.c_str(), frame_id.c_str());
+
+        // TF ownership guard (2026-07-07). Watched pair = the POST-inversion
+        // pair actually broadcast. configure() also resets the monitor for
+        // lifecycle re-cycles (readParameters runs from on_configure).
+        tf_conflict_action_ = CommonUtils::readParam<std::string>(
+            this->get_node_parameters_interface(), "tf_conflict_action", std::string("warn"));
+        if (tf_conflict_action_ != "warn" && tf_conflict_action_ != "yield") {
+            RCLCPP_WARN(this->get_logger(),
+                "[RESPLE] tf_conflict_action='%s' unknown (warn|yield); using 'warn'",
+                tf_conflict_action_.c_str());
+            tf_conflict_action_ = "warn";
+        }
+        tf_conflict_quiet_ns_ = static_cast<int64_t>(1e9 * CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "tf_conflict_quiet_sec", 5.0));
+        tf_absent_warn_sec_ = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "tf_absent_warn_sec", 10.0);
+        if (invert_tf) {
+            tf_own_monitor_.configure(frame_id, odom_id);
+        } else {
+            tf_own_monitor_.configure(odom_id, frame_id);
+        }
+        tf_absence_warned_.store(false, std::memory_order_relaxed);
+        tf_yield_active_.store(false, std::memory_order_relaxed);
 
         // Extrinsic convention (see updateLidarTransform): default true keeps
         // the production TF-based flow; dataset replay launches pass false so
@@ -2867,6 +3001,34 @@ private:
             }
         }
 
+        // TF ownership guard (2026-07-07): foreign publisher on the pair we
+        // broadcast. ERROR while actively conflicting; WARN when new foreign
+        // transforms were seen this window but the intruder has gone quiet.
+        {
+            const uint64_t tf_same = tf_own_monitor_.foreignSamePair();
+            const uint64_t tf_parent = tf_own_monitor_.foreignOtherParent();
+            const bool tf_active = tf_own_monitor_.foreignActiveWithin(
+                steadyNowNs(), tf_conflict_quiet_ns_);
+            const bool tf_yielding = tf_yield_active_.load(std::memory_order_relaxed);
+            stat.add("TF Foreign Publishes Same Pair (cumulative)", static_cast<int>(tf_same));
+            stat.add("TF Foreign Parent Claims (cumulative)", static_cast<int>(tf_parent));
+            stat.add("TF Conflict Active", tf_active);
+            stat.add("TF Yielding", tf_yielding);
+            const uint64_t tf_delta =
+                (tf_same + tf_parent) - last_tf_foreign_total_;
+            last_tf_foreign_total_ = tf_same + tf_parent;
+            if (publish_tf && tf_active) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+                msg = tf_yielding
+                    ? "TF ownership conflict active (yielding our broadcast)"
+                    : "TF ownership conflict active (two publishers on our pair)";
+            } else if (publish_tf && tf_delta > 0
+                       && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+                msg = "Foreign TF publisher observed this window";
+            }
+        }
+
         // HARDENING §3.3 recovery-policy observability: whether odometry/TF
         // publication is currently held, and how many covariance resets the
         // 'reset' mode has performed.
@@ -3490,6 +3652,21 @@ private:
         pub_odom->publish(odom_msg);
 
         if (publish_tf) {
+            // TF ownership guard 'yield': while a foreign publisher on our
+            // pair was seen within the quiet window, suspend OUR broadcast
+            // (odometry topics above keep flowing) instead of fighting it —
+            // interleaved publishers make the pose flicker. Resumes
+            // automatically once the intruder goes quiet.
+            const bool yield_now = tf_conflict_action_ == "yield"
+                && tf_own_monitor_.foreignActiveWithin(steadyNowNs(), tf_conflict_quiet_ns_);
+            tf_yield_active_.store(yield_now, std::memory_order_relaxed);
+            if (yield_now) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] yielding the %s->%s TF to a foreign publisher "
+                    "(tf_conflict_action=yield); odometry topics continue.",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str());
+                return;
+            }
             geometry_msgs::msg::TransformStamped transformStamped;
             transformStamped.transform.translation.x = pose_msg.pose.position.x;
             transformStamped.transform.translation.y = pose_msg.pose.position.y;
@@ -3509,6 +3686,10 @@ private:
                 transformStamped.header.frame_id = odom_id;
                 transformStamped.child_frame_id  = frame_id;
             }
+            // Record the exact wire stamp BEFORE sending so the DDS loopback
+            // of our own message can never race the ring insert.
+            tf_own_monitor_.notePublished(
+                rclcpp::Time(transformStamped.header.stamp).nanoseconds());
             br->sendTransform(transformStamped);
         }
     }

@@ -62,10 +62,12 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 
 #include "utils/common_utils.h"
 #include "SplineState.h"
 #include "utils/point_cloud_ingest.h"
+#include "utils/tf_ownership.h"
 
 template<typename PointType>
 class MappingBase
@@ -1003,6 +1005,29 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/publish_tf", true);
         invert_tf  = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/invert_tf", false);
+
+        // TF ownership guard (2026-07-07): same scheme as the RESPLE node
+        // (see utils/tf_ownership.h), watching the map->odom pair this node
+        // broadcasts. Shared param names — one knob configures both nodes.
+        tf_conflict_action_ = CommonUtils::readParam<std::string>(
+            this->get_node_parameters_interface(), "tf_conflict_action", std::string("warn"));
+        if (tf_conflict_action_ != "warn" && tf_conflict_action_ != "yield") {
+            RCLCPP_WARN(this->get_logger(),
+                "[Mapping] tf_conflict_action='%s' unknown (warn|yield); using 'warn'",
+                tf_conflict_action_.c_str());
+            tf_conflict_action_ = "warn";
+        }
+        tf_conflict_quiet_ns_ = static_cast<int64_t>(1e9 * CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "tf_conflict_quiet_sec", 5.0));
+        tf_absent_warn_sec_ = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "tf_absent_warn_sec", 10.0);
+        if (invert_tf) {
+            tf_own_monitor_.configure(odom_id, map_id);
+        } else {
+            tf_own_monitor_.configure(map_id, odom_id);
+        }
+        tf_absence_warned_.store(false, std::memory_order_relaxed);
+        tf_yield_active_.store(false, std::memory_order_relaxed);
         // amcl-style future-dating for the map->odom TF (seconds added to the
         // stamp). The transform is stamped at the (lagged) path tip, so exact-
         // time lookups in the map frame at fresh sensor stamps fail with
@@ -1069,8 +1094,17 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         auto large_reliable_qos = rclcpp::QoS(10000).reliable();
         sub_start = this->create_subscription<std_msgs::msg::Int64>("start_time", start_qos,
             std::bind(&Mapping::startCallBack, this, std::placeholders::_1));
-        sub_est = this->create_subscription<estimate_msgs::msg::Estimate>("est_window", large_reliable_qos, 
+        sub_est = this->create_subscription<estimate_msgs::msg::Estimate>("est_window", large_reliable_qos,
             std::bind(&Mapping::getEstCallback, this, std::placeholders::_1));
+        // TF ownership guard: raw /tf + /tf_static watchers (mirror of the
+        // RESPLE node's; see tfWatchCallback there for the rationale).
+        sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+            "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
+            std::bind(&Mapping::tfWatchCallback, this, std::placeholders::_1));
+        sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+            "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
+            std::bind(&Mapping::tfWatchCallback, this, std::placeholders::_1));
+        tf_watch_start_ = std::chrono::steady_clock::now();
         
         // Start processing thread (exited-flag store last, for the bounded
         // join's join-vs-detach decision — see joinProcessingThreadBounded).
@@ -1101,6 +1135,8 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         // Reset subscriptions
         sub_start.reset();
         sub_est.reset();
+        sub_tf_watch_.reset();
+        sub_tf_static_watch_.reset();
 
         // Clear init flag so a re-activation starts in the unitialized state.
         // Worker is joined; safe to write without ordering concerns. Also drop
@@ -1256,6 +1292,25 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 path_t_ns_ = 0;
                 opt_old_path.poses.clear();
             }
+            // TF ownership absence check (one-shot, mirror of the RESPLE
+            // node's): map/publish_tf=false means an external localizer is
+            // expected to own map->odom — WARN if nobody has published it.
+            if (!publish_tf && tf_absent_warn_sec_ > 0 &&
+                !tf_absence_warned_.load(std::memory_order_relaxed) &&
+                !tf_own_monitor_.pairSeen()) {
+                const double waited = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - tf_watch_start_).count();
+                if (waited > tf_absent_warn_sec_) {
+                    tf_absence_warned_.store(true, std::memory_order_relaxed);
+                    RCLCPP_WARN(this->get_logger(),
+                        "[Mapping] map/publish_tf=false but NO ONE has published "
+                        "%s->%s in %.0f s. The external owner (global localizer?) "
+                        "is not wired up - the map frame is dangling. Either start "
+                        "it or set map/publish_tf: true.",
+                        tf_own_monitor_.parent().c_str(),
+                        tf_own_monitor_.child().c_str(), waited);
+                }
+            }
             // Acquire-load on if_init_succeed pairs with startCallBack's
             // release-store so the staged start_pending_ / start_bag_time_pending_
             // are visible. Under Option B all spline_active_ mutation (init above
@@ -1368,6 +1423,59 @@ private:
     bool publish_tf, invert_tf;
     // map->odom TF future-dating in seconds (map/transform_tolerance, 0 = off).
     double map_tf_tolerance_ = 0.0;
+    // TF ownership guard (2026-07-07): mirror of the RESPLE node's, watching
+    // the (post-inversion) map->odom pair this node broadcasts. Both the
+    // dynamic transform and the static identity latch are whitelisted by
+    // stamp (notePublished / notePublishedStatic). Shared param names with
+    // RESPLE (tf_conflict_action / tf_conflict_quiet_sec / tf_absent_warn_sec)
+    // — both nodes read the same YAML.
+    resple::tfown::TfOwnershipMonitor tf_own_monitor_;
+    std::string tf_conflict_action_ = "warn";
+    int64_t tf_conflict_quiet_ns_ = 5000000000LL;
+    double tf_absent_warn_sec_ = 10.0;
+    rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_watch_;
+    rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_static_watch_;
+    std::atomic<bool> tf_absence_warned_{false};
+    std::atomic<bool> tf_yield_active_{false};
+    std::chrono::steady_clock::time_point tf_watch_start_{};
+
+    static int64_t steadyNowNs() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg)
+    {
+        const int64_t now_ns = steadyNowNs();
+        for (const auto& ts : msg->transforms) {
+            const int64_t stamp_ns = rclcpp::Time(ts.header.stamp).nanoseconds();
+            const auto v = tf_own_monitor_.classify(
+                ts.header.frame_id, ts.child_frame_id, stamp_ns, now_ns);
+            if (!publish_tf) continue;  // demoted: foreign owner is EXPECTED
+            if (v == resple::tfown::Verdict::FOREIGN_SAME_PAIR) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[Mapping] TF ownership conflict: another publisher is broadcasting "
+                    "%s->%s (%lu foreign transforms so far). Two publishers on one TF "
+                    "pair make the map frame flicker. Either set map/publish_tf: false "
+                    "here (a global localizer owns the map frame) or disable the other "
+                    "publisher.%s",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str(),
+                    static_cast<unsigned long>(tf_own_monitor_.foreignSamePair()),
+                    tf_conflict_action_ == "yield"
+                        ? " tf_conflict_action=yield: suspending our broadcast while "
+                          "the other publisher is active." : "");
+            } else if (v == resple::tfown::Verdict::FOREIGN_OTHER_PARENT) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[Mapping] TF tree conflict: frame '%s' is also claimed by parent "
+                    "'%s' while we publish %s->%s (%lu so far). A TF child has exactly "
+                    "one parent - fix the other publisher or our frame configuration.",
+                    tf_own_monitor_.child().c_str(), ts.header.frame_id.c_str(),
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str(),
+                    static_cast<unsigned long>(tf_own_monitor_.foreignOtherParent()));
+            }
+        }
+    }
+
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     // cuda-perf-nano addition: latch identity map→odom on first
     // startCallBack so the REP-105 chain is closed during the cold-start
@@ -1560,10 +1668,23 @@ private:
 
         pub_odom->publish(odom_msg);      
         
-        // Publish map transforms        
+        // Publish map transforms
         if(publish_tf)
         {
-            // Calculate desired frame to map transform            
+            // TF ownership guard 'yield': suspend our map->odom broadcast
+            // while a foreign publisher on the pair was seen within the quiet
+            // window (mirror of the RESPLE node's odom TF yield).
+            const bool yield_now = tf_conflict_action_ == "yield"
+                && tf_own_monitor_.foreignActiveWithin(steadyNowNs(), tf_conflict_quiet_ns_);
+            tf_yield_active_.store(yield_now, std::memory_order_relaxed);
+            if (yield_now) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[Mapping] yielding the %s->%s TF to a foreign publisher "
+                    "(tf_conflict_action=yield); odometry/path topics continue.",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str());
+                return;
+            }
+            // Calculate desired frame to map transform
             geometry_msgs::msg::TransformStamped baselink_to_map;
             baselink_to_map.header.stamp = odom_msg.header.stamp;
             baselink_to_map.header.frame_id = map_id;
@@ -1639,6 +1760,10 @@ private:
                     odom_to_map.header.frame_id = map_id;
                     odom_to_map.child_frame_id  = odom_id;
                 }
+                // Record the exact wire stamp BEFORE sending so the DDS
+                // loopback of our own message can never race the ring insert.
+                tf_own_monitor_.notePublished(
+                    rclcpp::Time(odom_to_map.header.stamp).nanoseconds());
                 br->sendTransform(odom_to_map);
             }
         }
@@ -1685,6 +1810,11 @@ private:
                 identity.child_frame_id  = odom_id;
             }
             identity.transform.rotation.w = 1.0;
+            // Static whitelist entry: /tf_static is transient_local, so this
+            // exact stamp can be re-delivered arbitrarily late — it must never
+            // age out of the self-stamp ring (see tf_ownership.h).
+            tf_own_monitor_.notePublishedStatic(
+                rclcpp::Time(identity.header.stamp).nanoseconds());
             static_br_->sendTransform(identity);
         }
     }
