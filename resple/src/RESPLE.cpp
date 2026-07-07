@@ -2179,7 +2179,7 @@ private:
                 return false;
             }
             if (!tf_buffer_->canTransform(init_attitude_frame_, this->frame_id,
-                                          rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
+                                          rclcpp::Time(0), rclcpp::Duration::from_seconds(0.0))) {
                 return false;
             }
             const auto tf = tf_buffer_->lookupTransform(
@@ -2215,9 +2215,14 @@ private:
                     return false;
                 }
                 geometry_msgs::msg::TransformStamped transform;
+                // Zero timeout (2026-07-07 review): this runs on the sensor
+                // callback thread HOLDING m_buff — a blocking wait here stalls
+                // the worker (init/collectMeasurements) and, because the sensor
+                // group is mutually exclusive, every other sensor callback.
+                // Callers retry at message rate, so waiting buys nothing.
                 if (tf_buffer_->canTransform(this->frame_id, source_frame_id,
-                                                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
-                        transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id, 
+                                                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.0))) {
+                        transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id,
                                                                         rclcpp::Time(0));
                         imu_to_baselink_ = transform;
                         
@@ -2277,7 +2282,7 @@ private:
             if (tf_buffer_->_frameExists(this->frame_id) &&
                 tf_buffer_->_frameExists(source_frame_id) &&
                 tf_buffer_->canTransform(this->frame_id, source_frame_id,
-                                         rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
+                                         rclcpp::Time(0), rclcpp::Duration::from_seconds(0.0))) {
                 const auto transform = tf_buffer_->lookupTransform(
                     this->frame_id, source_frame_id, rclcpp::Time(0));
                 lidar.lidar_to_baselink = tf2::transformToEigen(transform);

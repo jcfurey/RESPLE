@@ -187,3 +187,88 @@ TEST(PointCloudAdapter, ExplicitTimeUnitOverride) {
                            layout, cfg, out));
   EXPECT_NEAR(out[1].time_ms, 2.0, 1e-4);
 }
+
+// ----- Auto time-unit magnitude sniffing (2026-07-02 finding #23) ----------
+// The datatype convention alone (float=seconds, int=nanoseconds) misreads
+// absolute-epoch stamps in the "wrong" datatype; Auto now sniffs magnitude.
+
+TEST(PointCloudAdapter, AutoSniffsFloat64AbsoluteNanoseconds) {
+  // livox_ros_driver2-style: 'timestamp' float64 holding EPOCH NANOSECONDS.
+  // Under the old float=seconds convention the relative offsets came out
+  // 1e9x too large; the magnitude sniff must classify this as ns.
+  std::vector<FieldInfo> fields = {
+      {"x", 0, FLOAT32, 1}, {"y", 4, FLOAT32, 1}, {"z", 8, FLOAT32, 1},
+      {"timestamp", 12, FLOAT64, 1},
+  };
+  const uint32_t point_step = 20;
+  const uint32_t n = 3;
+  std::vector<uint8_t> data(point_step * n, 0);
+  const double t0 = 1.7e18;  // ~2023 epoch, nanoseconds
+  const double ts[3] = {t0, t0 + 1e5, t0 + 1e6};  // +0.1 ms, +1 ms
+  for (uint32_t i = 0; i < n; ++i) {
+    size_t base = i * point_step;
+    put<float>(data, base + 0, 1.f);
+    put<float>(data, base + 4, 2.f);
+    put<float>(data, base + 8, 3.f);
+    put<double>(data, base + 12, ts[i]);
+  }
+  auto layout = resolveLayout(fields);
+  ASSERT_TRUE(layout.valid && layout.has_time);
+  std::vector<OutPoint> out;
+  ASSERT_TRUE(convertCloud(data.data(), data.size(), point_step, n, false,
+                           layout, {}, out));
+  EXPECT_NEAR(out[0].time_ms, 0.0, 1e-4);
+  EXPECT_NEAR(out[1].time_ms, 0.1, 1e-3);
+  EXPECT_NEAR(out[2].time_ms, 1.0, 1e-3);
+}
+
+TEST(PointCloudAdapter, AutoSniffsUint64AbsoluteMicroseconds) {
+  std::vector<FieldInfo> fields = {
+      {"x", 0, FLOAT32, 1}, {"y", 4, FLOAT32, 1}, {"z", 8, FLOAT32, 1},
+      {"time", 12, FLOAT64, 1},
+  };
+  const uint32_t point_step = 20;
+  const uint32_t n = 2;
+  std::vector<uint8_t> data(point_step * n, 0);
+  const double t0 = 1.7e15;  // epoch microseconds
+  const double ts[2] = {t0, t0 + 500.0};  // +0.5 ms
+  for (uint32_t i = 0; i < n; ++i) {
+    size_t base = i * point_step;
+    put<float>(data, base + 0, 1.f);
+    put<float>(data, base + 4, 2.f);
+    put<float>(data, base + 8, 3.f);
+    put<double>(data, base + 12, ts[i]);
+  }
+  auto layout = resolveLayout(fields);
+  ASSERT_TRUE(layout.valid && layout.has_time);
+  std::vector<OutPoint> out;
+  ASSERT_TRUE(convertCloud(data.data(), data.size(), point_step, n, false,
+                           layout, {}, out));
+  EXPECT_NEAR(out[1].time_ms - out[0].time_ms, 0.5, 1e-6);
+}
+
+TEST(PointCloudAdapter, AutoKeepsConventionForRelativeOffsets) {
+  // Relative float32 seconds (Velodyne-style, values << 5e8): the sniff must
+  // NOT fire; the float=seconds convention applies as before.
+  std::vector<FieldInfo> fields = {
+      {"x", 0, FLOAT32, 1}, {"y", 4, FLOAT32, 1}, {"z", 8, FLOAT32, 1},
+      {"time", 12, FLOAT32, 1},
+  };
+  const uint32_t point_step = 16;
+  const uint32_t n = 2;
+  std::vector<uint8_t> data(point_step * n, 0);
+  const float ts[2] = {0.0f, 0.05f};  // 50 ms scan
+  for (uint32_t i = 0; i < n; ++i) {
+    size_t base = i * point_step;
+    put<float>(data, base + 0, 1.f);
+    put<float>(data, base + 4, 2.f);
+    put<float>(data, base + 8, 3.f);
+    put<float>(data, base + 12, ts[i]);
+  }
+  auto layout = resolveLayout(fields);
+  ASSERT_TRUE(layout.valid && layout.has_time);
+  std::vector<OutPoint> out;
+  ASSERT_TRUE(convertCloud(data.data(), data.size(), point_step, n, false,
+                           layout, {}, out));
+  EXPECT_NEAR(out[1].time_ms - out[0].time_ms, 50.0, 1e-3);
+}

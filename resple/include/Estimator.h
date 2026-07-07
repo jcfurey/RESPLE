@@ -221,6 +221,7 @@ class Estimator
         bool converged = true;
         int num_tot_eff = 0;
         int t = 0;
+        bool updated = false;
         for (int i = 0; i < max_iter; i++) {
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
@@ -235,8 +236,16 @@ class Estimator
                     break;
                 }
             } else {
+                // Zero correspondences THIS iteration. If an earlier iteration
+                // already applied an update, copy its Joseph-form posterior out
+                // before breaking — leaving the propagated prior would pair an
+                // updated state with a covariance that says nothing happened.
+                if (updated) {
+                    cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
+                }
                 break;
             }
+            updated = true;
             converged = true;
             Eigen::Matrix<double, XSIZE, 1> state_af = getState();
             if ((state_af - rcpi).norm() > eps) {
@@ -254,7 +263,14 @@ class Estimator
                 break;
             }
         }
-        accumGateInflation();   // once-per-frame advisory pose-cov inflation
+        // Advisory pose-cov inflation: only on frames that ran an update. A
+        // zero-correspondence frame carries no observability information, so
+        // the leaky integrator freezes rather than growing or decaying on the
+        // PREVIOUS frame's stale degeneracy verdict. (Total dropout is the NIS
+        // detector's jurisdiction, not the gate's.)
+        if (updated) {
+            accumGateInflation();
+        }
     }
 
 #ifdef RESPLE_USE_CUDA
@@ -279,6 +295,7 @@ class Estimator
         bool converged = true;
         int num_tot_eff = 0;
         int t = 0;
+        bool updated = false;
         for (int i = 0; i < max_iter; i++) {
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
@@ -293,8 +310,16 @@ class Estimator
                     break;
                 }
             } else {
+                // Zero correspondences THIS iteration. If an earlier iteration
+                // already applied an update, copy its Joseph-form posterior out
+                // before breaking — leaving the propagated prior would pair an
+                // updated state with a covariance that says nothing happened.
+                if (updated) {
+                    cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
+                }
                 break;
             }
+            updated = true;
             converged = true;
             Eigen::Matrix<double, XSIZE, 1> state_af = getState();
             if ((state_af - rcpi).norm() > eps) {
@@ -310,7 +335,14 @@ class Estimator
                 break;
             }
         }
-        accumGateInflation();   // once-per-frame advisory pose-cov inflation
+        // Advisory pose-cov inflation: only on frames that ran an update. A
+        // zero-correspondence frame carries no observability information, so
+        // the leaky integrator freezes rather than growing or decaying on the
+        // PREVIOUS frame's stale degeneracy verdict. (Total dropout is the NIS
+        // detector's jurisdiction, not the gate's.)
+        if (updated) {
+            accumGateInflation();
+        }
     }
 
     void updateIEKFLiDARInertial(Eigen::aligned_deque<PointData>& pt_meas,
@@ -334,6 +366,7 @@ class Estimator
         bool converged = true;
         int num_tot_eff = 0;
         int t = 0;
+        bool updated = false;
         for (int i = 0; i < max_iter; i++) {
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
@@ -346,6 +379,11 @@ class Estimator
             } else if (num_tot_eff > 0) {
                 update_ok = updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, g, cov_acc, cov_gyro, num_threads);
             } else {
+                // Zero correspondences THIS iteration — same posterior copy-out
+                // rationale as the LO variant above.
+                if (updated) {
+                    cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
+                }
                 break;
             }
             if (!update_ok) {
@@ -354,6 +392,7 @@ class Estimator
                 cov_rcp = cov_prop;
                 break;
             }
+            updated = true;
             converged = true;
             Eigen::Matrix<double, XSIZE, 1> state_af = getState();
             if ((state_af - rcpi).norm() > eps) {
@@ -369,7 +408,14 @@ class Estimator
                 break;
             }
         }
-        accumGateInflation();   // once-per-frame advisory pose-cov inflation
+        // Advisory pose-cov inflation: only on frames that ran an update. A
+        // zero-correspondence frame carries no observability information, so
+        // the leaky integrator freezes rather than growing or decaying on the
+        // PREVIOUS frame's stale degeneracy verdict. (Total dropout is the NIS
+        // detector's jurisdiction, not the gate's.)
+        if (updated) {
+            accumGateInflation();
+        }
     }
 #endif  // RESPLE_USE_CUDA
 
@@ -394,6 +440,7 @@ class Estimator
         bool converged = true;
         int num_tot_eff = 0;
         int t = 0;
+        bool updated = false;
         for (int i = 0; i < max_iter; i++) {
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
             if (converged) {
@@ -406,6 +453,11 @@ class Estimator
             } else if (num_tot_eff > 0) {
                 update_ok = updateLiDARInertial(pt_meas, imu_meas, num_tot_eff, rcp_prop, cov_prop, pt_thresh, cov_thresh, g, cov_acc, cov_gyro, num_threads);
             } else {
+                // Zero correspondences THIS iteration — same posterior copy-out
+                // rationale as the LO variant above.
+                if (updated) {
+                    cov_rcp = 0.5 * (cov_post_ + cov_post_.transpose());
+                }
                 break;
             }
             if (!update_ok) {
@@ -414,6 +466,7 @@ class Estimator
                 cov_rcp = cov_prop;
                 break;
             }
+            updated = true;
             converged = true;
             Eigen::Matrix<double, XSIZE, 1> state_af = getState();
             if ((state_af - rcpi).norm() > eps) {
@@ -431,7 +484,14 @@ class Estimator
                 break;
             }
         }
-        accumGateInflation();   // once-per-frame advisory pose-cov inflation
+        // Advisory pose-cov inflation: only on frames that ran an update. A
+        // zero-correspondence frame carries no observability information, so
+        // the leaky integrator freezes rather than growing or decaying on the
+        // PREVIOUS frame's stale degeneracy verdict. (Total dropout is the NIS
+        // detector's jurisdiction, not the gate's.)
+        if (updated) {
+            accumGateInflation();
+        }
     }
 
     void propRCP(int64_t t)
