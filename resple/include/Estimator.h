@@ -6,6 +6,7 @@
 #include <limits>
 #include "SplineState.h"
 #include "Association.h"
+#include "utils/overload_control.h"
 
 template<int XSIZE>
 class Estimator
@@ -118,6 +119,20 @@ class Estimator
         const double r = std::max(static_cast<double>(range_sensor), 0.1);
         if (r >= range_ref) return 1.0;
         return std::min((range_ref * range_ref) / (r * r), range_noise_scale_max);
+    }
+
+    // Overload hardening (2026-07-07): damping schedule for propRCP's
+    // constant-velocity extrapolation across data gaps. Defaults (decay 1.0)
+    // are a bit-identical no-op — the legacy expression is taken verbatim.
+    // Set once at configure (params gap_extrap_decay / gap_extrap_free_knots,
+    // pattern of corresp_cfg); worker-thread reads only.
+    resple::overload::GapExtrapDamping gap_extrap;
+
+    // Cumulative knots extrapolated beyond the free window (i.e. genuine gap
+    // fast-forwards, counted whether or not damping is active). Atomic because
+    // the diagnostics path reads it from the node while the worker is mid-cycle.
+    uint64_t gapExtrapKnots() const {
+        return gap_extrap_knots_.load(std::memory_order_relaxed);
     }
 
     // Atomic because updateDiagnostics may read these from the ROS executor
@@ -499,15 +514,49 @@ class Estimator
         if (spl.maxTimeNs() >= t) {
             cov_rcp += cov_sys;
         } else {
+            // k counts knots added by THIS call: steady state adds <= ~2 per
+            // call, while a shed/dropped-scan gap is fast-forwarded in one
+            // call — so gap_extrap.free_knots (default 3) exempts normal
+            // operation and the damping schedule engages only on real gaps.
+            int k = 0;
             while (spl.maxTimeNs() < t) {
                 Eigen::Matrix<double, 24, 1> cps_win = spl.getRCPs();
-                Eigen::Matrix<double, 6, 1> cp_prop_pos = 2*cps_win.block<6, 1>(12, 0) - cps_win.block<6, 1>(0, 0);
-                Eigen::Vector3d delta = cps_win.segment<3>(9);
-                spl.addOneStateKnot(cp_prop_pos.head<3>(), delta);
+                const double s = gap_extrap.scale(k);
+                if (k >= gap_extrap.free_knots) {
+                    gap_extrap_knots_.fetch_add(1, std::memory_order_relaxed);
+                }
+                Eigen::Vector3d cp_prop_pos;
+                Eigen::Vector3d delta;
+                if (s == 1.0) {
+                    // Literal legacy expression (damping off / free window):
+                    // stride-2 constant-velocity extrapolation, bit-identical
+                    // to the pre-damping code path.
+                    Eigen::Matrix<double, 6, 1> cp_prop = 2*cps_win.block<6, 1>(12, 0) - cps_win.block<6, 1>(0, 0);
+                    cp_prop_pos = cp_prop.head<3>();
+                    delta = cps_win.segment<3>(9);
+                } else {
+                    // Damped gap extrapolation (overload hardening): newest-
+                    // knot form p3 + s·(p3 − p2). Identical to the legacy
+                    // 2·p2 − p0 at constant velocity, but converges to a
+                    // clean hold-at-newest as s→0 — damping the legacy form
+                    // instead converges to a 2-cycle oscillation between the
+                    // last two knot positions (pinned in
+                    // test_overload_control.cpp). The rotation delta is
+                    // damped toward zero the same way. Covariance propagation
+                    // below is deliberately UNCHANGED (A·P·Aᵀ + Q per knot):
+                    // uncertainty keeps growing across the gap even though
+                    // the mean motion is damped.
+                    const Eigen::Vector3d p3 = cps_win.block<3, 1>(18, 0);
+                    const Eigen::Vector3d p2 = cps_win.block<3, 1>(12, 0);
+                    cp_prop_pos = p3 + s * (p3 - p2);
+                    delta = s * cps_win.segment<3>(9);
+                }
+                spl.addOneStateKnot(cp_prop_pos, delta);
                 cov_rcp = a_mat * cov_rcp * a_mat.transpose() + cov_sys;
+                ++k;
             }
         }
-    }    
+    }
 
     SplineState* getSpline() {
         return &spl;
@@ -649,6 +698,8 @@ class Estimator
     // update(); NaN if that update failed. Written by update() only.
     double last_nis_ = std::numeric_limits<double>::quiet_NaN();
     int last_nis_dof_ = 0;
+    // See gapExtrapKnots(): knots propRCP added beyond the free window.
+    std::atomic<uint64_t> gap_extrap_knots_{0};
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> innv_buf_;
     Eigen::Matrix<double, Eigen::Dynamic, 1> cov_inv_buf_;

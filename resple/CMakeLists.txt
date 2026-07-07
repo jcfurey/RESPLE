@@ -318,7 +318,8 @@ if(BUILD_TESTING)
   set(RESPLE_UNIT_TESTS
     test/test_geometry_core.cpp
     test/test_point_cloud_adapter.cpp
-    test/test_filter_health.cpp)
+    test/test_filter_health.cpp
+    test/test_overload_control.cpp)
   foreach(_test_src ${RESPLE_UNIT_TESTS})
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${_test_src})
       get_filename_component(_test_name ${_test_src} NAME_WE)

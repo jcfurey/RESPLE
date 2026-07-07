@@ -93,6 +93,20 @@ class MappingBase
         frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
         map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map/frame_id", "map");
         num_threads_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "num_threads", 5);
+        // Same OpenMP clamp as the RESPLE node (overload hardening 2026-07-07):
+        // configs written for big machines must not oversubscribe a small one.
+        {
+            const unsigned hc = std::thread::hardware_concurrency();
+            if (hc > 0) {
+                const int cap = std::max(1, static_cast<int>(hc) - 2);
+                if (num_threads_ > cap) {
+                    RCLCPP_WARN(nh->get_logger(),
+                        "num_threads=%d exceeds this machine's budget (%u cores - 2); "
+                        "clamping to %d", num_threads_, hc, cap);
+                    num_threads_ = cap;
+                }
+            }
+        }
         // Map lag in knots (see processScan). Default 8 = the convergence
         // horizon plus margin: the IEKF only updates the last 4 RCPs and
         // est_window only resends the last 5 knots, so a knot is FINAL once
@@ -106,6 +120,25 @@ class MappingBase
             RCLCPP_WARN(nh->get_logger(),
                 "map_deskew_lag_knots=%d is negative; using 0 (no lag)", deskew_lag_knots_);
             deskew_lag_knots_ = 0;
+        }
+        // Overload hardening (2026-07-07): the per-sensor scan-buffer cap was
+        // hardcoded 200, duplicated in every callback, and dropped silently
+        // (permanent map holes with no trace). Now parameterized (default 200
+        // = previous behaviour) and counted — see pushScanCapped().
+        max_scan_buffer_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "map/max_scan_buffer", 200);
+        if (max_scan_buffer_ < 1) {
+            RCLCPP_WARN(nh->get_logger(),
+                "map/max_scan_buffer=%d is < 1; using 1", max_scan_buffer_);
+            max_scan_buffer_ = 1;
+        }
+        // Batch publish: accumulate transformed scans and publish /global_map
+        // at most every N ms (0 = per-scan, previous behaviour). Batching
+        // never drops content — see processScan.
+        publish_min_interval_ms_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "map/publish_min_interval_ms", 0);
+        if (publish_min_interval_ms_ > 0) {
+            RCLCPP_INFO(nh->get_logger(),
+                "[Mapping] /global_map batched: publishing at most every %d ms",
+                publish_min_interval_ms_);
         }
 
         RCLCPP_INFO(nh->get_logger(), "Frame IDs -  map: %s, body: %s", 
@@ -131,6 +164,7 @@ class MappingBase
         pc_last.reset(new typename pcl::PointCloud<PointType>());
         pc_last_ds.reset(new typename pcl::PointCloud<PointType>());
         pc.reset(new typename pcl::PointCloud<PointType>());
+        pc_pending_.reset(new typename pcl::PointCloud<PointType>());
     }
 
     Eigen::Affine3d getLidarToBaselink()
@@ -141,6 +175,35 @@ class MappingBase
     Eigen::Affine3d getImuToBaselink()
     {
         return imu_to_baselink_;
+    }
+
+    // Single choke point for buffering a downsampled scan for the worker
+    // (overload hardening 2026-07-07 — replaces 7 identical inline cap blocks).
+    // Drops the OLDEST scans when the worker stalls: map holes are preferred
+    // to OOM, but they are now counted (cap_dropped in the 2 s summary) and
+    // WARNed instead of silent. Called from sensor callbacks only (serialized
+    // on cb_mtx_); the counter is atomic because processScan's summary reads
+    // it from the worker thread.
+    void pushScanCapped(const typename pcl::PointCloud<PointType>& cloud)
+    {
+        size_t n_dropped = 0;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            while (pc_L_buff.size() >= static_cast<size_t>(max_scan_buffer_)) {
+                pc_L_buff.pop_front();
+                ++n_dropped;
+            }
+            pc_L_buff.push_back(cloud);
+        }
+        if (n_dropped > 0) {
+            total_cap_dropped_.fetch_add(n_dropped, std::memory_order_relaxed);
+            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
+                "[Mapping] scan buffer full (map/max_scan_buffer=%d): dropping oldest "
+                "scans — the map will have holes here (%lu dropped total). The worker "
+                "is not keeping up (CPU contention or spline gate).",
+                max_scan_buffer_,
+                static_cast<unsigned long>(total_cap_dropped_.load(std::memory_order_relaxed)));
+        }
     }
 
     // Single definition of the sensor-callback guard policy: serialize the
@@ -239,8 +302,28 @@ class MappingBase
                 pc_L_buff.pop_front();
             }
             transformCloud(front_cloud, spl, pc);
-            publishMap(pc, pub_global_map);
+            if (publish_min_interval_ms_ <= 0) {
+                publishMap(pc, pub_global_map);
+            } else {
+                // Batch, don't drop (overload hardening 2026-07-07): every
+                // /global_map msg is ONE incremental scan that viewers
+                // accumulate, so a skipped publish would be a permanent map
+                // hole. Accumulate and flush on the interval below instead —
+                // fewer, larger messages for the same total content.
+                *pc_pending_ += *pc;
+            }
             n_published++;
+        }
+        // Interval flush for the batch mode. Runs even on ticks that consumed
+        // no scans so a gated/paused stream still drains the pending batch.
+        if (publish_min_interval_ms_ > 0 && !pc_pending_->points.empty()) {
+            const auto now_pub = node_handle_->get_clock()->now();
+            if ((now_pub - last_batch_publish_).nanoseconds() >=
+                int64_t(publish_min_interval_ms_) * 1000000LL) {
+                publishMap(pc_pending_, pub_global_map);
+                pc_pending_->clear();
+                last_batch_publish_ = now_pub;
+            }
         }
         // Update aggregate counters (cheap; called once per process-loop tick).
         total_published_ += n_published;
@@ -260,9 +343,10 @@ class MappingBase
             RCLCPP_INFO(node_handle_->get_logger(),
                 "[Mapping] processScan: pc_L_buff=%zu spline_knots=%ld "
                 "spline=[%ld..%ld] last_t_end=%ld "
-                "totals: published=%zu dropped_old=%zu pending_new=%zu",
+                "totals: published=%zu dropped_old=%zu pending_new=%zu cap_dropped=%lu",
                 buf_remaining, spl->numKnots(), s_min, s_max, last_t_end_ns,
-                total_published_, total_dropped_old_, total_pending_new_);
+                total_published_, total_dropped_old_, total_pending_new_,
+                static_cast<unsigned long>(total_cap_dropped_.load(std::memory_order_relaxed)));
         }
         return (n_published + n_dropped_old) > 0;
     }
@@ -410,6 +494,15 @@ class MappingBase
     size_t total_published_ = 0;
     size_t total_dropped_old_ = 0;
     size_t total_pending_new_ = 0;
+    // Scans evicted by the buffer cap (pushScanCapped). Atomic: written on
+    // the callback threads, read by the worker's 2 s summary.
+    std::atomic<uint64_t> total_cap_dropped_{0};
+    int max_scan_buffer_ = 200;
+    // Batch publish (map/publish_min_interval_ms, 0 = publish every scan).
+    // Worker-thread only.
+    int publish_min_interval_ms_ = 0;
+    rclcpp::Time last_batch_publish_{0, 0, RCL_ROS_TIME};
+    typename pcl::PointCloud<PointType>::Ptr pc_pending_;
     // Last gate-held front t_end — dedupes pending_new across worker cycles.
     int64_t last_gated_t_end_ns_ = 0;
     typename pcl::PointCloud<PointType>::Ptr pc_last;
@@ -500,12 +593,7 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds() - time_offset;
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -569,12 +657,7 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = stamp_ns - time_offset;
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -635,12 +718,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -699,12 +777,7 @@ public:
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -763,12 +836,7 @@ public:
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -830,12 +898,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(hesai_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -895,12 +958,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -1822,8 +1880,19 @@ int mappingMain(int argc, char** argv) {
         }
     }
     RCLCPP_INFO(node->get_logger(), "Mapping active - entering executor spin");
-    
-    rclcpp::executors::MultiThreadedExecutor exec;
+
+    // Overload hardening (2026-07-07): mirror of the RESPLE node's
+    // executor_threads. 0 (default) = rclcpp's one-thread-per-core.
+    const int executor_threads = CommonUtils::readParam<int>(
+        node->get_node_parameters_interface(), "executor_threads", 0);
+    if (executor_threads > 0) {
+        RCLCPP_INFO(node->get_logger(),
+            "MultiThreadedExecutor limited to %d threads (executor_threads)",
+            executor_threads);
+    }
+    rclcpp::executors::MultiThreadedExecutor exec(
+        rclcpp::ExecutorOptions(),
+        static_cast<size_t>(std::max(0, executor_threads)));
     exec.add_node(node->get_node_base_interface());
     exec.add_node(temp_nh);
     exec.spin();

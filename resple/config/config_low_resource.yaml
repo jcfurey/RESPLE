@@ -1,0 +1,118 @@
+# RESPLE config — low-resource profile (2026-07-07 overload hardening).
+#
+# For resource-limited machines (4-8 cores SHARED with other software) where
+# the default profile shows the overload signature: odometry jumping around
+# on bag playback or live, backlog_ms growing, rt_factor < 1 in
+# `resple_diagnostics`. Derived from config_ouster.yaml; the deltas are the
+# block at the bottom ("LOW-RESOURCE PROFILE") plus num_threads.
+#
+# Policy: DROP SCANS, STAY REAL-TIME. Stale queued scans are shed against a
+# data-time budget (max_latency_ms) and the estimator fast-forwards across
+# the gap with damped extrapolation (gap_extrap_decay) instead of processing
+# old data late and yanking the pose back.
+#
+# The Mapping node is assumed OFF (use_mapping:=false, the launch default):
+# publish_est_window is disabled below to save the reliable-QoS publish. If
+# you need the live map, set publish_est_window: true and consider
+# map/publish_min_interval_ms: 500 (batches /global_map without losing
+# content).
+/**:
+  ros__parameters:
+    # Frame IDs for TF tree
+    odom/frame_id: odom              # Odom (odometry frame_id) frame
+    map/frame_id: map                # Map frame (Mapping node publications)
+    frame_id: base_link              # Robot (odometry child_frame_id) frame
+
+    odom/publish_tf: True            # RESPLE broadcasts the odom->base_link TF
+    odom/invert_tf: False             # invert the odom->base_link broadcast direction
+    map/publish_tf: True             # Mapping node broadcasts the map->odom TF
+    map/invert_tf: False              # invert the map->odom broadcast direction
+
+    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
+    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
+
+    topic_imu: /sensor/lidar/lidar0/imu
+    acc_ratio: false
+    # Extrinsic convention: the base_link<-sensor TF carries the mounting
+    # extrinsic; q_lb/t_lb below is an EXTRA offset (identity here). Never
+    # make both non-identity — they compose. See doc/PARAMETERS.md.
+    tf_extrinsics: true
+    lidars: ["Ouster"]
+    Ouster:
+      topic_lidar: /sensor/lidar/lidar0/points
+      lidar_type: Ouster
+      scan_line: 128
+      blind: 0.5
+      q_lb: [1.0, 0.0, 0.0, 0.0]
+      t_lb: [0.0, 0.0, 0.0]
+      w_pt: 0.01
+    lidar_time_offset: 0.1
+
+    knot_hz: 100
+    if_lidar_only: false            # LIO mode (LiDAR-inertial)
+
+    ds_scan_voxel: 0.2
+    point_filter_num: 3
+    num_threads: 3                  # small OpenMP pool; the runtime clamp
+                                    # (hardware_concurrency - 2) also applies
+    nn_thresh: 0.5
+    coeff_cov: 3.0
+    num_match_points: 8    # k-NN for plane fit
+
+    ds_lm_voxel: 0.2
+    cube_len: 1000.0
+
+    cov_P0: 0.02
+    cov_RCP_pos_old: 0.1
+    cov_RCP_ort_old: 0.1
+    cov_RCP_pos_new: 1.0
+    cov_RCP_ort_new: 1.0
+    std_sys_pos: 0.2
+    std_sys_ort: 0.1
+    cov_acc: [1.0,1.0,1.0]
+    cov_gyro: [0.1,0.1,0.1]
+    cov_ba: [0.2, 0.2, 0.2]
+    cov_bg: [0.2, 0.2, 0.2]
+    n_iter: 1
+    num_points_upd: 500
+
+    imu_init_num_samples: 50     # IMU samples averaged during stationary init
+    imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+
+    spline_prune_keep_knots: 600   # knots kept in memory (~6 s @ knot_hz 100)
+    nn_max_sq_dist: 5.0            # k-th-neighbor max squared distance (m^2)
+    plane_fit_thresh: 0.1          # plane-fit residual threshold (m)
+    plane_min_cond_ratio: 0.0      # plane degeneracy guard; 0 = off
+    nis_window: 32                 # filter-consistency (NIS) window, IEKF cycles
+    nis_warn_ratio: 2.0            # WARN when NIS mean > ratio x dof
+    nis_diverged_ratio: 4.0        # DIVERGED threshold
+    nis_breach_limit: 3            # consecutive breaches before DIVERGED
+    nis_recovery_mode: "off"       # keep quotes: bare off is YAML false
+    nis_reset_cov: 1.0             # 'reset' reinflation variance (m^2/rad^2)
+    map_prune_radius: 0.0          # 0 = cube-only (cube_len)
+
+    # ------------------------------------------------------------------
+    # LOW-RESOURCE PROFILE (the point of this file — see doc/PARAMETERS.md
+    # "Resource-limited machines" for the symptom → metric → knob map).
+    # ------------------------------------------------------------------
+    executor_threads: 2            # cap the ROS executor pool (default 0 =
+                                   # one thread per core); the sensor group is
+                                   # MutuallyExclusive so >2 buys ~nothing
+    max_latency_ms: 200            # DATA-TIME latency budget per LiDAR queue:
+                                   # queued scans older than this vs the newest
+                                   # arrival are shed (counted: shed_scans)
+    max_scan_buffer: 20            # hard count cap behind the budget (2 s of
+                                   # scans at 10 Hz; drop-oldest, counted)
+    max_imu_staging: 2000          # IMU staging cap (samples, drop-oldest)
+    gap_extrap_decay: 0.9          # damp propRCP's constant-velocity
+                                   # extrapolation across shed gaps: velocity
+                                   # decays geometrically toward a hold, so the
+                                   # post-gap correction stays bounded
+    gap_extrap_free_knots: 3       # knots per propRCP call exempt from the
+                                   # decay (steady state adds <= ~2; only real
+                                   # gaps engage the damping)
+    publish_current_scan: false    # skip the /current_scan world-cloud copy +
+                                   # publish (visualization only)
+    publish_est_window: false      # skip /est_window — ONLY valid with the
+                                   # Mapping node off (use_mapping:=false); it
+                                   # is Mapping's sole input

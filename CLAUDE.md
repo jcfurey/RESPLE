@@ -369,6 +369,7 @@ reference (status as of latest pass):
 | 36 | `processData` lidar-buffer drain checked `while (!lidar_data.t_buff.empty())` OUTSIDE `mtx_pc`, racing the sensor callback's locked `t_buff.push_back` on the deque internals | **fixed** (Phase 2.6: check emptiness under `mtx_pc` — `while(true){ lock; if(empty) break; … }`). TSan data-path sweep, real-race count 18→0 | 2.6 |
 | 37 | async map-update task read the spline (`lasermapFovSegment → getPositionLiDAR → itpPosition/itpQuaternion`) holding only `mtx_map_`, while the worker grows the spline (`collectMeasurements → addOneStateKnot`) under `spline_mutex_` ALONE (no `mtx_map_`) → race | **fixed** (Phase 2.6: take `spline_mutex_` in `lasermapFovSegment`; order `mtx_map_ → spline_mutex_` preserved). TSan-verified | 2.6 |
 | 38 | `joinProcessingThreadBounded` (both nodes) dispatched `join()` onto a `std::async` task and `detach()`ed from the lifecycle thread on timeout — two threads racing on the same `std::thread` object (UB when the worker exited at the deadline; TSan runtime CHECK-abort in `pthread_detach`), and the async future's dtor un-bounded the wait | **fixed** (worker lambda release-stores `processing_thread_exited_` as its last action; bounded join polls the flag, then join-or-detach single-threaded) | 2.7 |
+| 69 | Unbounded processing **latency** under CPU overload (distinct from hazard 5's memory bound): the worker drains the whole scan backlog per pass, so on a starved machine the pose output lags, then bursts — and after any drop `propRCP` extrapolated constant-velocity across the gap with no horizon, yanking the pose on re-entry (and tripping the IMU residual gate via garbage `imu_itp`) | **capability landed, default off** (2026-07-07 overload hardening: `max_latency_ms` data-time shedding in `pushScanBounded` via `utils/overload_control.h`; `gap_extrap_decay` damped propRCP re-entry; `executor_threads` cap; `publish_current_scan`/`publish_est_window` gates; Mapping `map/max_scan_buffer` counted drops + `map/publish_min_interval_ms` batch publish; overload block in the Diagnostics msg: `rt_factor`/`backlog_ms`/`shed_scans`/`cycle_overruns`/`gap_extrap_knots`. One deliberate default change: `num_threads` clamps to `hardware_concurrency−2` at runtime. Profile: `config_low_resource.yaml`; see PARAMETERS.md "Resource-limited machines") | 2026-07-07 |
 
 **2026-07-02 bug hunt (hazards 39–68):** a multi-agent audit against the RESPLE
 paper (arXiv:2504.11580), Sommer et al. 2020 (arXiv:1911.08860), the ASIG-X
@@ -446,6 +447,16 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `nis_recovery_mode` | §3.3 divergence recovery: `off` (detect-only) / `hold` (gate odom+TF while DIVERGED) / `reset` (reinflate IEKF covariance to `nis_reset_cov`) | `off` |
 | `max_scan_buffer` | §2.3 per-LiDAR raw-scan cap (scans, drop-oldest; 0 = unbounded) | `0` |
 | `max_imu_staging` | §2.3 IMU staging cap (samples, drop-oldest; was hardcoded 2000) | `2000` |
+| `max_latency_ms` | overload hardening: per-LiDAR DATA-TIME latency budget; queued scans older than this vs the newest arrival are shed (counted as `shed_scans`; 0 = off) | `0` |
+| `gap_extrap_decay` | damping for propRCP's across-gap constant-velocity extrapolation (1.0 = off, literal legacy expression; <1 decays velocity toward a hold beyond `gap_extrap_free_knots`) | `1.0` |
+| `gap_extrap_free_knots` | knots per propRCP call exempt from the decay (steady state adds ≤ ~2) | `3` |
+| `executor_threads` | MultiThreadedExecutor pool cap, both nodes (0 = rclcpp default: one per core) | `0` |
+| `publish_current_scan` / `publish_est_window` | publisher gates; est_window may only be disabled with Mapping off (its sole input) | `true` |
+| `map/max_scan_buffer` / `map/publish_min_interval_ms` | Mapping: per-sensor buffer cap (was silent hardcoded 200; drops now counted) / batch-don't-drop `/global_map` interval (0 = per-scan) | `200` / `0` |
+
+`num_threads` is clamped at runtime to `max(1, hardware_concurrency − 2)`
+with a WARN (both nodes) — the shipped configs assume a big machine. The one
+deliberate default-behaviour change of the overload-hardening series.
 
 The `cube_len` hardcoded default in code (`RESPLE.cpp:580`, value 2000) is
 overridden by the param; check the logged value on startup rather than reading

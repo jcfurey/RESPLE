@@ -61,8 +61,10 @@ depths, IEKF numerical-failure count, NIS + dof + filter state (OK/WARN/
 DIVERGED), recovery state (hold active, reset count), pose-covariance trace +
 λ_min, the correspondence funnel (`candidates → passed_window →
 passed_distance → passed_plane → used`), deskew out-of-range count, map size,
-prune/drop counters, and per-stage frame timings (drain / IEKF / deskew /
-total / async map update). See
+prune/drop counters, per-stage frame timings (drain / IEKF / deskew /
+total / async map update), and the overload block (`rt_factor`, `backlog_ms`,
+`latency_wall_ms`, `shed_scans`, `cycle_overruns`, `gap_extrap_knots` — see
+"Resource-limited machines" below). See
 [`estimate_msgs/msg/Diagnostics.msg`](../estimate_msgs/msg/Diagnostics.msg)
 for the authoritative field list.
 
@@ -159,12 +161,61 @@ All behaviour-preserving or opt-in by default. Section references are to
 | `map_prune_radius` | `0.0` | §3.4 keep only map points within this distance (m) of the pose; floored at 2× the detection range so it cannot bite live measurements. `0` = cube-only behaviour (`cube_len`). The FOV cube alone never deletes while the robot stays inside it. |
 | `max_scan_buffer` | `0` | §2.3 per-LiDAR raw-scan cap (scans, drop-oldest). `0` = unbounded. Engaging drops are counted in diagnostics. |
 | `max_imu_staging` | `2000` | §2.3 IMU staging-buffer cap (samples, drop-oldest); `0` disables. |
+| `max_latency_ms` | `0` | Overload hardening ("drop scans, stay real-time"): per-LiDAR **data-time** latency budget. When a scan arrives, queued scans of the *same* LiDAR whose stamps are more than this many ms older than it are shed before the worker ever sees them (counted separately as `shed_scans`; throttled WARN while engaging). Data-time semantics: independent of bag playback rate, needs no wall clock, survives sim-time jumps; a bag-loop restart (time going backwards) never sheds. The newest queued scan is only shed when the incoming push immediately replaces it. `0` = off (legacy unbounded latency). |
+| `gap_extrap_decay` | `1.0` | Overload hardening: damping for `propRCP`'s constant-velocity extrapolation across data gaps (after sheds/drops). `1.0` = off — the literal legacy expression, bit-identical. `<1`: for each knot beyond `gap_extrap_free_knots` within one propRCP call, the extrapolated velocity is scaled by `decay^(excess)`, converging to a hold-at-newest — the excursion across a gap is bounded by ~`free + v/(1−decay)` knots of travel instead of growing linearly, so the first post-gap update yanks the pose far less (and the IMU residual gate is not tripped by runaway extrapolation). Covariance propagation is unchanged (keeps growing across the gap). |
+| `gap_extrap_free_knots` | `3` | Knots per `propRCP` call exempt from the decay. Steady-state calls add ≤ ~2 knots, so the default engages the damping only on genuine gaps. Inert while `gap_extrap_decay` = 1 (the `gap_extrap_knots` diagnostic still counts gap fast-forwards). |
+| `executor_threads` | `0` | Cap on the `MultiThreadedExecutor` thread pool (both nodes). `0` = rclcpp default (one thread per core — oversubscription on small shared machines). The sensor callback group is MutuallyExclusive, so `2` is enough almost everywhere. |
+| `publish_current_scan` | `true` | `false` skips the `/current_scan` world-cloud copy + publish (RESPLE node). Visualization-only output; odometry and the internal map are unaffected. |
+| `publish_est_window` | `true` | `false` skips the `/est_window` publish (RESPLE node). **Only valid with the Mapping node off** (`use_mapping:=false`, the launch default) — `/est_window` is Mapping's sole input and it starves silently without it. A loud WARN fires at configure when disabled. |
+| `map/max_scan_buffer` | `200` | Mapping node: per-sensor scan-buffer cap (was hardcoded 200 and dropped **silently**; now counted as `cap_dropped` in the 2 s summary + throttled WARN — cap-drops are permanent map holes). |
+| `map/publish_min_interval_ms` | `0` | Mapping node: batch `/global_map` publishes — transformed scans accumulate and flush at most every N ms. **Batches, never drops**: each publish is an incremental scan viewers accumulate, so content is preserved, just in fewer/larger messages. `0` = per-scan (legacy). |
+
+Additionally, `num_threads` (both nodes) is now clamped at runtime to
+`max(1, hardware_concurrency − 2)` with a WARN — the shipped configs assume a
+big machine, and the old value 8 oversubscribed 4–6-core boxes so badly the
+worker lost its cores mid-IEKF. This is the one deliberate default-behaviour
+change of the overload-hardening series; on ≥ `num_threads + 2` cores nothing
+changes.
 
 **Tuning workflow:** leave the defaults; record `resple_diagnostics`; only
 then adjust. The funnel counters localize correspondence losses (sparse map
 vs degenerate patches vs association outliers), `Spline Knots (total)` and
 the drop counters show memory pressure, and the NIS fields show filter
 consistency before/after any change.
+
+### Resource-limited machines (odometry "jumping around")
+
+On a small or shared CPU (4–8 cores next to other software) the default
+profile fails in a specific shape: the worker falls behind the sensor stream,
+the un-capped input queue grows, and the worker then drains the whole backlog
+in one burst — the pose output freezes and then jumps. If scans get dropped,
+`propRCP` extrapolates constant-velocity across the gap without a horizon and
+the first post-gap update yanks the pose back (worse in LIO: a runaway
+extrapolation makes the interpolated IMU prediction garbage, which trips the
+IMU residual gate and disables the IMU exactly when it is the only
+stabilizer).
+
+Diagnose before tuning — the overload block of `resple_diagnostics` (and the
+same metrics in `/diagnostics`):
+
+| Symptom | Metric | Knob |
+| --- | --- | --- |
+| Output freezes then jumps; latency grows over a run | `backlog_ms` climbing, `rt_factor < 1` | `max_latency_ms: 200` — bounds the data-time backlog by shedding the *oldest* queued scans; the estimator stays at the front of the stream. `backlog_ms` then saw-tooths ≤ ~budget instead of growing. |
+| Pose lurches right after WARN-logged sheds/drops | `shed_scans` / `dropped_scans` climbing + jump at the same time | `gap_extrap_decay: 0.9` — damps the across-gap extrapolation toward a hold so the re-entry correction is bounded. `gap_extrap_knots` counts how often gaps are being fast-forwarded. |
+| Everything slow, other processes starved, no single hot spot | `cycle_overruns` climbing, whole machine loaded | `num_threads` (auto-clamped), `executor_threads: 2`, and the publisher gates `publish_current_scan: false` / `publish_est_window: false` (the latter only with Mapping off). |
+| Map has holes / Mapping WARNs about dropped scans | `cap_dropped` in the Mapping 2 s summary | Mapping is optional — prefer running without it when starved. Otherwise raise `map/max_scan_buffer` and batch with `map/publish_min_interval_ms: 500` (batching never loses content). |
+
+`config_low_resource.yaml` bundles the recommended values (budget 200 ms,
+decay 0.9, 3 OpenMP + 2 executor threads, both publishers gated, Mapping
+assumed off).
+
+Caveats: `rt_factor` reads ≈1 *by design* once shedding is active (data time
+is fast-forwarded) — read it together with `shed_scans`; `backlog_ms` is the
+rate-independent ground truth. `latency_wall_ms` is only meaningful live or
+with `ros2 bag play --clock` + `use_sim_time`. Multi-lidar: the budget is
+per-LiDAR (a lagging-clock lidar is judged only against itself); after a
+shed, the existing fast-forward + admission gate drop other lidars' stale
+points — that is the chosen policy, not a bug.
 
 ## Reproducing the original (`main`) behavior for A/B comparison
 

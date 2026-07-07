@@ -73,6 +73,7 @@
 #include "Estimator.h"
 #include "utils/point_cloud_ingest.h"
 #include "utils/filter_health.h"
+#include "utils/overload_control.h"
 #ifdef RESPLE_USE_CUDA
 #include "gpu/cuda_knn.h"
 #endif
@@ -136,7 +137,27 @@ public:
         } else {
             num_match_points_ = this->get_parameter("num_match_points").as_int();
         }
-        
+
+        // Overload hardening (2026-07-07): clamp the OpenMP width to what the
+        // machine can actually give without starving the ROS executor and the
+        // async map-update thread. Every shipped config hardcodes num_threads
+        // for a big machine; on a 4-6 core box that oversubscribes the CPU and
+        // the worker loses its cores mid-IEKF. Deliberate default-behaviour
+        // change on small machines (< num_threads+2 cores) — see CLAUDE.md.
+        {
+            const unsigned hc = std::thread::hardware_concurrency();
+            if (hc > 0) {
+                const int cap = std::max(1, static_cast<int>(hc) - 2);
+                if (num_threads_ > cap) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "num_threads=%d exceeds this machine's budget (%u cores - 2 "
+                        "reserved for executor/map thread); clamping to %d",
+                        num_threads_, hc, cap);
+                    num_threads_ = cap;
+                }
+            }
+        }
+
         RCLCPP_INFO(this->get_logger(), "Using %d threads for parallel processing", num_threads_);
         RCLCPP_INFO(this->get_logger(), "Using %d nearest neighbor points for matching", num_match_points_);
         
@@ -581,6 +602,27 @@ public:
                         const bool init_done = if_init_filter.load();
                         int64_t spline_max = (init_done && spline) ? spline->maxTimeNs() : 0;
                         int64_t spline_n   = (init_done && spline) ? spline->numKnots() : 0;
+                        // Real-time factor: spline data-time advance / wall time
+                        // over this ~2 s window. Only meaningful when the IEKF
+                        // ran in the window (else an idle/paused bag reads as 0).
+                        // With latency shedding active this stays ~1 by design —
+                        // read together with shed_scans.
+                        {
+                            const auto now_mono = std::chrono::steady_clock::now();
+                            if (rtf_prev_spline_max_ > 0 && spline_max > 0 &&
+                                hb_iekf_count > 0) {
+                                const double wall_s = std::chrono::duration<double>(
+                                    now_mono - rtf_prev_wall_).count();
+                                if (wall_s > 0.5) {
+                                    const double data_s =
+                                        double(spline_max - rtf_prev_spline_max_) / 1e9;
+                                    rt_factor_.store(static_cast<float>(data_s / wall_s),
+                                                     std::memory_order_relaxed);
+                                }
+                            }
+                            rtf_prev_spline_max_ = spline_max;
+                            rtf_prev_wall_ = now_mono;
+                        }
                         bool map_busy = map_update_pending_.load(std::memory_order_acquire)
                             && map_update_future_.valid()
                             && map_update_future_.wait_for(std::chrono::seconds(0))
@@ -588,10 +630,14 @@ public:
                         RCLCPP_INFO(this->get_logger(),
                             "[RESPLE] heartbeat: loops=%zu iekf=%zu coll_false=%zu "
                             "pc_buff=%zu pt_buff=%zu imu_int=%zu "
-                            "spline_knots=%ld spline_max=%ld map_busy=%d",
+                            "spline_knots=%ld spline_max=%ld map_busy=%d "
+                            "rtf=%.2f shed=%lu overruns=%u",
                             hb_loop_count, hb_iekf_count, hb_collect_false_count,
                             pc_buff_total, pt_buff_total, imu_buff_size,
-                            spline_n, spline_max, int(map_busy));
+                            spline_n, spline_max, int(map_busy),
+                            rt_factor_.load(std::memory_order_relaxed),
+                            static_cast<unsigned long>(shed_scans_.load(std::memory_order_relaxed)),
+                            cycle_overruns_.load(std::memory_order_relaxed));
                         hb_loop_count = hb_iekf_count = hb_collect_false_count = 0;
                     }
                 }
@@ -686,6 +732,9 @@ public:
                     "(spline knots=%ld, pt_buff total=%zu)",
                     spline->numKnots(), pt_buff_total);
             }
+            // Cycle-budget overrun accounting starts AFTER initialization so
+            // the deliberate 50 ms init-wait sleeps above never count.
+            const auto cycle_t0 = std::chrono::steady_clock::now();
             bool collected_any = false;
             while (true) {
                 // Phase 4 stage timing: drain covers THIS frame's collection
@@ -996,7 +1045,11 @@ public:
                 // max_spl_knots tracks totalKnots() (monotonic, includes
                 // pruned knots) so the growth gate keeps firing once Phase 3.1
                 // pruning caps numKnots() at the retention window.
-                if (spline->totalKnots() > max_spl_knots) {
+                // publish_est_window=false (overload hardening) skips the msg
+                // build + reliable-QoS publish entirely — ONLY safe with the
+                // Mapping node disabled (use_mapping:=false): /est_window is
+                // Mapping's sole input and it starves silently without it.
+                if (publish_est_window_ && spline->totalKnots() > max_spl_knots) {
                     estimate_msgs::msg::Spline spline_msg;
                     {
                         std::lock_guard<std::mutex> spline_lock(spline_mutex_);
@@ -1112,7 +1165,12 @@ public:
                     // mutation wedges (rebuild, blocking I/O, etc.).
                     // publishPoseAndTf already ran inline above; the async
                     // lambda is now strictly map-mutation, no ROS I/O.
-                    publishCurrentScan(pc_world_bg_);
+                    // publish_current_scan=false (overload hardening) skips
+                    // the per-point copy + serialization; visualization-only
+                    // output, nothing downstream consumes it.
+                    if (publish_current_scan_) {
+                        publishCurrentScan(pc_world_bg_);
+                    }
                     // Set map_update_pending_ BEFORE launching so on_deactivate's
                     // read (after worker join) sees the pending state. The
                     // lambda clears it on exit so the next loop iteration's
@@ -1235,6 +1293,32 @@ public:
                     dmsg.deskew_ms = std::chrono::duration<float, std::milli>(deskew_end - iekf_end).count();
                     dmsg.frame_total_ms = frame_duration.count() / 1000.0f;
                     dmsg.map_update_ms = last_map_update_us_.load(std::memory_order_relaxed) / 1000.0f;
+                    // Overload / real-time health (2026-07-07 hardening).
+                    newest_processed_ns_.store(max_time_ns, std::memory_order_relaxed);
+                    dmsg.rt_factor = rt_factor_.load(std::memory_order_relaxed);
+                    {
+                        // Data-time backlog: newest ARRIVED stamp (per-lidar
+                        // atomic, callback-written) minus newest PROCESSED
+                        // time. Rate-independent overload ground truth.
+                        int64_t newest_arrived = 0;
+                        for (const auto& [bn, bd] : lidars_data) {
+                            newest_arrived = std::max(
+                                newest_arrived,
+                                bd.last_t_ns.load(std::memory_order_relaxed));
+                        }
+                        dmsg.backlog_ms = (newest_arrived > max_time_ns)
+                            ? static_cast<float>(newest_arrived - max_time_ns) / 1e6f
+                            : 0.f;
+                    }
+                    // Wall latency: node clock vs newest processed stamp.
+                    // Meaningful live or with bag --clock + use_sim_time.
+                    dmsg.latency_wall_ms = static_cast<float>(
+                        this->now().nanoseconds() - max_time_ns) / 1e6f;
+                    dmsg.shed_scans = shed_scans_.load(std::memory_order_relaxed);
+                    dmsg.cycle_overruns = cycle_overruns_.load(std::memory_order_relaxed);
+                    dmsg.gap_extrap_knots = if_lidar_only
+                        ? estimator_lo.gapExtrapKnots()
+                        : estimator_lio.gapExtrapKnots();
                     pub_diag_->publish(dmsg);
                 }
 
@@ -1253,6 +1337,14 @@ public:
                     // latency well under the 10ms knot interval while
                     // freeing the core for sensor callbacks.
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                // Overload metric: steady-state iterations exceeding the 50 ms
+                // design budget (kRatePeriod). Idle passes take ~1 ms and
+                // cannot trip this; a climbing counter = the machine cannot
+                // keep up with the configured workload.
+                if (std::chrono::steady_clock::now() - cycle_t0 >
+                        std::chrono::milliseconds(50)) {
+                    cycle_overruns_.fetch_add(1, std::memory_order_relaxed);
                 }
             } catch (const std::exception& e) {
                 RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1546,6 +1638,31 @@ private:
     std::atomic<uint64_t> dropped_scans_{0};
     std::atomic<uint64_t> dropped_imu_{0};
 
+    // 2026-07-07 overload hardening ("drop scans, stay real-time"):
+    // per-LiDAR DATA-TIME latency budget for queued raw scans. 0 = off.
+    // Shedding happens in pushScanBounded via overload::latencyShedCount;
+    // counted separately from the count-cap drops above so operators can
+    // tell "budget engaged" from "burst overflowed the cap".
+    int64_t max_latency_ns_ = 0;
+    std::atomic<uint64_t> shed_scans_{0};
+    // Worker steady-state iterations that exceeded the 50 ms budget.
+    std::atomic<uint32_t> cycle_overruns_{0};
+    // Real-time factor over the ~2 s heartbeat window (worker-written,
+    // diagnostics-read). rtf_prev_* are worker-thread-only.
+    std::atomic<float> rt_factor_{0.f};
+    int64_t rtf_prev_spline_max_ = 0;
+    std::chrono::steady_clock::time_point rtf_prev_wall_{};
+    // Newest processed measurement stamp (worker-written) for latency_wall_ms
+    // and backlog_ms; and cumulative gap-extrapolated knots (see Estimator).
+    std::atomic<int64_t> newest_processed_ns_{0};
+    // Publisher relief (overload hardening): both default true (= today).
+    // publish_current_scan gates the /current_scan world-cloud copy+publish
+    // (visualization only). publish_est_window gates /est_window — ONLY
+    // disable together with use_mapping:=false (it is Mapping's sole input).
+    // Worker-thread reads; set once in readParameters (configure).
+    bool publish_current_scan_ = true;
+    bool publish_est_window_ = true;
+
     // Single push path for every LiDAR callback (HARDENING §2.3).
     template<typename PtsT>
     void pushScanBounded(LidarData& ld, PtsT&& pts, int64_t t_begin)
@@ -1556,6 +1673,34 @@ private:
                 ld.pc_buff.pop_front();
                 ld.t_buff.pop_front();
                 dropped_scans_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // 2026-07-07 overload hardening: latency-bounded shedding ("drop
+        // scans, stay real-time"). DATA-TIME budget against THIS lidar's
+        // incoming stamp — playback-rate independent, no wall clock, and a
+        // lagging second lidar is judged only against itself. This is the
+        // single choke point every LiDAR callback routes through, already
+        // under mtx_pc, and shedding here (before removeNaN/voxel/PointData)
+        // is the cheapest possible drop. It also bounds pc_buff growth while
+        // the worker is stuck in a long catch-up pass. The estimator sees a
+        // clean time gap and fast-forwards via propRCP (damped when
+        // gap_extrap_decay < 1) instead of processing stale data late.
+        if (max_latency_ns_ > 0) {
+            const std::size_t n = resple::overload::latencyShedCount(
+                ld.t_buff, t_begin, max_latency_ns_);
+            for (std::size_t i = 0; i < n; ++i) {
+                ld.pc_buff.pop_front();
+                ld.t_buff.pop_front();
+            }
+            if (n > 0) {
+                shed_scans_.fetch_add(n, std::memory_order_relaxed);
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] latency budget engaged: shed %zu queued scan(s) "
+                    "older than %ld ms (cumulative %lu). The machine is not "
+                    "keeping up with the input rate.",
+                    n, static_cast<long>(max_latency_ns_ / 1000000),
+                    static_cast<unsigned long>(
+                        shed_scans_.load(std::memory_order_relaxed)));
             }
         }
         ld.pc_buff.push_back(std::forward<PtsT>(pts));
@@ -1912,6 +2057,32 @@ private:
             estimator_lio.range_noise_scale_max = rmax;
         }
 
+        // Overload hardening (2026-07-07): damped propRCP gap extrapolation.
+        // decay 1.0 (default) is a bit-identical no-op — propRCP takes the
+        // literal legacy constant-velocity expression. decay < 1 geometrically
+        // damps the extrapolated velocity for knots beyond free_knots within
+        // one propRCP call, bounding the excursion (and the post-gap yank)
+        // after latency sheds / scan drops. See utils/overload_control.h.
+        {
+            const double gap_decay = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "gap_extrap_decay", 1.0);
+            const int gap_free = CommonUtils::readParam<int>(
+                this->get_node_parameters_interface(), "gap_extrap_free_knots", 3);
+            resple::overload::GapExtrapDamping gd;
+            gd.decay = gap_decay;
+            gd.free_knots = std::max(0, gap_free);
+            estimator_lo.gap_extrap = gd;
+            estimator_lio.gap_extrap = gd;
+            if (gap_decay < 1.0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] gap_extrap_decay=%.3f (free_knots=%d): propRCP "
+                    "extrapolation velocity damped geometrically beyond the free "
+                    "window; excursion across a v m/knot gap bounded by ~free + "
+                    "v/(1-decay) knots instead of growing linearly.",
+                    gap_decay, gd.free_knots);
+            }
+        }
+
         // §3.2 prototype: X-ICP-style degenerate-direction gate (translation
         // only). 0 disables (default — decision-gate rule: this changes the
         // estimator's update; enable only behind a bag A/B). Recommended
@@ -1992,6 +2163,32 @@ private:
         // previously hardcoded 2000; 0 disables). Drop-oldest + counters.
         max_scan_buffer_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_scan_buffer", 0);
         max_imu_staging_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_imu_staging", 2000);
+        // 2026-07-07 overload hardening: per-LiDAR data-time latency budget.
+        // 0 = off (default, legacy). See pushScanBounded / doc/PARAMETERS.md.
+        max_latency_ns_ = 1000000LL * CommonUtils::readParam<int>(
+            this->get_node_parameters_interface(), "max_latency_ms", 0);
+        if (max_latency_ns_ > 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] latency shedding armed: queued scans older than %ld ms "
+                "(data time, per lidar) are dropped to stay real-time",
+                static_cast<long>(max_latency_ns_ / 1000000));
+        }
+        // Publisher relief (overload hardening): both true by default.
+        publish_current_scan_ = CommonUtils::readParam<bool>(
+            this->get_node_parameters_interface(), "publish_current_scan", true);
+        publish_est_window_ = CommonUtils::readParam<bool>(
+            this->get_node_parameters_interface(), "publish_est_window", true);
+        if (!publish_current_scan_) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] publish_current_scan=false: /current_scan disabled "
+                "(visualization only; odometry/map unaffected).");
+        }
+        if (!publish_est_window_) {
+            RCLCPP_WARN(this->get_logger(),
+                "[RESPLE] publish_est_window=false: /est_window disabled. The "
+                "Mapping node consumes ONLY this topic — run with "
+                "use_mapping:=false or the map will silently never build.");
+        }
 
         // HARDENING §6.3 internal-map insertion lag (0 = upstream
         // insert-at-edge; recommended trial value 8 = the convergence
@@ -2615,6 +2812,60 @@ private:
                  static_cast<int>(dropped_scans_.load(std::memory_order_relaxed)));
         stat.add("IMU Samples Dropped (cumulative)",
                  static_cast<int>(dropped_imu_.load(std::memory_order_relaxed)));
+
+        // Overload / real-time health (2026-07-07 hardening). rt_factor is
+        // spline data-time advance / wall time over a ~2 s worker window; with
+        // latency shedding active it stays ~1 BY DESIGN (data time is fast-
+        // forwarded), so read it TOGETHER with the shed counter to tell
+        // "keeping up" from "keeping up by dropping". Backlog is recomputed
+        // here (not the worker's cached value) so a fully stalled worker
+        // still shows it growing.
+        const float rt_factor = rt_factor_.load(std::memory_order_relaxed);
+        const uint64_t shed = shed_scans_.load(std::memory_order_relaxed);
+        float backlog_ms = 0.f;
+        {
+            const int64_t newest_proc = newest_processed_ns_.load(std::memory_order_relaxed);
+            if (newest_proc > 0) {
+                int64_t newest_arrived = 0;
+                for (const auto& [bn, bd] : lidars_data) {
+                    newest_arrived = std::max(
+                        newest_arrived, bd.last_t_ns.load(std::memory_order_relaxed));
+                }
+                if (newest_arrived > newest_proc) {
+                    backlog_ms = static_cast<float>(newest_arrived - newest_proc) / 1e6f;
+                }
+            }
+        }
+        stat.add("RT Factor (data/wall, ~2s window)", static_cast<double>(rt_factor));
+        stat.add("Backlog (ms, data time)", static_cast<double>(backlog_ms));
+        stat.add("Scans Shed by Latency Budget (cumulative)", static_cast<int>(shed));
+        stat.add("Worker Cycle Overruns (cumulative)",
+                 static_cast<int>(cycle_overruns_.load(std::memory_order_relaxed)));
+        // Escalation: rt_factor is only meaningful once a measurement window
+        // has completed (0 until then) and frames advanced this period.
+        if (frame_count > 0 && rt_factor > 0.f) {
+            if (rt_factor < 0.7f) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+                msg = "Real-time factor critically low - worker falling behind the stream";
+            } else if (rt_factor < 0.9f
+                       && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+                msg = "Real-time factor below 0.9 - worker not keeping up";
+            }
+        }
+        // Backlog vs the latency budget (only when the budget is armed; with
+        // it off there is no calibrated scale for what "too much" means).
+        if (max_latency_ns_ > 0 && backlog_ms > 0.f) {
+            const float budget_ms = static_cast<float>(max_latency_ns_) / 1e6f;
+            if (backlog_ms > 3.f * budget_ms) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+                msg = "Input backlog far exceeds max_latency_ms budget";
+            } else if (backlog_ms > budget_ms
+                       && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+                msg = "Input backlog exceeds max_latency_ms budget";
+            }
+        }
 
         // HARDENING §3.3 recovery-policy observability: whether odometry/TF
         // publication is currently held, and how many covariance resets the
@@ -4022,7 +4273,20 @@ int respleMain(int argc, char *argv[])
     }
     RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE active - entering executor spin");
 
-    rclcpp::executors::MultiThreadedExecutor exec;
+    // Overload hardening (2026-07-07): 0 (default) keeps rclcpp's behaviour
+    // (one executor thread per core), which oversubscribes small shared
+    // machines — the sensor group is MutuallyExclusive so >2 threads buy
+    // almost nothing. Low-resource profile sets 2.
+    const int executor_threads = CommonUtils::readParam<int>(
+        node->get_node_parameters_interface(), "executor_threads", 0);
+    if (executor_threads > 0) {
+        RCLCPP_INFO(node->get_logger(),
+            "MultiThreadedExecutor limited to %d threads (executor_threads)",
+            executor_threads);
+    }
+    rclcpp::executors::MultiThreadedExecutor exec(
+        rclcpp::ExecutorOptions(),
+        static_cast<size_t>(std::max(0, executor_threads)));
     exec.add_node(node->get_node_base_interface());
     exec.spin();
 
