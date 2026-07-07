@@ -68,7 +68,13 @@
     # [NARROW] Tighter point-to-plane accept gate (production 0.5 m): in a
     # sub-1.5 m environment a 0.5 m residual is a mismatch, not a fit.
     nn_thresh: 0.3
-    coeff_cov: 3.0
+    # [NARROW] Aliasing hardening: acceptance is |zp| < nn_thresh OR
+    # "filter confident" (HPH' < w_pt*(coeff_cov-1)). That second clause lets a
+    # confident filter swallow ANY residual — including wrong-instance matches
+    # while sliding between basins of a repetitive tunnel (rib/arch/fixture
+    # periodicity). coeff_cov = 1.0 makes the clause unsatisfiable, so
+    # acceptance is strictly residual-gated. (Production keeps 3.0.)
+    coeff_cov: 1.0
     num_match_points: 8
 
     ds_lm_voxel: 0.075               # [NARROW] match the scan voxel (see above)

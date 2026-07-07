@@ -18,6 +18,10 @@
 
     topic_imu: /os_cloud_node/imu
     acc_ratio: false
+    # Extrinsic convention: this rig's full LiDAR->body extrinsic is in
+    # q_lb/t_lb below (upstream/dataset convention); no base_link<-sensor
+    # TF is consulted. See doc/PARAMETERS.md.
+    tf_extrinsics: false
     lidars: ["Ouster"]
     Ouster:
       topic_lidar: /os_cloud_node/points

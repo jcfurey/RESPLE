@@ -58,7 +58,7 @@ def generate_launch_description():
                 name='RESPLE',
                 emulate_tty=True,
                 output='both',
-                parameters=[config_yaml_fusion, {'tf_extrinsics': False}],
+                parameters=[config_yaml_fusion],
                 arguments=['--ros-args', '--log-level', 'info'])
             ]),                 
         TimerAction(
@@ -71,7 +71,7 @@ def generate_launch_description():
                 name='Mapping',
                 emulate_tty=True,
                 output='both',
-                parameters=[config_yaml_fusion, {'tf_extrinsics': False}],
+                parameters=[config_yaml_fusion],
                 arguments=['--ros-args', '--log-level', 'info'])
             ])                
   ])

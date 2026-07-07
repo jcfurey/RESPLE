@@ -299,7 +299,7 @@ class MappingBase
                 if (tf_buffer_->_frameExists(this->frame_id) &&
                     tf_buffer_->_frameExists(source_frame_id) &&
                     tf_buffer_->canTransform(this->frame_id, source_frame_id,
-                                             rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
+                                             rclcpp::Time(0), rclcpp::Duration::from_seconds(0.0))) {
                     const auto transform = tf_buffer_->lookupTransform(
                         this->frame_id, source_frame_id, rclcpp::Time(0));
                     lidar_to_baselink_ = tf2::transformToEigen(transform);

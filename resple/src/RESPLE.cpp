@@ -410,6 +410,8 @@ public:
         // LO IMU-wait and frame-id state must restart with it (findings #9/#10).
         last_pose_pub_time_ns_ = std::numeric_limits<int64_t>::min();
         lo_imu_wait_started_ = false;
+        init_attitude_wait_started_ = false;
+        init_attitude_delta_deg_.store(-1.0, std::memory_order_relaxed);
         imu_frame_id_.clear();
         
         // Reset publishers
@@ -1411,7 +1413,30 @@ private:
     bool lo_imu_wait_started_ = false;
     std::chrono::steady_clock::time_point lo_imu_wait_start_{};
     double lo_imu_wait_timeout_ = 10.0;
-    
+
+    // Initial-attitude source (Design B). "gravity" (default) = accelerometer
+    // only, self-contained, BLOCKS until a stationary window exists. "tf" =
+    // base_link attitude from the TF tree (init_attitude_frame -> frame_id),
+    // works while moving. "tf_gravity_check" = TF authoritative, accelerometer
+    // cross-checks it when a stationary window is available (WARN on
+    // disagreement — a wrong imu->base_link extrinsic or a non-level attitude
+    // frame shows up here). The attitude frame MUST be gravity-aligned (Z up);
+    // TF supplies roll/pitch and yaw only if init_yaw_from_tf (else yaw stays a
+    // free gauge, preserving the "relative odometry source" contract).
+    std::string init_attitude_source_ = "gravity";
+    std::string init_attitude_frame_;          // gravity-aligned reference frame
+    bool init_yaw_from_tf_ = false;
+    double gravity_magnitude_ = 9.81;
+    double init_attitude_consistency_deg_ = 3.0;
+    // TF-wait deadline for the attitude lookup (mirrors the LO-IMU wait): after
+    // this, a tf-mode init that has neither TF nor a gravity window proceeds
+    // with identity rather than blocking forever.
+    bool init_attitude_wait_started_ = false;
+    std::chrono::steady_clock::time_point init_attitude_wait_start_{};
+    // Last TF-vs-gravity roll/pitch disagreement (deg) from tf_gravity_check;
+    // -1 = not computed. Read by the diagnostics thread.
+    std::atomic<double> init_attitude_delta_deg_{-1.0};
+
     bool publish_tf, invert_tf;
     std::string frame_id;
     std::string odom_id;
@@ -1744,6 +1769,33 @@ private:
         tf_extrinsics_ = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "tf_extrinsics", true);
         tf_wait_timeout_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "tf_wait_timeout", 10.0);
         lo_imu_wait_timeout_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "lo_imu_wait_timeout", 10.0);
+
+        // Initial-attitude source (Design B — see the member declarations).
+        init_attitude_source_ = CommonUtils::readParam<std::string>(
+            this->get_node_parameters_interface(), "init_attitude_source", std::string("gravity"));
+        init_attitude_frame_ = CommonUtils::readParam<std::string>(
+            this->get_node_parameters_interface(), "init_attitude_frame", std::string(""));
+        init_yaw_from_tf_ = CommonUtils::readParam<bool>(
+            this->get_node_parameters_interface(), "init_yaw_from_tf", false);
+        gravity_magnitude_ = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "gravity_magnitude", 9.81);
+        init_attitude_consistency_deg_ = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "init_attitude_consistency_deg", 3.0);
+        const bool init_tf_mode = (init_attitude_source_ == "tf" ||
+                                   init_attitude_source_ == "tf_gravity_check");
+        if (init_tf_mode && init_attitude_frame_.empty()) {
+            RCLCPP_WARN(this->get_logger(),
+                "[RESPLE] init_attitude_source='%s' needs init_attitude_frame (a "
+                "gravity-aligned frame); none set — falling back to gravity alignment.",
+                init_attitude_source_.c_str());
+            init_attitude_source_ = "gravity";
+        } else if (init_tf_mode) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] initial attitude from TF '%s' -> '%s' (mode=%s, yaw %s, "
+                "consistency gate %.1f deg)", init_attitude_frame_.c_str(), frame_id.c_str(),
+                init_attitude_source_.c_str(), init_yaw_from_tf_ ? "from TF" : "free",
+                init_attitude_consistency_deg_);
+        }
         if (!tf_extrinsics_) {
             RCLCPP_INFO(this->get_logger(),
                 "[RESPLE] tf_extrinsics=false: sensor clouds/IMU stay in their native "
@@ -2111,6 +2163,38 @@ private:
         }
     }
 
+    // Best-effort one-shot lookup of base_link's attitude in the configured
+    // gravity-aligned reference frame (Design B). Returns the rotation
+    // R_{init_attitude_frame <- frame_id} at the latest available time. No
+    // internal blocking — initialization() retries each cycle and bounds the
+    // wait via init_attitude_wait_start_. Time(0) (latest) is used for the
+    // same reason updateImuTransform/updateLidarTransform do: exact for a
+    // static mount, close enough for a slowly-varying source at init.
+    bool lookupInitAttitude(Eigen::Quaterniond& q_wb_out)
+    {
+        if (init_attitude_frame_.empty()) return false;
+        try {
+            if (!tf_buffer_->_frameExists(init_attitude_frame_) ||
+                !tf_buffer_->_frameExists(this->frame_id)) {
+                return false;
+            }
+            if (!tf_buffer_->canTransform(init_attitude_frame_, this->frame_id,
+                                          rclcpp::Time(0), rclcpp::Duration::from_seconds(0.0))) {
+                return false;
+            }
+            const auto tf = tf_buffer_->lookupTransform(
+                init_attitude_frame_, this->frame_id, rclcpp::Time(0));
+            q_wb_out = Eigen::Quaterniond(tf2::transformToEigen(tf).rotation());
+            q_wb_out.normalize();
+            return true;
+        } catch (const tf2::TransformException& ex) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "[RESPLE] init attitude TF lookup (%s -> %s) failed: %s",
+                init_attitude_frame_.c_str(), this->frame_id.c_str(), ex.what());
+            return false;
+        }
+    }
+
     bool updateImuTransform(std::string source_frame_id)
     {
         // YAML-only mode (tf_extrinsics=false): never consult TF; the caller
@@ -2131,9 +2215,14 @@ private:
                     return false;
                 }
                 geometry_msgs::msg::TransformStamped transform;
+                // Zero timeout (2026-07-07 review): this runs on the sensor
+                // callback thread HOLDING m_buff — a blocking wait here stalls
+                // the worker (init/collectMeasurements) and, because the sensor
+                // group is mutually exclusive, every other sensor callback.
+                // Callers retry at message rate, so waiting buys nothing.
                 if (tf_buffer_->canTransform(this->frame_id, source_frame_id,
-                                                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
-                        transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id, 
+                                                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.0))) {
+                        transform = tf_buffer_->lookupTransform(this->frame_id, source_frame_id,
                                                                         rclcpp::Time(0));
                         imu_to_baselink_ = transform;
                         
@@ -2193,7 +2282,7 @@ private:
             if (tf_buffer_->_frameExists(this->frame_id) &&
                 tf_buffer_->_frameExists(source_frame_id) &&
                 tf_buffer_->canTransform(this->frame_id, source_frame_id,
-                                         rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1))) {
+                                         rclcpp::Time(0), rclcpp::Duration::from_seconds(0.0))) {
                 const auto transform = tf_buffer_->lookupTransform(
                     this->frame_id, source_frame_id, rclcpp::Time(0));
                 lidar.lidar_to_baselink = tf2::transformToEigen(transform);
@@ -2560,6 +2649,18 @@ private:
         stat.add("IMU Fault Bits", static_cast<int>(imu_faults));
         stat.add("IMU Gyro Bias (rad/s, stationary est.)",
                  imu_gyro_bias_norm_.load(std::memory_order_relaxed));
+        // Init-time TF-vs-gravity attitude cross-check (tf_gravity_check mode);
+        // a large value flags a bad imu->base_link extrinsic or non-level
+        // attitude frame. -1 = not computed (other modes / no gravity window).
+        const double att_delta = init_attitude_delta_deg_.load(std::memory_order_relaxed);
+        if (att_delta >= 0.0) {
+            stat.add("Init Attitude TF-vs-Gravity Delta (deg)", att_delta);
+            if (att_delta > init_attitude_consistency_deg_
+                && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+                msg = "Init attitude: TF and gravity disagree (check extrinsic/frame)";
+            }
+        }
         if (fh_state == 2) {
             level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
             msg = "Filter divergence detected (windowed NIS)";
@@ -3284,129 +3385,197 @@ private:
                 }
             }
 
-            // Use IMU for gravity alignment (always in LIO; in LO when IMU
-            // data is available). This ensures the spline starts
-            // gravity-aligned (z = up).
+            // ============ Initial attitude (Design B) ========================
+            // Two candidate sources for the world<-base_link initial rotation;
+            // policy in init_attitude_source (see member decls). The world is
+            // gravity-aligned by construction (Z up) on every path.
+            const bool tf_mode = (init_attitude_source_ == "tf" ||
+                                  init_attitude_source_ == "tf_gravity_check");
+            const bool check_mode = (init_attitude_source_ == "tf_gravity_check");
+
+            // ---- Gravity candidate (accelerometer) --------------------------
+            // In gravity mode this BLOCKS (return false → retry) until a
+            // stationary window exists — the safe self-contained default. In
+            // tf modes it is OPPORTUNISTIC: insufficient samples or a noisy
+            // window just leave grav_ok=false and init proceeds via TF.
+            bool grav_ok = false;
+            Eigen::Quaterniond q_WI_grav = Eigen::Quaterniond::Identity();
+            double accel_variance = 0.0;
+            int n_imu = 0;
             if (use_imu_gravity) {
-                int buff_size;
-                int n_imu;
-                Eigen::Vector3d gravity_mean;
-                double accel_variance = 0.0;
+                Eigen::Vector3d gravity_mean = Eigen::Vector3d::Zero();
+                bool window_ok = false;
                 {
                     std::unique_lock<std::mutex> imu_lock(m_buff);
                     // Bound the pre-init staging (finding #13): the
                     // quietest-window scan below is O(windows x n_imu), and
-                    // imu_buff otherwise grows without bound while the
-                    // variance gate keeps failing (robot in motion). Keep a
-                    // recent multiple of the window size — a stationary
-                    // interval must be recent to be a valid gravity anchor.
+                    // imu_buff otherwise grows unbounded while the variance
+                    // gate keeps failing (robot in motion). Keep a recent
+                    // multiple of the window — a stationary interval must be
+                    // recent to be a valid gravity anchor.
                     const int init_buff_cap = std::max(4 * imu_init_num_samples_, 400);
                     while (static_cast<int>(imu_buff.size()) > init_buff_cap) {
                         imu_buff.pop_front();
                     }
-                    buff_size = imu_buff.size();
+                    const int buff_size = imu_buff.size();
 
-                    // Wait for sufficient IMU samples
                     if (buff_size < imu_init_num_samples_) {
-                        imu_lock.unlock();
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                            "Waiting for %d IMU samples for gravity alignment (current: %d)",
-                            imu_init_num_samples_, buff_size);
-                        return false;
-                    }
+                        if (!tf_mode) {
+                            imu_lock.unlock();
+                            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                "Waiting for %d IMU samples for gravity alignment (current: %d)",
+                                imu_init_num_samples_, buff_size);
+                            return false;   // gravity mode: keep waiting
+                        }
+                        // tf mode: gravity unavailable this cycle, fall through.
+                    } else {
+                        if (!imu_count_logged_.exchange(true)) {
+                            RCLCPP_INFO(this->get_logger(),
+                                "[RESPLE] Collected %d IMU samples for gravity alignment "
+                                "(buffer size: %d)", imu_init_num_samples_, buff_size);
+                        }
+                        // Scan all n_imu-wide windows, pick the quietest — if
+                        // the bag started mid-motion the tail would fail the
+                        // variance check and anchor the map to a noisy gravity.
+                        n_imu = std::min(imu_init_num_samples_, buff_size);
+                        const int n_windows = buff_size - n_imu + 1;
+                        Eigen::Vector3d best_mean = Eigen::Vector3d::Zero();
+                        double best_var = std::numeric_limits<double>::infinity();
+                        int best_start = 0;
+                        for (int w = 0; w < n_windows; ++w) {
+                            Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+                            for (int i = 0; i < n_imu; ++i) sum += imu_buff.at(w + i).accel;
+                            const Eigen::Vector3d mean = sum / n_imu;
+                            double var = 0.0;
+                            for (int i = 0; i < n_imu; ++i)
+                                var += (imu_buff.at(w + i).accel - mean).squaredNorm();
+                            var /= n_imu;
+                            if (var < best_var) { best_var = var; best_mean = mean; best_start = w; }
+                        }
+                        gravity_mean = best_mean;
+                        accel_variance = best_var;
 
-                    // One-shot: positive confirmation that we hit the sample
-                    // count, even if the variance check below later fails. Pairs
-                    // with the "Waiting for N IMU samples" warn — without this
-                    // log, a stuck variance check looks identical to "no IMU".
-                    if (!imu_count_logged_.exchange(true)) {
+                        if (accel_variance > imu_init_max_variance_) {
+                            if (!tf_mode) {
+                                imu_lock.unlock();
+                                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                    "IMU readings too noisy for initialization (best window variance: "
+                                    "%.4f > %.4f, scanned %d windows). Ensure robot is stationary at "
+                                    "some point during launch or increase imu_init_max_variance.",
+                                    accel_variance, imu_init_max_variance_, n_windows);
+                                return false;   // gravity mode: wait for stationary
+                            }
+                            // tf mode: noisy window → gravity unavailable.
+                        } else {
+                            RCLCPP_INFO(this->get_logger(),
+                                "[RESPLE] gravity window: picked samples [%d..%d] of %d "
+                                "(variance %.4f, scanned %d windows)",
+                                best_start, best_start + n_imu - 1, buff_size,
+                                accel_variance, n_windows);
+                            window_ok = true;
+                        }
+                    }
+                }
+                if (window_ok) {
+                    // Rotate sensor-frame gravity into base_link when the IMU
+                    // mounting rotation is known (finding #9): pre-init samples
+                    // are buffered RAW. No-op in YAML-only mode.
+                    if (updateImuTransform(imu_frame_id_)) {
+                        const Eigen::Quaterniond R_bi(
+                            tf2::transformToEigen(imu_to_baselink_).rotation());
+                        gravity_mean = R_bi * gravity_mean;
+                    }
+                    // g2R already removes yaw (gravity cannot observe it).
+                    q_WI_grav = Quater::positify(Eigen::Quaterniond(CommonUtils::g2R(gravity_mean)));
+                    grav_ok = true;
+                }
+            }
+
+            // ---- TF candidate (base_link attitude in a gravity-aligned frame)
+            bool tf_ok = false;
+            Eigen::Quaterniond q_WI_tf = Eigen::Quaterniond::Identity();
+            Eigen::Vector3d tf_ypr = Eigen::Vector3d::Zero();
+            if (tf_mode) {
+                Eigen::Quaterniond q_wb;
+                if (lookupInitAttitude(q_wb)) {
+                    tf_ypr = CommonUtils::R2ypr(q_wb.toRotationMatrix());
+                    Eigen::Vector3d ypr_use = tf_ypr;
+                    if (!init_yaw_from_tf_) ypr_use.x() = 0.0;  // yaw stays a free gauge
+                    q_WI_tf = Quater::positify(Eigen::Quaterniond(CommonUtils::ypr2R(ypr_use)));
+                    tf_ok = true;
+                }
+            }
+
+            // ---- Select + cross-check ---------------------------------------
+            if (tf_ok) {
+                q_WI = q_WI_tf;
+                if (check_mode && grav_ok) {
+                    const Eigen::Vector3d g_ypr = CommonUtils::R2ypr(q_WI_grav.toRotationMatrix());
+                    const double dpitch = tf_ypr.y() - g_ypr.y();
+                    const double droll  = tf_ypr.z() - g_ypr.z();
+                    const double delta_deg = std::sqrt(dpitch * dpitch + droll * droll);
+                    init_attitude_delta_deg_.store(delta_deg, std::memory_order_relaxed);
+                    if (delta_deg > init_attitude_consistency_deg_) {
+                        RCLCPP_WARN(this->get_logger(),
+                            "[RESPLE] init attitude: TF vs gravity roll/pitch disagree by %.2f deg "
+                            "(> %.2f). Check the imu->base_link extrinsic and that '%s' is "
+                            "gravity-aligned. Using TF.",
+                            delta_deg, init_attitude_consistency_deg_, init_attitude_frame_.c_str());
+                    } else {
                         RCLCPP_INFO(this->get_logger(),
-                            "[RESPLE] Collected %d IMU samples for gravity alignment "
-                            "(buffer size: %d)",
-                            imu_init_num_samples_, buff_size);
-                    }
-
-                    // Scan ALL n_imu-wide windows in the buffer and pick
-                    // the one with the lowest accelerometer variance.
-                    // Previously we always took the tail; if the bag
-                    // started with the robot moving (or — common with our
-                    // delayed-launch workflow — the latest samples happen
-                    // to land mid-motion), the tail would fail the
-                    // variance check and the spline orientation ended up
-                    // anchored to a noisy gravity estimate, tilting the
-                    // map. Picking the quietest window in the buffer
-                    // recovers a clean gravity even when init lands
-                    // mid-bag.
-                    n_imu = std::min(imu_init_num_samples_, buff_size);
-                    const int n_windows = buff_size - n_imu + 1;
-                    Eigen::Vector3d best_mean = Eigen::Vector3d::Zero();
-                    double best_var = std::numeric_limits<double>::infinity();
-                    int best_start = 0;
-                    for (int w = 0; w < n_windows; ++w) {
-                        Eigen::Vector3d sum = Eigen::Vector3d::Zero();
-                        for (int i = 0; i < n_imu; ++i) {
-                            sum += imu_buff.at(w + i).accel;
-                        }
-                        Eigen::Vector3d mean = sum / n_imu;
-                        double var = 0.0;
-                        for (int i = 0; i < n_imu; ++i) {
-                            var += (imu_buff.at(w + i).accel - mean).squaredNorm();
-                        }
-                        var /= n_imu;
-                        if (var < best_var) {
-                            best_var = var;
-                            best_mean = mean;
-                            best_start = w;
-                        }
-                    }
-                    gravity_mean = best_mean;
-                    accel_variance = best_var;
-
-                    if (accel_variance > imu_init_max_variance_) {
-                        imu_lock.unlock();
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                            "IMU readings too noisy for initialization (best window variance: %.4f > %.4f, "
-                            "scanned %d windows). Ensure robot is stationary at some point during launch "
-                            "or increase imu_init_max_variance parameter.",
-                            accel_variance, imu_init_max_variance_, n_windows);
-                        return false;
-                    }
-                    RCLCPP_INFO(this->get_logger(),
-                        "[RESPLE] gravity window: picked samples [%d..%d] of %d "
-                        "(variance %.4f, scanned %d windows)",
-                        best_start, best_start + n_imu - 1, buff_size,
-                        accel_variance, n_windows);
-
-                    // Clean up old IMU data
-                    while (!imu_buff.empty() && imu_buff.front().time_ns < start_t_ns) {
-                        imu_buff.pop_front();
+                            "[RESPLE] init attitude: TF vs gravity consistent (%.2f deg).", delta_deg);
                     }
                 }
-
-                // Rotate the sensor-frame gravity into base_link when the IMU
-                // mounting rotation is known (finding #9): pre-init samples
-                // are buffered RAW, so a non-identity mounting would tilt the
-                // initial orientation by the mounting angle and disagree with
-                // the post-init (TF-transformed) IMU stream. In YAML-only mode
-                // (tf_extrinsics=false) this is a no-op, matching upstream.
-                if (updateImuTransform(imu_frame_id_)) {
-                    const Eigen::Quaterniond R_bi(
-                        tf2::transformToEigen(imu_to_baselink_).rotation());
-                    gravity_mean = R_bi * gravity_mean;
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] initial attitude from TF '%s' (yaw %s, mode: %s)",
+                    init_attitude_frame_.c_str(), init_yaw_from_tf_ ? "from TF" : "free",
+                    if_lidar_only ? "LO" : "LIO");
+            } else if (grav_ok) {
+                q_WI = q_WI_grav;
+                if (tf_mode) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "[RESPLE] init attitude: TF '%s' unavailable; using gravity alignment.",
+                        init_attitude_frame_.c_str());
                 }
-
-                // Initialize orientation from gravity
-                Eigen::Vector3d gravity_ave = gravity_mean.normalized() * 9.81;
-                Eigen::Matrix3d R0 = CommonUtils::g2R(gravity_ave);
-                double yaw = CommonUtils::R2ypr(R0).x();
-                R0 = CommonUtils::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
-                Eigen::Quaterniond q0(R0);
-                q_WI = Quater::positify(q0);
-                gravity = q_WI * gravity_ave;
-
                 RCLCPP_INFO(this->get_logger(),
                     "Gravity alignment successful (samples: %d, variance: %.4f, mode: %s)",
                     n_imu, accel_variance, if_lidar_only ? "LO" : "LIO");
+            } else {
+                // Neither source available this cycle. In tf mode, give the TF
+                // a bounded chance (tf_wait_timeout) before falling to identity,
+                // so a slow static-TF publisher doesn't init the map tilted.
+                if (tf_mode) {
+                    const auto now_mono = std::chrono::steady_clock::now();
+                    if (!init_attitude_wait_started_) {
+                        init_attitude_wait_start_ = now_mono;
+                        init_attitude_wait_started_ = true;
+                    }
+                    if (std::chrono::duration<double>(now_mono - init_attitude_wait_start_).count()
+                            <= tf_wait_timeout_) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "[RESPLE] waiting for init attitude: TF '%s' -> '%s' (no clean gravity "
+                            "window yet)", init_attitude_frame_.c_str(), frame_id.c_str());
+                        return false;
+                    }
+                    RCLCPP_WARN(this->get_logger(),
+                        "[RESPLE] init attitude: no TF and no stationary gravity window after %.1f s; "
+                        "identity orientation (map z = base_link z).", tf_wait_timeout_);
+                }
+                q_WI = Eigen::Quaterniond::Identity();
+            }
+
+            // World is gravity-aligned by construction (Z up). With
+            // gravity_magnitude=9.81 this equals the old q_WI·(ĝ·9.81), which
+            // is exactly [0,0,9.81] since g2R maps ĝ→+Z.
+            gravity = Eigen::Vector3d(0.0, 0.0, gravity_magnitude_);
+
+            // Drop pre-start IMU so the first LIO update consumes only samples
+            // at/after the spline origin (all paths, not just the gravity one).
+            {
+                std::lock_guard<std::mutex> imu_lock(m_buff);
+                while (!imu_buff.empty() && imu_buff.front().time_ns < start_t_ns) {
+                    imu_buff.pop_front();
+                }
             }
 
             // Initialize the filter BEFORE flipping if_init_filter — this way

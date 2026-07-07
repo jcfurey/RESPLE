@@ -247,3 +247,89 @@ TEST(SubtractBox, PartialOverlapTilesTheDifference) {
         EXPECT_EQ(hits, contains(inner, p) ? 0 : 1) << p.transpose();
       }
 }
+
+// ------------------------- attitude / gravity init -------------------------
+// These lock the invariant the TF-attitude init (Design B) rests on: for a
+// gravity-aligned reference frame, the attitude derived from the TF (base_link
+// pose in that frame, yaw removed) equals the attitude derived from the
+// accelerometer (measured gravity direction), to within noise. If these two
+// constructions ever diverge, the cross-check in initialization() would fire
+// on correct data.
+
+using resple::geom::g2r;
+using resple::geom::r2ypr;
+using resple::geom::ypr2r;
+
+namespace {
+// Specific force an accelerometer at rest reads, expressed in body frame:
+// world gravity is [0,0,+g] (up); the sensor measures it rotated into body.
+Vec3 measuredGravityBody(const Eigen::Matrix3d& R_wb, double g = 9.81) {
+  return R_wb.transpose() * Vec3(0, 0, g);
+}
+}  // namespace
+
+TEST(Attitude, YprRoundTrip) {
+  for (double yaw : {-170.0, -40.0, 0.0, 33.0, 175.0})
+    for (double pitch : {-70.0, -15.0, 0.0, 25.0, 60.0})
+      for (double roll : {-75.0, -10.0, 0.0, 20.0, 80.0}) {
+        const Vec3 ypr(yaw, pitch, roll);
+        const Vec3 back = r2ypr(ypr2r(ypr));
+        EXPECT_NEAR(back.x(), yaw, 1e-9) << ypr.transpose();
+        EXPECT_NEAR(back.y(), pitch, 1e-9) << ypr.transpose();
+        EXPECT_NEAR(back.z(), roll, 1e-9) << ypr.transpose();
+      }
+}
+
+TEST(Attitude, GravityRecoversRollPitchZeroesYaw) {
+  // g2r(measured gravity) must recover the platform roll/pitch and zero yaw,
+  // independent of the true yaw (gravity cannot observe heading).
+  for (double yaw : {-120.0, 0.0, 95.0})
+    for (double pitch : {-60.0, -20.0, 0.0, 30.0, 65.0})
+      for (double roll : {-70.0, 0.0, 15.0, 55.0}) {
+        const Eigen::Matrix3d R_wb = ypr2r(Vec3(yaw, pitch, roll));
+        const Eigen::Matrix3d R_grav = g2r(measuredGravityBody(R_wb));
+        const Vec3 ypr = r2ypr(R_grav);
+        EXPECT_NEAR(ypr.x(), 0.0, 1e-6) << "yaw must be zeroed";
+        EXPECT_NEAR(ypr.y(), pitch, 1e-6) << "pitch, true yaw=" << yaw;
+        EXPECT_NEAR(ypr.z(), roll, 1e-6) << "roll, true yaw=" << yaw;
+      }
+}
+
+TEST(Attitude, TfAndGravityAgreeInLevelFrame) {
+  // The Design B cross-check: with a gravity-aligned attitude frame, the
+  // TF-derived q_WI (base_link pose, yaw removed) matches the accelerometer
+  // q_WI. Delta (roll/pitch, degrees) must be ~0 on consistent data.
+  for (double yaw : {-150.0, 0.0, 60.0})
+    for (double pitch : {-55.0, 0.0, 40.0})
+      for (double roll : {-65.0, 0.0, 25.0}) {
+        const Eigen::Matrix3d R_wb = ypr2r(Vec3(yaw, pitch, roll));  // TF: base_link in world
+        // TF path: take roll/pitch from the TF, zero the yaw gauge.
+        Vec3 tf_ypr = r2ypr(R_wb);
+        tf_ypr.x() = 0.0;
+        const Vec3 q_tf = r2ypr(ypr2r(tf_ypr));
+        // Gravity path.
+        const Vec3 q_grav = r2ypr(g2r(measuredGravityBody(R_wb)));
+        const double dpitch = q_tf.y() - q_grav.y();
+        const double droll = q_tf.z() - q_grav.z();
+        EXPECT_LT(std::sqrt(dpitch * dpitch + droll * droll), 1e-4)
+            << "ypr=(" << yaw << "," << pitch << "," << roll << ")";
+      }
+}
+
+TEST(Attitude, MountingTiltShowsAsCrossCheckDelta) {
+  // A wrong imu->base_link extrinsic (the accel is rotated by an unmodeled
+  // mounting tilt) must surface as a nonzero TF-vs-gravity delta — the
+  // diagnostic value that makes the cross-check useful.
+  const Eigen::Matrix3d R_wb = ypr2r(Vec3(10.0, 5.0, -8.0));  // true, level-ish base_link
+  const Eigen::Matrix3d R_mount = ypr2r(Vec3(0.0, 12.0, 0.0));  // unmodeled 12deg pitch mount
+  // Gravity measured in the (mis-mounted, uncorrected) IMU frame.
+  const Vec3 g_imu = R_mount * measuredGravityBody(R_wb);
+  const Vec3 q_grav = r2ypr(g2r(g_imu));
+  Vec3 tf_ypr = r2ypr(R_wb);
+  tf_ypr.x() = 0.0;
+  const Vec3 q_tf = r2ypr(ypr2r(tf_ypr));
+  const double dpitch = q_tf.y() - q_grav.y();
+  const double droll = q_tf.z() - q_grav.z();
+  const double delta = std::sqrt(dpitch * dpitch + droll * droll);
+  EXPECT_GT(delta, 5.0) << "12deg mount tilt should be visible in the delta";
+}

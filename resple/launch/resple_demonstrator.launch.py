@@ -54,7 +54,7 @@ def generate_launch_description():
         name='RESPLE',
         emulate_tty=True,
         output='log',
-        parameters=[config_yaml_fusion, {'tf_extrinsics': False}],
+        parameters=[config_yaml_fusion],
         arguments=['--ros-args', '--log-level', 'info'])
 
     mapping_node = launch_ros.actions.Node(
@@ -63,7 +63,7 @@ def generate_launch_description():
         name='Mapping',
         emulate_tty=True,
         output='log',
-        parameters=[config_yaml_fusion, {'tf_extrinsics': False}],
+        parameters=[config_yaml_fusion],
         arguments=['--ros-args', '--log-level', 'info'])
 
     # Wrap each in a TimerAction. period accepts a Substitution that
