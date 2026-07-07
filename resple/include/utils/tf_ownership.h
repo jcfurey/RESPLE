@@ -37,6 +37,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -98,10 +99,10 @@ class TfOwnershipMonitor {
                    int64_t stamp_ns,
                    int64_t now_ns) {
     std::lock_guard<std::mutex> lk(m_);
-    if (child_seen != child_) {
+    if (!frameEq(child_seen, child_)) {
       return Verdict::UNRELATED;
     }
-    if (parent_seen != parent_) {
+    if (!frameEq(parent_seen, parent_)) {
       ++foreign_other_parent_;
       last_foreign_ns_ = now_ns;
       return Verdict::FOREIGN_OTHER_PARENT;
@@ -165,6 +166,20 @@ class TfOwnershipMonitor {
     std::array<int64_t, 256> a;
     a.fill(kUnsetStamp);
     return a;
+  }
+
+  // tf2's BufferCore strips a single leading '/' (ROS 1 legacy frame ids);
+  // raw publishers may still emit one. Compare under the same normalization
+  // so "/odom" and "odom" are one frame — otherwise a legacy-style foreign
+  // publisher on our exact pair would evade the same-pair match.
+  static bool frameEq(const std::string& a, const std::string& b) {
+    const char* pa = a.c_str();
+    std::size_t na = a.size();
+    const char* pb = b.c_str();
+    std::size_t nb = b.size();
+    if (na > 0 && pa[0] == '/') { ++pa; --na; }
+    if (nb > 0 && pb[0] == '/') { ++pb; --nb; }
+    return na == nb && std::memcmp(pa, pb, na) == 0;
   }
 
   mutable std::mutex m_;  // leaf lock — never held while taking another lock

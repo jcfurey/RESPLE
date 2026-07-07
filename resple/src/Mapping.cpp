@@ -1799,23 +1799,36 @@ private:
         // during the cold-start window before pubOdom() gets its first
         // valid odom→base_link lookup. tf_static is transient_local, so
         // late-joining listeners still receive it.
-        if (publish_tf && static_br_ && !static_map_odom_sent_.exchange(true)) {
-            geometry_msgs::msg::TransformStamped identity;
-            identity.header.stamp = this->get_clock()->now();
-            if (invert_tf) {
-                identity.header.frame_id = odom_id;
-                identity.child_frame_id  = map_id;
-            } else {
-                identity.header.frame_id = map_id;
-                identity.child_frame_id  = odom_id;
+        if (publish_tf && static_br_) {
+            // TF ownership guard 'yield': a foreign map->odom owner active at
+            // start means our identity latch would inject a conflicting
+            // transform onto /tf_static (transient_local — it would linger).
+            // Skip WITHOUT consuming the one-shot, so a later, quiet (re)start
+            // can still latch.
+            if (tf_conflict_action_ == "yield" &&
+                tf_own_monitor_.foreignActiveWithin(steadyNowNs(), tf_conflict_quiet_ns_)) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[Mapping] skipping the identity %s->%s static latch: a foreign "
+                    "publisher owns the pair (tf_conflict_action=yield).",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str());
+            } else if (!static_map_odom_sent_.exchange(true)) {
+                geometry_msgs::msg::TransformStamped identity;
+                identity.header.stamp = this->get_clock()->now();
+                if (invert_tf) {
+                    identity.header.frame_id = odom_id;
+                    identity.child_frame_id  = map_id;
+                } else {
+                    identity.header.frame_id = map_id;
+                    identity.child_frame_id  = odom_id;
+                }
+                identity.transform.rotation.w = 1.0;
+                // Static whitelist entry: /tf_static is transient_local, so
+                // this exact stamp can be re-delivered arbitrarily late — it
+                // must never age out of the self-stamp ring (tf_ownership.h).
+                tf_own_monitor_.notePublishedStatic(
+                    rclcpp::Time(identity.header.stamp).nanoseconds());
+                static_br_->sendTransform(identity);
             }
-            identity.transform.rotation.w = 1.0;
-            // Static whitelist entry: /tf_static is transient_local, so this
-            // exact stamp can be re-delivered arbitrarily late — it must never
-            // age out of the self-stamp ring (see tf_ownership.h).
-            tf_own_monitor_.notePublishedStatic(
-                rclcpp::Time(identity.header.stamp).nanoseconds());
-            static_br_->sendTransform(identity);
         }
     }
 

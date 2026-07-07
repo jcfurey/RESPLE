@@ -135,6 +135,20 @@ TEST(TfOwnership, ConfigureResetsEverything) {
   EXPECT_EQ(m.child(), "base_link");
 }
 
+TEST(TfOwnership, LeadingSlashNormalization) {
+  // tf2 strips one leading '/' (ROS 1 legacy ids); a foreign publisher
+  // emitting "/odom"->"/base_footprint" is the SAME pair and must be caught,
+  // not evade the match as UNRELATED.
+  TfOwnershipMonitor m;
+  m.configure("odom", "base_footprint");
+  m.notePublished(1 * S);
+  EXPECT_EQ(m.classify("/odom", "/base_footprint", 1 * S, 0), Verdict::SELF);
+  EXPECT_EQ(m.classify("/odom", "/base_footprint", 2 * S, 0), Verdict::FOREIGN_SAME_PAIR);
+  EXPECT_EQ(m.classify("/map", "base_footprint", 1 * S, 0), Verdict::FOREIGN_OTHER_PARENT);
+  // Normalization is one slash only — a genuinely different frame stays out.
+  EXPECT_EQ(m.classify("odom", "/base", 1 * S, 0), Verdict::UNRELATED);
+}
+
 TEST(TfOwnership, InvertedPairIsJustTheWatchedPair) {
   // invert_tf swaps the broadcast direction; the node configures the monitor
   // with the POST-inversion pair, so base->odom is then the exact pair and
