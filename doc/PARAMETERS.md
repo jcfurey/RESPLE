@@ -79,7 +79,7 @@ for the authoritative field list.
 | `odom/invert_tf` | `false` | Invert the broadcast direction |
 | `map/publish_tf`, `map/invert_tf` | `true`, `false` | Same, Mapping node |
 | `cov_pose`, `cov_twist` | `[0.2, 0.2, 0.2, 0.1, 0.1, 0.1]` | Diagonals for the Mapping node's odometry covariance (position/linear first three, orientation/angular last three) |
-| `tf_extrinsics` | `true` | `true`: the `base_link ← sensor` TF carries the mounting extrinsic (production convention; YAML `q_lb`/`t_lb` is an *extra* offset, normally identity). `false`: no TF consulted; clouds/IMU stay in their native frames and YAML `q_lb`/`t_lb` is the single extrinsic (upstream/dataset-replay convention — set by the dataset launches). Never publish a TF that duplicates a non-identity YAML extrinsic: the two compose and cancel. |
+| `tf_extrinsics` | `true` | `true`: the `base_link ← sensor` TF carries the mounting extrinsic (production convention; YAML `q_lb`/`t_lb` is an *extra* offset, normally identity). `false`: no TF consulted; clouds/IMU stay in their native frames and YAML `q_lb`/`t_lb` is the single extrinsic (upstream/dataset-replay convention). **Set per-rig in each config YAML** (next to `q_lb`/`t_lb`), not in the launch — the dataset configs ship `false`, the production/template configs ship `true`. Never publish a TF that duplicates a non-identity YAML extrinsic: the two compose and cancel. |
 | `tf_wait_timeout` | `10.0` | Seconds to wait for the sensor TF before falling back to the YAML-only convention (was: scans dropped forever) |
 
 ### Sensors

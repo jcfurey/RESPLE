@@ -64,7 +64,7 @@ def generate_launch_description():
                 name='RESPLE',
                 emulate_tty=True,
                 output='log',
-                parameters=[config_yaml_fusion, {'tf_extrinsics': False}])
+                parameters=[config_yaml_fusion])
             ]),
         TimerAction(
             period=_mapping_delay,
@@ -76,7 +76,7 @@ def generate_launch_description():
                 name='Mapping',
                 emulate_tty=True,
                 output='log',
-                parameters=[config_yaml_fusion, {'tf_extrinsics': False}])
+                parameters=[config_yaml_fusion])
             ])                                    
   ])
 

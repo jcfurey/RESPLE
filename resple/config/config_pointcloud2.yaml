@@ -27,6 +27,10 @@
 
     topic_imu: /imu/data
     acc_ratio: false
+    # Extrinsic convention: the base_link<-sensor TF carries the mounting
+    # extrinsic; q_lb/t_lb below is an EXTRA offset (identity here). Never
+    # make both non-identity — they compose. See doc/PARAMETERS.md.
+    tf_extrinsics: true
     lidars: ["Generic"]
     Generic:
       topic_lidar: /points
