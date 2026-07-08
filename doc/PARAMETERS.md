@@ -134,6 +134,42 @@ static `base_footprint → base_link` plus RESPLE's `odom → base_link` give
 `base_link` **two parents** — the tree is just as broken. The guard reports
 this as a foreign-parent claim.
 
+Worked example — `robot_localization` odom EKF fusing wheel odometry +
+RESPLE (illustrative; tune the config vectors to your platform). RESPLE side:
+`frame_id: base_footprint`, `odom/publish_tf: false` (see
+`config_ouster.yaml`'s frame block). EKF side:
+
+```yaml
+ekf_odom:
+  ros__parameters:
+    world_frame: odom
+    odom_frame: odom
+    base_link_frame: base_footprint
+    publish_tf: true                    # THE owner of odom->base_footprint
+
+    odom0: /wheel/odometry              # wheel encoders: velocities only —
+    odom0_config: [false, false, false, # wheel pose integrates slip; let the
+                   false, false, false, # filter integrate the twist instead
+                   true,  true,  false,
+                   false, false, true,
+                   false, false, false]
+
+    odom1: /localization/resple/odom    # RESPLE (this package's `odom` topic,
+    odom1_config: [true,  true,  true,  # remapped/namespaced per your launch):
+                   true,  true,  true,  # full 6-DoF pose, absolute. Its
+                   false, false, false, # covariance is the live IEKF posterior
+                   false, false, false, # (plus the §6.7 tunnel inflation if
+                   false, false, false] # enabled), so the EKF weighs it
+                                        # against wheel slip honestly — do not
+                                        # override it with a static matrix.
+```
+
+Fuse RESPLE as the single absolute pose source (as above) so the EKF's odom
+frame tracks RESPLE's gauge; if you later add a second absolute pose source,
+switch one of them to `_differential: true` to avoid origin fights. RESPLE's
+twist block is also available (fuse velocities instead of pose) — its twist
+covariance is likewise the real posterior since the 2026-07-02 fix.
+
 ### Sensors
 
 | Parameter | Default | Meaning |

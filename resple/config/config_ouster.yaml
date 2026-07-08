@@ -3,14 +3,46 @@
 # Copy and adapt topics/extrinsics for your own platform.
 /**:
   ros__parameters:
-    # Frame IDs for TF tree
+    # ------------------------------------------------------------------
+    # Frame IDs & TF ownership. TF has no ownership arbitration — two
+    # publishers on one parent->child pair make every consumer's pose
+    # flicker. Pick ONE of the two modes below; the runtime guard
+    # (tf_conflict_action, bottom of this file) catches a wrong flag.
+    # Full recipe: doc/PARAMETERS.md "TF ownership".
+    #
+    # STANDALONE (this file's defaults): RESPLE owns odom->base_link, the
+    # optional Mapping node owns map->odom. Nothing else may publish
+    # either pair.
+    #
+    # INTEGRATED STACK — wheel-odom/IMU-fed EKF (e.g. robot_localization's
+    # odom EKF) plus mapping consumers (elevation_mapping, ...):
+    #   frame_id: base_footprint     # match the EKF's base frame; with
+    #                                # tf_extrinsics: true the sensor
+    #                                # mounting resolves through the URDF
+    #                                # chain (base_footprint->...->os_sensor)
+    #   odom/publish_tf: False       # the EKF owns odom->base_footprint.
+    #                                # RESPLE stays a pure odometry SOURCE:
+    #                                # feed the EKF this node's `odom` TOPIC
+    #                                # (nav_msgs/Odometry as an odomN input;
+    #                                # its pose covariance is the live IEKF
+    #                                # posterior, so the EKF can weigh it
+    #                                # against wheel odom honestly)
+    #   map/publish_tf: False        # only if a global localizer/SLAM owns
+    #                                # map->odom — or skip the Mapping node
+    #                                # entirely (use_mapping:=false, the
+    #                                # launch default)
+    # elevation_mapping & co. publish no TF (pure consumers): no conflict,
+    # they just need the odom->base chain + the pose covariance topic.
+    # With odom/publish_tf: False the guard also WARNs once if the expected
+    # external owner never shows up (tf_absent_warn_sec).
+    # ------------------------------------------------------------------
     odom/frame_id: odom              # Odom (odometry frame_id) frame
     map/frame_id: map                # Map frame (Mapping node publications)
     frame_id: base_link              # Robot (odometry child_frame_id) frame
 
-    odom/publish_tf: True            # RESPLE broadcasts the odom->base_link TF
+    odom/publish_tf: True            # RESPLE broadcasts the odom->base_link TF (False = external EKF owns it)
     odom/invert_tf: False             # invert the odom->base_link broadcast direction
-    map/publish_tf: True             # Mapping node broadcasts the map->odom TF
+    map/publish_tf: True             # Mapping node broadcasts the map->odom TF (False = external localizer owns it)
     map/invert_tf: False              # invert the map->odom broadcast direction
 
     cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
@@ -96,3 +128,23 @@
     max_scan_buffer: 0             # per-LiDAR raw-scan cap (scans, drop-oldest);
                                    # 0 = unbounded
     max_imu_staging: 2000          # IMU staging cap (samples, drop-oldest)
+
+    # TF ownership guard (both nodes; see the frame block at the top and
+    # doc/PARAMETERS.md "TF ownership"). Detects another node publishing the
+    # TF pair this node owns — e.g. an odom EKF on odom->base_footprint while
+    # odom/publish_tf was left True. Self-broadcasts are stamp-matched out,
+    # so the guard never trips on its own transforms.
+    tf_conflict_action: "warn"     # "warn" = throttled ERROR + diagnostics
+                                   # (tf_foreign_*, tf_conflict_active).
+                                   # "yield" = additionally suspend OUR TF
+                                   # broadcast while the foreign owner is
+                                   # active (topics keep flowing; resumes
+                                   # when it goes quiet) — the safety net for
+                                   # stacks where the EKF may start late or
+                                   # restart. (Keep quotes.)
+    tf_conflict_quiet_sec: 5.0     # foreign must stay quiet this long before
+                                   # yield resumes our broadcast
+    tf_absent_warn_sec: 10.0       # with publish_tf: False: one-shot WARN if
+                                   # NOBODY publishes the pair within this
+                                   # (external EKF/localizer never started);
+                                   # 0 = off
