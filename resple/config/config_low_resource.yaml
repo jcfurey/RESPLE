@@ -19,6 +19,14 @@
 /**:
   ros__parameters:
     # Frame IDs for TF tree
+
+    # TF ownership: this file's defaults assume RESPLE owns odom->base_link
+    # and Mapping owns map->odom. Running inside a larger stack (wheel-odom
+    # EKF owning the odom frame, a global localizer owning map)? Set
+    # frame_id to the EKF's base frame and the publish_tf flags False -- the
+    # full dual-mode recipe is in config_ouster.yaml's frame block and
+    # doc/PARAMETERS.md "TF ownership". The runtime guard below catches a
+    # wrong flag either way.
     odom/frame_id: odom              # Odom (odometry frame_id) frame
     map/frame_id: map                # Map frame (Mapping node publications)
     frame_id: base_link              # Robot (odometry child_frame_id) frame
@@ -104,6 +112,16 @@
     max_scan_buffer: 20            # hard count cap behind the budget (2 s of
                                    # scans at 10 Hz; drop-oldest, counted)
     max_imu_staging: 2000          # IMU staging cap (samples, drop-oldest)
+    # TF ownership guard (see config_ouster.yaml / doc/PARAMETERS.md
+    # "TF ownership" for the full story; values below are the defaults).
+    tf_conflict_action: "warn"     # "warn" = throttled ERROR + diagnostics on a
+                                   # foreign publisher of our TF pair; "yield" =
+                                   # also suspend our broadcast while it is
+                                   # active (topics keep flowing). Keep quotes.
+    tf_conflict_quiet_sec: 5.0     # quiet window before yield resumes
+    tf_absent_warn_sec: 10.0       # publish_tf=False: one-shot WARN if nobody
+                                   # publishes the pair within this (0 = off)
+
     gap_extrap_decay: 0.9          # damp propRCP's constant-velocity
                                    # extrapolation across shed gaps: velocity
                                    # decays geometrically toward a hold, so the

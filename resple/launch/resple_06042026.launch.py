@@ -58,6 +58,11 @@ def generate_launch_description():
                 'map->odom TF will be published. Pass use_mapping:=true to enable.'),
         # base_link -> os_sensor (identity). The bag's /tf_static completes the
         # chain to os_lidar / os_imu. Replay /tf_static for this to resolve.
+        # If a URDF / robot_state_publisher already provides the sensor
+        # mounting (integrated stacks), DELETE this node: two static
+        # publishers on one TF pair latch nondeterministically (last writer
+        # per listener wins), and an identity placeholder silently cancels
+        # or fights the real URDF extrinsic.
         launch_ros.actions.Node(
             package='tf2_ros',
             executable='static_transform_publisher',

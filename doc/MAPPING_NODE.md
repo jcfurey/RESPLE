@@ -101,6 +101,31 @@ The tip itself is lagged by `map_deskew_lag_knots`, so the composition uses
 only fully-converged knots. The odometry path stays bleeding-edge; only the
 slow-varying drift-correction frame trades latency for accuracy.
 
+**Coexisting with an external localization stack** (see PARAMETERS.md
+"TF ownership" for the full recipe):
+
+- *External odom EKF owns `odom → base`* (RESPLE demoted with
+  `odom/publish_tf: false`): Mapping keeps working unchanged — its
+  `odom→base` lookup simply returns the **EKF's fused** pose, so the
+  composed `map → odom` absorbs the EKF-vs-RESPLE discrepancy (wheel-slip
+  corrections etc.). That is exactly the standard drift-correction
+  semantics of the `map` frame; nothing to configure.
+- *External global localizer / SLAM owns `map → odom`*: set
+  `map/publish_tf: false` (Mapping keeps publishing `global_map`,
+  `traj_path`, `odometry` — only the TF is ceded), or don't run Mapping.
+- *Runtime guard*: both nodes watch `/tf` + `/tf_static` for a foreign
+  publisher on the pair they own (`tf_conflict_action` warn/yield;
+  `tf_absent_warn_sec` catches "demoted but no external owner ever
+  showed up"). Mapping's identity latch is stamp-whitelisted, and in
+  `yield` mode the latch is skipped — not consumed — while a foreign
+  owner is active.
+
+**Do not feed Mapping's `odometry` topic to a fusion EKF.** Its pose is in
+the `map` frame and its covariance is the static `cov_pose`/`cov_twist`
+config diagonal — it exists for visualization parity. The fusion input is
+the RESPLE node's `odom` topic, whose covariance is the live IEKF
+posterior.
+
 ## Empirically verified
 
 HelmDyn01 bag, LIO mode (`if_lidar_only: false`), ROS 2 Jazzy, 2026-06-10,

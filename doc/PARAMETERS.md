@@ -170,6 +170,12 @@ switch one of them to `_differential: true` to avoid origin fights. RESPLE's
 twist block is also available (fuse velocities instead of pose) — its twist
 covariance is likewise the real posterior since the 2026-07-02 fix.
 
+Related bonus: once the stack's TF tree is up (EKF + URDF), RESPLE can take
+its **initial attitude** from it instead of waiting for a stationary gravity
+window — `init_attitude_source: tf` (or `tf_gravity_check`) with a
+gravity-aligned `init_attitude_frame`; see the Sensors table above. Useful
+when the robot starts on a slope or is already moving at launch.
+
 ### Sensors
 
 | Parameter | Default | Meaning |

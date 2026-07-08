@@ -62,6 +62,11 @@ def generate_launch_description():
             msg='Mapping node disabled (use_mapping:=false): no /global_map or '
                 'map->odom TF will be published. Pass use_mapping:=true to enable.'),
         lidar_frame_arg,
+        # If a URDF / robot_state_publisher already provides the sensor
+        # mounting (integrated stacks), DELETE this node: two static
+        # publishers on one TF pair latch nondeterministically (last writer
+        # per listener wins), and an identity placeholder silently cancels
+        # or fights the real URDF extrinsic.
         launch_ros.actions.Node(
             package='tf2_ros',
             executable='static_transform_publisher',
