@@ -61,8 +61,12 @@ depths, IEKF numerical-failure count, NIS + dof + filter state (OK/WARN/
 DIVERGED), recovery state (hold active, reset count), pose-covariance trace +
 λ_min, the correspondence funnel (`candidates → passed_window →
 passed_distance → passed_plane → used`), deskew out-of-range count, map size,
-prune/drop counters, and per-stage frame timings (drain / IEKF / deskew /
-total / async map update). See
+prune/drop counters, per-stage frame timings (drain / IEKF / deskew /
+total / async map update), the overload block (`rt_factor`, `backlog_ms`,
+`latency_wall_ms`, `shed_scans`, `cycle_overruns`, `gap_extrap_knots` — see
+"Resource-limited machines" below), and the TF ownership guard
+(`tf_foreign_same_pair`, `tf_foreign_other_parent`, `tf_conflict_active`,
+`tf_yielding` — see "TF ownership" below). See
 [`estimate_msgs/msg/Diagnostics.msg`](../estimate_msgs/msg/Diagnostics.msg)
 for the authoritative field list.
 
@@ -81,6 +85,96 @@ for the authoritative field list.
 | `cov_pose`, `cov_twist` | `[0.2, 0.2, 0.2, 0.1, 0.1, 0.1]` | Diagonals for the Mapping node's odometry covariance (position/linear first three, orientation/angular last three) |
 | `tf_extrinsics` | `true` | `true`: the `base_link ← sensor` TF carries the mounting extrinsic (production convention; YAML `q_lb`/`t_lb` is an *extra* offset, normally identity). `false`: no TF consulted; clouds/IMU stay in their native frames and YAML `q_lb`/`t_lb` is the single extrinsic (upstream/dataset-replay convention). **Set per-rig in each config YAML** (next to `q_lb`/`t_lb`), not in the launch — the dataset configs ship `false`, the production/template configs ship `true`. Never publish a TF that duplicates a non-identity YAML extrinsic: the two compose and cancel. |
 | `tf_wait_timeout` | `10.0` | Seconds to wait for the sensor TF before falling back to the YAML-only convention (was: scans dropped forever) |
+| `tf_conflict_action` | `"warn"` | TF ownership guard (both nodes, shared name): what to do when **another node** publishes the TF pair this node broadcasts (RESPLE: `odom → frame_id`; Mapping: `map → odom`; post-inversion). `"warn"` = throttled ERROR + diagnostics, transforms unchanged. `"yield"` = keep publishing odometry/path **topics** but suspend our own TF broadcast while the foreign publisher is active — resumes automatically once it goes quiet for `tf_conflict_quiet_sec`. Self-published transforms are recognized by exact stamp match, so the guard never trips on its own DDS loopback. Also detects the watched **child** frame being claimed by a *different* parent (a TF child has exactly one parent — two parents break the tree even without a same-pair collision). See "TF ownership" below. |
+| `tf_conflict_quiet_sec` | `5.0` | How long the foreign publisher must stay quiet before `yield` resumes our broadcast (also the window for the `tf_conflict_active` diagnostic). |
+| `tf_absent_warn_sec` | `10.0` | Reverse misconfiguration check: when `publish_tf` is **false** (an external owner is expected — e.g. the odom EKF), WARN once if *nobody* has published the pair after this many seconds. `0` disables. |
+
+### TF ownership — coexisting with an external localization stack
+
+TF is a tree: every child frame has exactly **one** parent, and tf2 keeps the
+latest transform per pair with no concept of ownership. Two nodes publishing
+the same pair interleave at their two rates and every consumer sees the pose
+flicker/jump between them; a child claimed by two different parents breaks
+lookups outright. The guard above watches the raw `/tf` + `/tf_static` stream
+for exactly these two failures on the pair each node broadcasts, and its
+verdicts surface in `resple_diagnostics` (`tf_foreign_same_pair`,
+`tf_foreign_other_parent`, `tf_conflict_active`, `tf_yielding`) and as
+WARN/ERROR in `/diagnostics`.
+
+Recommended wiring when RESPLE runs inside a larger stack
+(`robot_localization` odom EKF, elevation_mapping, a global localizer):
+
+- **Odometry fusion (robot_localization / odom EKF owns the odom TF).** Set
+  `odom/publish_tf: false` — RESPLE stays a pure odometry *source*: the EKF
+  fuses the `/odometry` topic (whose pose covariance is the live IEKF
+  posterior, plus the §6.7 advisory inflation in degenerate geometry) and
+  owns `odom → base_footprint`. Note the on-robot configs typically set
+  `frame_id: base_footprint`, which makes RESPLE's would-be TF pair *exactly*
+  the EKF's pair — with both `publish_tf` flags on they fight for the same
+  transform, which is precisely the flicker the guard flags. The
+  `tf_absent_warn_sec` check covers the opposite mistake (RESPLE demoted but
+  the EKF never launched: TF consumers starve silently).
+- **elevation_mapping and other TF consumers** publish no TF themselves —
+  no conflict possible; they just need one consistent `odom → base` chain
+  and RESPLE's pose covariance.
+- **Map frame.** The Mapping node is visualization-side and owns
+  `map → odom` (plus a one-shot identity latch on `/tf_static` for the
+  cold-start window). If a global localizer / SLAM owns the map frame, set
+  `map/publish_tf: false` or simply run without Mapping
+  (`use_mapping:=false`, the launch default).
+- **`tf_conflict_action: yield`** is the belt-and-braces option for rigs
+  where the owner set may change at runtime (e.g. an EKF that starts late or
+  restarts): whichever RESPLE/Mapping TF has a live foreign owner is
+  suspended automatically instead of fighting, and resumes when the owner
+  disappears. Default stays `warn` (detect-only).
+
+Two-parent subtlety worth knowing: with `frame_id: base_link` and an EKF
+publishing `odom → base_footprint`, nobody collides on a *pair*, but the URDF
+static `base_footprint → base_link` plus RESPLE's `odom → base_link` give
+`base_link` **two parents** — the tree is just as broken. The guard reports
+this as a foreign-parent claim.
+
+Worked example — `robot_localization` odom EKF fusing wheel odometry +
+RESPLE (illustrative; tune the config vectors to your platform). RESPLE side:
+`frame_id: base_footprint`, `odom/publish_tf: false` (see
+`config_ouster.yaml`'s frame block). EKF side:
+
+```yaml
+ekf_odom:
+  ros__parameters:
+    world_frame: odom
+    odom_frame: odom
+    base_link_frame: base_footprint
+    publish_tf: true                    # THE owner of odom->base_footprint
+
+    odom0: /wheel/odometry              # wheel encoders: velocities only —
+    odom0_config: [false, false, false, # wheel pose integrates slip; let the
+                   false, false, false, # filter integrate the twist instead
+                   true,  true,  false,
+                   false, false, true,
+                   false, false, false]
+
+    odom1: /localization/resple/odom    # RESPLE (this package's `odom` topic,
+    odom1_config: [true,  true,  true,  # remapped/namespaced per your launch):
+                   true,  true,  true,  # full 6-DoF pose, absolute. Its
+                   false, false, false, # covariance is the live IEKF posterior
+                   false, false, false, # (plus the §6.7 tunnel inflation if
+                   false, false, false] # enabled), so the EKF weighs it
+                                        # against wheel slip honestly — do not
+                                        # override it with a static matrix.
+```
+
+Fuse RESPLE as the single absolute pose source (as above) so the EKF's odom
+frame tracks RESPLE's gauge; if you later add a second absolute pose source,
+switch one of them to `_differential: true` to avoid origin fights. RESPLE's
+twist block is also available (fuse velocities instead of pose) — its twist
+covariance is likewise the real posterior since the 2026-07-02 fix.
+
+Related bonus: once the stack's TF tree is up (EKF + URDF), RESPLE can take
+its **initial attitude** from it instead of waiting for a stationary gravity
+window — `init_attitude_source: tf` (or `tf_gravity_check`) with a
+gravity-aligned `init_attitude_frame`; see the Sensors table above. Useful
+when the robot starts on a slope or is already moving at launch.
 
 ### Sensors
 
@@ -159,12 +253,94 @@ All behaviour-preserving or opt-in by default. Section references are to
 | `map_prune_radius` | `0.0` | §3.4 keep only map points within this distance (m) of the pose; floored at 2× the detection range so it cannot bite live measurements. `0` = cube-only behaviour (`cube_len`). The FOV cube alone never deletes while the robot stays inside it. |
 | `max_scan_buffer` | `0` | §2.3 per-LiDAR raw-scan cap (scans, drop-oldest). `0` = unbounded. Engaging drops are counted in diagnostics. |
 | `max_imu_staging` | `2000` | §2.3 IMU staging-buffer cap (samples, drop-oldest); `0` disables. |
+| `max_latency_ms` | `0` | Overload hardening ("drop scans, stay real-time"): per-LiDAR **data-time** latency budget. When a scan arrives, queued scans of the *same* LiDAR whose stamps are more than this many ms older than it are shed before the worker ever sees them (counted separately as `shed_scans`; throttled WARN while engaging). Data-time semantics: independent of bag playback rate, needs no wall clock, survives sim-time jumps; a bag-loop restart (time going backwards) never sheds. The newest queued scan is only shed when the incoming push immediately replaces it. `0` = off (legacy unbounded latency). |
+| `gap_extrap_decay` | `1.0` | Overload hardening: damping for `propRCP`'s constant-velocity extrapolation across data gaps (after sheds/drops). `1.0` = off — the literal legacy expression, bit-identical. `<1`: for each knot beyond `gap_extrap_free_knots` within one propRCP call, the extrapolated velocity is scaled by `decay^(excess)`, converging to a hold-at-newest — the excursion across a gap is bounded by ~`free + v/(1−decay)` knots of travel instead of growing linearly, so the first post-gap update yanks the pose far less (and the IMU residual gate is not tripped by runaway extrapolation). Covariance propagation is unchanged (keeps growing across the gap). |
+| `gap_extrap_free_knots` | `3` | Knots per `propRCP` call exempt from the decay. Steady-state calls add ≤ ~2 knots, so the default engages the damping only on genuine gaps. Inert while `gap_extrap_decay` = 1 (the `gap_extrap_knots` diagnostic still counts gap fast-forwards). |
+| `executor_threads` | `0` | Cap on the `MultiThreadedExecutor` thread pool (both nodes). `0` = rclcpp default (one thread per core — oversubscription on small shared machines). The sensor callback group is MutuallyExclusive, so `2` is enough almost everywhere. |
+| `publish_current_scan` | `true` | `false` skips the `/current_scan` world-cloud copy + publish (RESPLE node). Visualization-only output; odometry and the internal map are unaffected. |
+| `publish_est_window` | `true` | `false` skips the `/est_window` publish (RESPLE node). **Only valid with the Mapping node off** (`use_mapping:=false`, the launch default) — `/est_window` is Mapping's sole input and it starves silently without it. A loud WARN fires at configure when disabled. |
+| `map/max_scan_buffer` | `200` | Mapping node: per-sensor scan-buffer cap (was hardcoded 200 and dropped **silently**; now counted as `cap_dropped` in the 2 s summary + throttled WARN — cap-drops are permanent map holes). |
+| `map/publish_min_interval_ms` | `0` | Mapping node: batch `/global_map` publishes — transformed scans accumulate and flush at most every N ms. **Batches, never drops**: each publish is an incremental scan viewers accumulate, so content is preserved, just in fewer/larger messages. `0` = per-scan (legacy). |
+
+Additionally, `num_threads` (both nodes) is now clamped at runtime to
+`max(1, hardware_concurrency − 2)` with a WARN — the shipped configs assume a
+big machine, and the old value 8 oversubscribed 4–6-core boxes so badly the
+worker lost its cores mid-IEKF. This is the one deliberate default-behaviour
+change of the overload-hardening series; on ≥ `num_threads + 2` cores nothing
+changes.
 
 **Tuning workflow:** leave the defaults; record `resple_diagnostics`; only
 then adjust. The funnel counters localize correspondence losses (sparse map
 vs degenerate patches vs association outliers), `Spline Knots (total)` and
 the drop counters show memory pressure, and the NIS fields show filter
 consistency before/after any change.
+
+### Resource-limited machines (odometry "jumping around")
+
+On a small or shared CPU (4–8 cores next to other software) the default
+profile fails in a specific shape: the worker falls behind the sensor stream,
+the un-capped input queue grows, and the worker then drains the whole backlog
+in one burst — the pose output freezes and then jumps. If scans get dropped,
+`propRCP` extrapolates constant-velocity across the gap without a horizon and
+the first post-gap update yanks the pose back (worse in LIO: a runaway
+extrapolation makes the interpolated IMU prediction garbage, which trips the
+IMU residual gate and disables the IMU exactly when it is the only
+stabilizer).
+
+Diagnose before tuning — the overload block of `resple_diagnostics` (and the
+same metrics in `/diagnostics`):
+
+| Symptom | Metric | Knob |
+| --- | --- | --- |
+| Output freezes then jumps; latency grows over a run | `backlog_ms` climbing, `rt_factor < 1` | `max_latency_ms: 200` — bounds the data-time backlog by shedding the *oldest* queued scans; the estimator stays at the front of the stream. `backlog_ms` then saw-tooths ≤ ~budget instead of growing. |
+| Pose lurches right after WARN-logged sheds/drops | `shed_scans` / `dropped_scans` climbing + jump at the same time | `gap_extrap_decay: 0.9` — damps the across-gap extrapolation toward a hold so the re-entry correction is bounded. `gap_extrap_knots` counts how often gaps are being fast-forwarded. |
+| Everything slow, other processes starved, no single hot spot | `cycle_overruns` climbing, whole machine loaded | `num_threads` (auto-clamped), `executor_threads: 2`, and the publisher gates `publish_current_scan: false` / `publish_est_window: false` (the latter only with Mapping off). |
+| Map has holes / Mapping WARNs about dropped scans | `cap_dropped` in the Mapping 2 s summary | Mapping is optional — prefer running without it when starved. Otherwise raise `map/max_scan_buffer` and batch with `map/publish_min_interval_ms: 500` (batching never loses content). |
+
+`config_low_resource.yaml` bundles the recommended values (budget 200 ms,
+decay 0.9, 3 OpenMP + 2 executor threads, both publishers gated, Mapping
+assumed off).
+
+Caveats: `rt_factor` reads ≈1 *by design* once shedding is active (data time
+is fast-forwarded) — read it together with `shed_scans`; `backlog_ms` is the
+rate-independent ground truth. `latency_wall_ms` is only meaningful live or
+with `ros2 bag play --clock` + `use_sim_time`. Multi-lidar: the budget is
+per-LiDAR (a lagging-clock lidar is judged only against itself); after a
+shed, the existing fast-forward + admission gate drop other lidars' stale
+points — that is the chosen policy, not a bug.
+
+### Clock domains — bag replay at throttled speeds
+
+Both nodes keep three time domains strictly separated (2026-07-08 audit), so
+**replay behaviour is invariant to `ros2 bag play --rate`** as long as you
+play with `--clock` and run the nodes with `use_sim_time:=true`:
+
+- **Data time** (message stamps): everything the estimator computes — spline
+  knots, deskew, IEKF admission, the `max_latency_ms` shedding decision, the
+  TF-guard self-stamp matching. Never touches any clock.
+- **ROS time** (node clock = sim time on bags): every *wait-for-data*
+  timeout and every data-facing window — `tf_wait_timeout` (both nodes),
+  `lo_imu_wait_timeout`, the init-attitude TF wait, the TF-guard
+  `tf_conflict_quiet_sec` freshness and `tf_absent_warn_sec` absence check,
+  and Mapping's `map/publish_min_interval_ms` batch interval. At
+  `--rate 0.25` a 10 s wait covers 10 s of *bag* time, so slow replay can no
+  longer expire a TF/IMU wait before the bag delivers the data. All of these
+  survive the two sim-time traps: the clock reading 0 before the first
+  `/clock` message (windows start at the first valid sample, not at a bogus
+  epoch delta) and backwards jumps on a bag loop restart (windows re-arm
+  instead of wedging; `utils/sim_time_wait.h`, unit-tested).
+- **Wall time** (monotonic clock): only things that genuinely measure the
+  real machine — per-stage compute timings, `cycle_overruns` (the 50 ms
+  worker budget), the wall denominator of `rt_factor` (its definition), the
+  lifecycle bounded joins, and Mapping's 50 ms publish-I/O pacing (content
+  is unaffected; each publish ships the full accumulated state).
+
+Without `--clock`/`use_sim_time` the node clock is system time, and the ROS
+time domain degrades to the pre-audit wall-clock behaviour — so **always
+replay with `--clock` and `use_sim_time:=true`** when testing at non-1x
+rates. (One known cosmetic residue: `RCLCPP_*_THROTTLE` suppression windows
+use the node clock and may stay quiet briefly after a bag loop restart —
+logging only, no behavioural effect.)
 
 ## Reproducing the original (`main`) behavior for A/B comparison
 

@@ -51,3 +51,36 @@ float32 iekf_ms             # propRCP + updateIEKF*
 float32 deskew_ms           # deskew transform + world-cloud accumulation
 float32 frame_total_ms      # whole frame (drain excluded; matches Avg Computation Time)
 float32 map_update_ms       # last completed async map update (incremental + FOV/radius prune)
+
+# --- overload / real-time health (2026-07-07 hardening) ---
+# rt_factor: spline data-time advance / wall time over a ~2 s window. <1 =
+# falling behind the stream. NOTE: with latency shedding active this stays
+# ~1 by design (data-time is fast-forwarded) — read it TOGETHER with
+# shed_scans to distinguish "keeping up" from "keeping up by dropping".
+float32 rt_factor
+# backlog_ms: max over lidars of (newest arrived scan stamp - spline
+# maxTimeNs), in data time. Rate-independent overload ground truth.
+float32 backlog_ms
+# latency_wall_ms: node clock now() - newest processed measurement stamp.
+# Only meaningful live, or on bag replay with --clock + use_sim_time.
+float32 latency_wall_ms
+# shed_scans: cumulative scans dropped by the max_latency_ms budget
+# (distinct from dropped_scans = max_scan_buffer count-cap drops).
+uint64 shed_scans
+# cycle_overruns: worker outer iterations exceeding the 50 ms budget.
+uint32 cycle_overruns
+# gap_extrap_knots: cumulative knots extrapolated beyond the free window
+# (gap fast-forwards; damped when gap_extrap_decay < 1).
+uint64 gap_extrap_knots
+
+# --- TF ownership guard (2026-07-07) ---
+# Foreign publishers observed on the TF pair this node broadcasts
+# (post-inversion odom->frame_id; self is stamp-matched out). same_pair =
+# another node fighting for the exact pair; other_parent = the child frame
+# claimed by a different parent (broken tree). tf_conflict_active = a foreign
+# observation within the last tf_conflict_quiet_sec; tf_yielding = the
+# 'yield' action is currently suspending our own broadcast.
+uint64 tf_foreign_same_pair
+uint64 tf_foreign_other_parent
+bool tf_conflict_active
+bool tf_yielding

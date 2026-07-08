@@ -38,6 +38,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 #include <diagnostic_updater/diagnostic_updater.hpp>
 #include <diagnostic_updater/publisher.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
@@ -73,6 +74,8 @@
 #include "Estimator.h"
 #include "utils/point_cloud_ingest.h"
 #include "utils/filter_health.h"
+#include "utils/overload_control.h"
+#include "utils/tf_ownership.h"
 #ifdef RESPLE_USE_CUDA
 #include "gpu/cuda_knn.h"
 #endif
@@ -136,7 +139,27 @@ public:
         } else {
             num_match_points_ = this->get_parameter("num_match_points").as_int();
         }
-        
+
+        // Overload hardening (2026-07-07): clamp the OpenMP width to what the
+        // machine can actually give without starving the ROS executor and the
+        // async map-update thread. Every shipped config hardcodes num_threads
+        // for a big machine; on a 4-6 core box that oversubscribes the CPU and
+        // the worker loses its cores mid-IEKF. Deliberate default-behaviour
+        // change on small machines (< num_threads+2 cores) — see CLAUDE.md.
+        {
+            const unsigned hc = std::thread::hardware_concurrency();
+            if (hc > 0) {
+                const int cap = std::max(1, static_cast<int>(hc) - 2);
+                if (num_threads_ > cap) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "num_threads=%d exceeds this machine's budget (%u cores - 2 "
+                        "reserved for executor/map thread); clamping to %d",
+                        num_threads_, hc, cap);
+                    num_threads_ = cap;
+                }
+            }
+        }
+
         RCLCPP_INFO(this->get_logger(), "Using %d threads for parallel processing", num_threads_);
         RCLCPP_INFO(this->get_logger(), "Using %d nearest neighbor points for matching", num_match_points_);
         
@@ -290,6 +313,20 @@ public:
             }
         }
         
+        // TF ownership guard: raw /tf + /tf_static watchers (absolute topic
+        // names — tf2_ros broadcasters publish there regardless of namespace).
+        // QoS mirrors the tf2_ros listener defaults (KeepLast(100); static is
+        // transient_local so a latched foreign static transform on our pair is
+        // seen even if it was published before we activated). Default callback
+        // group: the callback is O(frames) string compares, no heavy work.
+        sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+            "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
+            std::bind(&RESPLE::tfWatchCallback, this, std::placeholders::_1));
+        sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+            "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
+            std::bind(&RESPLE::tfWatchCallback, this, std::placeholders::_1));
+        tf_absence_wait_.reset();  // window (re)starts at first valid clock sample
+
         // Start processing thread. The exited-flag store is the lambda's last
         // action so joinProcessingThreadBounded can tell "worker finished,
         // join() will return promptly" from "worker wedged, must detach"
@@ -356,6 +393,8 @@ public:
         sub_hesai.reset();
         sub_livox_mid360_boxi.reset();
         sub_generic.reset();
+        sub_tf_watch_.reset();
+        sub_tf_static_watch_.reset();
 
         // Drain any in-flight callbacks before on_cleanup tears down lidars_data
         // / m_buff state. Subscription::reset() drops the application's strong
@@ -409,8 +448,8 @@ public:
         // TF until the new timeline overtakes the old one (finding #12). The
         // LO IMU-wait and frame-id state must restart with it (findings #9/#10).
         last_pose_pub_time_ns_ = std::numeric_limits<int64_t>::min();
-        lo_imu_wait_started_ = false;
-        init_attitude_wait_started_ = false;
+        lo_imu_wait_.reset();
+        init_attitude_wait_.reset();
         init_attitude_delta_deg_.store(-1.0, std::memory_order_relaxed);
         imu_frame_id_.clear();
         
@@ -560,6 +599,10 @@ public:
                 // Diagnostic only — read-only, no lock-order interactions.
                 {
                     auto now_clk = this->get_clock()->now();
+                    // Node clock can jump backwards (bag loop restart under
+                    // use_sim_time): re-arm instead of going silent until the
+                    // clock re-reaches the stale stamp.
+                    if (now_clk < hb_last_log) hb_last_log = now_clk;
                     if ((now_clk - hb_last_log).seconds() >= 2.0) {
                         hb_last_log = now_clk;
                         size_t pc_buff_total = 0, pt_buff_total = 0;
@@ -581,6 +624,48 @@ public:
                         const bool init_done = if_init_filter.load();
                         int64_t spline_max = (init_done && spline) ? spline->maxTimeNs() : 0;
                         int64_t spline_n   = (init_done && spline) ? spline->numKnots() : 0;
+                        // Real-time factor: spline data-time advance / wall time
+                        // over this ~2 s window. Only meaningful when the IEKF
+                        // ran in the window (else an idle/paused bag reads as 0).
+                        // With latency shedding active this stays ~1 by design —
+                        // read together with shed_scans.
+                        {
+                            const auto now_mono = std::chrono::steady_clock::now();
+                            if (rtf_prev_spline_max_ > 0 && spline_max > 0 &&
+                                hb_iekf_count > 0) {
+                                const double wall_s = std::chrono::duration<double>(
+                                    now_mono - rtf_prev_wall_).count();
+                                if (wall_s > 0.5) {
+                                    const double data_s =
+                                        double(spline_max - rtf_prev_spline_max_) / 1e9;
+                                    rt_factor_.store(static_cast<float>(data_s / wall_s),
+                                                     std::memory_order_relaxed);
+                                }
+                            }
+                            rtf_prev_spline_max_ = spline_max;
+                            rtf_prev_wall_ = now_mono;
+                        }
+                        // TF ownership absence check (one-shot): demoted
+                        // (odom/publish_tf=false, external owner expected —
+                        // e.g. the robot_localization odom EKF) but nobody
+                        // has published our pair since activation. Downstream
+                        // TF consumers are silently starving.
+                        if (!publish_tf && tf_absent_warn_sec_ > 0 &&
+                            !tf_absence_warned_.load(std::memory_order_relaxed) &&
+                            !tf_own_monitor_.pairSeen()) {
+                            const double waited = tf_absence_wait_.elapsedSec(
+                                this->now().nanoseconds());
+                            if (waited > tf_absent_warn_sec_) {
+                                tf_absence_warned_.store(true, std::memory_order_relaxed);
+                                RCLCPP_WARN(this->get_logger(),
+                                    "[RESPLE] odom/publish_tf=false but NO ONE has published "
+                                    "%s->%s in %.0f s. The external owner (odom EKF?) is not "
+                                    "wired up - TF consumers downstream are starving. Either "
+                                    "start it or set odom/publish_tf: true.",
+                                    tf_own_monitor_.parent().c_str(),
+                                    tf_own_monitor_.child().c_str(), waited);
+                            }
+                        }
                         bool map_busy = map_update_pending_.load(std::memory_order_acquire)
                             && map_update_future_.valid()
                             && map_update_future_.wait_for(std::chrono::seconds(0))
@@ -588,10 +673,14 @@ public:
                         RCLCPP_INFO(this->get_logger(),
                             "[RESPLE] heartbeat: loops=%zu iekf=%zu coll_false=%zu "
                             "pc_buff=%zu pt_buff=%zu imu_int=%zu "
-                            "spline_knots=%ld spline_max=%ld map_busy=%d",
+                            "spline_knots=%ld spline_max=%ld map_busy=%d "
+                            "rtf=%.2f shed=%lu overruns=%u",
                             hb_loop_count, hb_iekf_count, hb_collect_false_count,
                             pc_buff_total, pt_buff_total, imu_buff_size,
-                            spline_n, spline_max, int(map_busy));
+                            spline_n, spline_max, int(map_busy),
+                            rt_factor_.load(std::memory_order_relaxed),
+                            static_cast<unsigned long>(shed_scans_.load(std::memory_order_relaxed)),
+                            cycle_overruns_.load(std::memory_order_relaxed));
                         hb_loop_count = hb_iekf_count = hb_collect_false_count = 0;
                     }
                 }
@@ -686,6 +775,9 @@ public:
                     "(spline knots=%ld, pt_buff total=%zu)",
                     spline->numKnots(), pt_buff_total);
             }
+            // Cycle-budget overrun accounting starts AFTER initialization so
+            // the deliberate 50 ms init-wait sleeps above never count.
+            const auto cycle_t0 = std::chrono::steady_clock::now();
             bool collected_any = false;
             while (true) {
                 // Phase 4 stage timing: drain covers THIS frame's collection
@@ -996,7 +1088,11 @@ public:
                 // max_spl_knots tracks totalKnots() (monotonic, includes
                 // pruned knots) so the growth gate keeps firing once Phase 3.1
                 // pruning caps numKnots() at the retention window.
-                if (spline->totalKnots() > max_spl_knots) {
+                // publish_est_window=false (overload hardening) skips the msg
+                // build + reliable-QoS publish entirely — ONLY safe with the
+                // Mapping node disabled (use_mapping:=false): /est_window is
+                // Mapping's sole input and it starves silently without it.
+                if (publish_est_window_ && spline->totalKnots() > max_spl_knots) {
                     estimate_msgs::msg::Spline spline_msg;
                     {
                         std::lock_guard<std::mutex> spline_lock(spline_mutex_);
@@ -1112,7 +1208,12 @@ public:
                     // mutation wedges (rebuild, blocking I/O, etc.).
                     // publishPoseAndTf already ran inline above; the async
                     // lambda is now strictly map-mutation, no ROS I/O.
-                    publishCurrentScan(pc_world_bg_);
+                    // publish_current_scan=false (overload hardening) skips
+                    // the per-point copy + serialization; visualization-only
+                    // output, nothing downstream consumes it.
+                    if (publish_current_scan_) {
+                        publishCurrentScan(pc_world_bg_);
+                    }
                     // Set map_update_pending_ BEFORE launching so on_deactivate's
                     // read (after worker join) sees the pending state. The
                     // lambda clears it on exit so the next loop iteration's
@@ -1235,11 +1336,46 @@ public:
                     dmsg.deskew_ms = std::chrono::duration<float, std::milli>(deskew_end - iekf_end).count();
                     dmsg.frame_total_ms = frame_duration.count() / 1000.0f;
                     dmsg.map_update_ms = last_map_update_us_.load(std::memory_order_relaxed) / 1000.0f;
+                    // Overload / real-time health (2026-07-07 hardening).
+                    newest_processed_ns_.store(max_time_ns, std::memory_order_relaxed);
+                    dmsg.rt_factor = rt_factor_.load(std::memory_order_relaxed);
+                    {
+                        // Data-time backlog: newest ARRIVED stamp (per-lidar
+                        // atomic, callback-written) minus newest PROCESSED
+                        // time. Rate-independent overload ground truth.
+                        int64_t newest_arrived = 0;
+                        for (const auto& [bn, bd] : lidars_data) {
+                            newest_arrived = std::max(
+                                newest_arrived,
+                                bd.last_t_ns.load(std::memory_order_relaxed));
+                        }
+                        dmsg.backlog_ms = (newest_arrived > max_time_ns)
+                            ? static_cast<float>(newest_arrived - max_time_ns) / 1e6f
+                            : 0.f;
+                    }
+                    // Wall latency: node clock vs newest processed stamp.
+                    // Meaningful live or with bag --clock + use_sim_time.
+                    dmsg.latency_wall_ms = static_cast<float>(
+                        this->now().nanoseconds() - max_time_ns) / 1e6f;
+                    dmsg.shed_scans = shed_scans_.load(std::memory_order_relaxed);
+                    dmsg.cycle_overruns = cycle_overruns_.load(std::memory_order_relaxed);
+                    dmsg.gap_extrap_knots = if_lidar_only
+                        ? estimator_lo.gapExtrapKnots()
+                        : estimator_lio.gapExtrapKnots();
+                    // TF ownership guard.
+                    dmsg.tf_foreign_same_pair = tf_own_monitor_.foreignSamePair();
+                    dmsg.tf_foreign_other_parent = tf_own_monitor_.foreignOtherParent();
+                    dmsg.tf_conflict_active = tf_own_monitor_.foreignActiveWithin(
+                        this->now().nanoseconds(), tf_conflict_quiet_ns_);
+                    dmsg.tf_yielding = tf_yield_active_.load(std::memory_order_relaxed);
                     pub_diag_->publish(dmsg);
                 }
 
-                // Update diagnostics at 1 Hz
-                if ((this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) >= 1000000000LL) {
+                // Update diagnostics at 1 Hz. llabs: the node clock can jump
+                // backwards (bag loop restart under use_sim_time) — a plain
+                // difference would silence the tick until the clock re-reaches
+                // the stale stamp.
+                if (std::llabs(this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) >= 1000000000LL) {
                     diagnostics_.force_update();
                     last_process_ns_.store(this->now().nanoseconds(), std::memory_order_relaxed);
                 }
@@ -1253,6 +1389,14 @@ public:
                     // latency well under the 10ms knot interval while
                     // freeing the core for sensor callbacks.
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                // Overload metric: steady-state iterations exceeding the 50 ms
+                // design budget (kRatePeriod). Idle passes take ~1 ms and
+                // cannot trip this; a climbing counter = the machine cannot
+                // keep up with the configured workload.
+                if (std::chrono::steady_clock::now() - cycle_t0 >
+                        std::chrono::milliseconds(50)) {
+                    cycle_overruns_.fetch_add(1, std::memory_order_relaxed);
                 }
             } catch (const std::exception& e) {
                 RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1352,6 +1496,9 @@ private:
     // per-second rate, not a cumulative count).
     uint64_t last_numerical_failures_lo_ = 0;
     uint64_t last_numerical_failures_lio_ = 0;
+    // Per-window baseline for the TF-guard foreign-observation delta
+    // (updateDiagnostics only, executor thread).
+    uint64_t last_tf_foreign_total_ = 0;
     
     // Lifecycle management
     std::atomic<bool> processing_active_;
@@ -1410,8 +1557,8 @@ private:
     // initialization() to resolve the mounting rotation for gravity (finding #9).
     std::string imu_frame_id_;
     // LO-without-IMU init timeout state (finding #10; worker thread only).
-    bool lo_imu_wait_started_ = false;
-    std::chrono::steady_clock::time_point lo_imu_wait_start_{};
+    // NODE-CLOCK window (2026-07-08 clock-domain audit).
+    resple::timeutil::RosTimeWait lo_imu_wait_;
     double lo_imu_wait_timeout_ = 10.0;
 
     // Initial-attitude source (Design B). "gravity" (default) = accelerometer
@@ -1430,9 +1577,8 @@ private:
     double init_attitude_consistency_deg_ = 3.0;
     // TF-wait deadline for the attitude lookup (mirrors the LO-IMU wait): after
     // this, a tf-mode init that has neither TF nor a gravity window proceeds
-    // with identity rather than blocking forever.
-    bool init_attitude_wait_started_ = false;
-    std::chrono::steady_clock::time_point init_attitude_wait_start_{};
+    // with identity rather than blocking forever. NODE-CLOCK window.
+    resple::timeutil::RosTimeWait init_attitude_wait_;
     // Last TF-vs-gravity roll/pitch disagreement (deg) from tf_gravity_check;
     // -1 = not computed. Read by the diagnostics thread.
     std::atomic<double> init_attitude_delta_deg_{-1.0};
@@ -1440,6 +1586,69 @@ private:
     bool publish_tf, invert_tf;
     std::string frame_id;
     std::string odom_id;
+
+    // TF ownership guard (2026-07-07): watches the raw /tf (+ /tf_static)
+    // stream for a FOREIGN publisher on the pair this node broadcasts
+    // (post-inversion odom->frame_id). Self-vs-foreign is stamp-matched
+    // (utils/tf_ownership.h); the monitor's mutex is a leaf lock. Action:
+    //   warn  (default) - throttled ERROR + diagnostics, transforms unchanged
+    //   yield           - keep publishing odometry topics but suspend OUR TF
+    //                     broadcast while the foreign publisher was seen
+    //                     within tf_conflict_quiet_sec (auto-demotion; stops
+    //                     the flicker without operator intervention)
+    // When odom/publish_tf=false (external owner expected, e.g. the
+    // robot_localization odom EKF), the guard instead runs the ABSENCE check:
+    // one-shot WARN if nobody publishes the pair within tf_absent_warn_sec.
+    resple::tfown::TfOwnershipMonitor tf_own_monitor_;
+    std::string tf_conflict_action_ = "warn";
+    int64_t tf_conflict_quiet_ns_ = 5000000000LL;
+    double tf_absent_warn_sec_ = 10.0;
+    rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_watch_;
+    rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_static_watch_;
+    std::atomic<bool> tf_absence_warned_{false};
+    std::atomic<bool> tf_yield_active_{false};  // diagnostics: yield currently holding our TF
+    // Absence-check window in NODE-CLOCK time (2026-07-08 clock-domain audit):
+    // sim-time aware, survives the pre-/clock zero reading and loop restarts.
+    // Written from on_activate/heartbeat (worker) via elapsedSec; the guard's
+    // freshness 'now' likewise comes from the node clock so yield/resume is
+    // invariant to bag playback rate.
+    resple::timeutil::RosTimeWait tf_absence_wait_;
+
+    // Raw /tf + /tf_static watcher (default callback group; O(frames) string
+    // compares per message, no allocation). Runs on the executor; the monitor
+    // synchronizes internally against the worker's notePublished.
+    void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg)
+    {
+        const int64_t now_ns = this->now().nanoseconds();
+        for (const auto& ts : msg->transforms) {
+            const int64_t stamp_ns = rclcpp::Time(ts.header.stamp).nanoseconds();
+            const auto v = tf_own_monitor_.classify(
+                ts.header.frame_id, ts.child_frame_id, stamp_ns, now_ns);
+            if (!publish_tf) continue;  // demoted: foreign owner is EXPECTED here
+            if (v == resple::tfown::Verdict::FOREIGN_SAME_PAIR) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] TF ownership conflict: another publisher is broadcasting "
+                    "%s->%s (%lu foreign transforms so far). Two publishers on one TF "
+                    "pair make the pose flicker/jump. Either set odom/publish_tf: false "
+                    "here (RESPLE stays an odometry source for the external EKF) or "
+                    "disable the other publisher.%s",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str(),
+                    static_cast<unsigned long>(tf_own_monitor_.foreignSamePair()),
+                    tf_conflict_action_ == "yield"
+                        ? " tf_conflict_action=yield: suspending our broadcast while "
+                          "the other publisher is active." : "");
+            } else if (v == resple::tfown::Verdict::FOREIGN_OTHER_PARENT) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] TF tree conflict: frame '%s' is also claimed by parent "
+                    "'%s' while we publish %s->%s (%lu so far). A TF child has exactly "
+                    "one parent - the tree is broken and lookups will flap between "
+                    "parents. Fix the URDF/static publisher or our frame_id.",
+                    tf_own_monitor_.child().c_str(), ts.header.frame_id.c_str(),
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str(),
+                    static_cast<unsigned long>(tf_own_monitor_.foreignOtherParent()));
+            }
+        }
+    }
 
     std::map<std::string, LidarConfig> lidars;
     float ds_lm_voxel;
@@ -1546,6 +1755,31 @@ private:
     std::atomic<uint64_t> dropped_scans_{0};
     std::atomic<uint64_t> dropped_imu_{0};
 
+    // 2026-07-07 overload hardening ("drop scans, stay real-time"):
+    // per-LiDAR DATA-TIME latency budget for queued raw scans. 0 = off.
+    // Shedding happens in pushScanBounded via overload::latencyShedCount;
+    // counted separately from the count-cap drops above so operators can
+    // tell "budget engaged" from "burst overflowed the cap".
+    int64_t max_latency_ns_ = 0;
+    std::atomic<uint64_t> shed_scans_{0};
+    // Worker steady-state iterations that exceeded the 50 ms budget.
+    std::atomic<uint32_t> cycle_overruns_{0};
+    // Real-time factor over the ~2 s heartbeat window (worker-written,
+    // diagnostics-read). rtf_prev_* are worker-thread-only.
+    std::atomic<float> rt_factor_{0.f};
+    int64_t rtf_prev_spline_max_ = 0;
+    std::chrono::steady_clock::time_point rtf_prev_wall_{};
+    // Newest processed measurement stamp (worker-written) for latency_wall_ms
+    // and backlog_ms; and cumulative gap-extrapolated knots (see Estimator).
+    std::atomic<int64_t> newest_processed_ns_{0};
+    // Publisher relief (overload hardening): both default true (= today).
+    // publish_current_scan gates the /current_scan world-cloud copy+publish
+    // (visualization only). publish_est_window gates /est_window — ONLY
+    // disable together with use_mapping:=false (it is Mapping's sole input).
+    // Worker-thread reads; set once in readParameters (configure).
+    bool publish_current_scan_ = true;
+    bool publish_est_window_ = true;
+
     // Single push path for every LiDAR callback (HARDENING §2.3).
     template<typename PtsT>
     void pushScanBounded(LidarData& ld, PtsT&& pts, int64_t t_begin)
@@ -1556,6 +1790,34 @@ private:
                 ld.pc_buff.pop_front();
                 ld.t_buff.pop_front();
                 dropped_scans_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // 2026-07-07 overload hardening: latency-bounded shedding ("drop
+        // scans, stay real-time"). DATA-TIME budget against THIS lidar's
+        // incoming stamp — playback-rate independent, no wall clock, and a
+        // lagging second lidar is judged only against itself. This is the
+        // single choke point every LiDAR callback routes through, already
+        // under mtx_pc, and shedding here (before removeNaN/voxel/PointData)
+        // is the cheapest possible drop. It also bounds pc_buff growth while
+        // the worker is stuck in a long catch-up pass. The estimator sees a
+        // clean time gap and fast-forwards via propRCP (damped when
+        // gap_extrap_decay < 1) instead of processing stale data late.
+        if (max_latency_ns_ > 0) {
+            const std::size_t n = resple::overload::latencyShedCount(
+                ld.t_buff, t_begin, max_latency_ns_);
+            for (std::size_t i = 0; i < n; ++i) {
+                ld.pc_buff.pop_front();
+                ld.t_buff.pop_front();
+            }
+            if (n > 0) {
+                shed_scans_.fetch_add(n, std::memory_order_relaxed);
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] latency budget engaged: shed %zu queued scan(s) "
+                    "older than %ld ms (cumulative %lu). The machine is not "
+                    "keeping up with the input rate.",
+                    n, static_cast<long>(max_latency_ns_ / 1000000),
+                    static_cast<unsigned long>(
+                        shed_scans_.load(std::memory_order_relaxed)));
             }
         }
         ld.pc_buff.push_back(std::forward<PtsT>(pts));
@@ -1763,6 +2025,29 @@ private:
         RCLCPP_INFO(this->get_logger(), "Frame IDs - odom: %s, body: %s",
                     odom_id.c_str(), frame_id.c_str());
 
+        // TF ownership guard (2026-07-07). Watched pair = the POST-inversion
+        // pair actually broadcast. configure() also resets the monitor for
+        // lifecycle re-cycles (readParameters runs from on_configure).
+        tf_conflict_action_ = CommonUtils::readParam<std::string>(
+            this->get_node_parameters_interface(), "tf_conflict_action", std::string("warn"));
+        if (tf_conflict_action_ != "warn" && tf_conflict_action_ != "yield") {
+            RCLCPP_WARN(this->get_logger(),
+                "[RESPLE] tf_conflict_action='%s' unknown (warn|yield); using 'warn'",
+                tf_conflict_action_.c_str());
+            tf_conflict_action_ = "warn";
+        }
+        tf_conflict_quiet_ns_ = static_cast<int64_t>(1e9 * CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "tf_conflict_quiet_sec", 5.0));
+        tf_absent_warn_sec_ = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "tf_absent_warn_sec", 10.0);
+        if (invert_tf) {
+            tf_own_monitor_.configure(frame_id, odom_id);
+        } else {
+            tf_own_monitor_.configure(odom_id, frame_id);
+        }
+        tf_absence_warned_.store(false, std::memory_order_relaxed);
+        tf_yield_active_.store(false, std::memory_order_relaxed);
+
         // Extrinsic convention (see updateLidarTransform): default true keeps
         // the production TF-based flow; dataset replay launches pass false so
         // the YAML q_lb/t_lb is the single source of truth (upstream parity).
@@ -1912,6 +2197,32 @@ private:
             estimator_lio.range_noise_scale_max = rmax;
         }
 
+        // Overload hardening (2026-07-07): damped propRCP gap extrapolation.
+        // decay 1.0 (default) is a bit-identical no-op — propRCP takes the
+        // literal legacy constant-velocity expression. decay < 1 geometrically
+        // damps the extrapolated velocity for knots beyond free_knots within
+        // one propRCP call, bounding the excursion (and the post-gap yank)
+        // after latency sheds / scan drops. See utils/overload_control.h.
+        {
+            const double gap_decay = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "gap_extrap_decay", 1.0);
+            const int gap_free = CommonUtils::readParam<int>(
+                this->get_node_parameters_interface(), "gap_extrap_free_knots", 3);
+            resple::overload::GapExtrapDamping gd;
+            gd.decay = gap_decay;
+            gd.free_knots = std::max(0, gap_free);
+            estimator_lo.gap_extrap = gd;
+            estimator_lio.gap_extrap = gd;
+            if (gap_decay < 1.0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] gap_extrap_decay=%.3f (free_knots=%d): propRCP "
+                    "extrapolation velocity damped geometrically beyond the free "
+                    "window; excursion across a v m/knot gap bounded by ~free + "
+                    "v/(1-decay) knots instead of growing linearly.",
+                    gap_decay, gd.free_knots);
+            }
+        }
+
         // §3.2 prototype: X-ICP-style degenerate-direction gate (translation
         // only). 0 disables (default — decision-gate rule: this changes the
         // estimator's update; enable only behind a bag A/B). Recommended
@@ -1992,6 +2303,32 @@ private:
         // previously hardcoded 2000; 0 disables). Drop-oldest + counters.
         max_scan_buffer_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_scan_buffer", 0);
         max_imu_staging_ = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "max_imu_staging", 2000);
+        // 2026-07-07 overload hardening: per-LiDAR data-time latency budget.
+        // 0 = off (default, legacy). See pushScanBounded / doc/PARAMETERS.md.
+        max_latency_ns_ = 1000000LL * CommonUtils::readParam<int>(
+            this->get_node_parameters_interface(), "max_latency_ms", 0);
+        if (max_latency_ns_ > 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] latency shedding armed: queued scans older than %ld ms "
+                "(data time, per lidar) are dropped to stay real-time",
+                static_cast<long>(max_latency_ns_ / 1000000));
+        }
+        // Publisher relief (overload hardening): both true by default.
+        publish_current_scan_ = CommonUtils::readParam<bool>(
+            this->get_node_parameters_interface(), "publish_current_scan", true);
+        publish_est_window_ = CommonUtils::readParam<bool>(
+            this->get_node_parameters_interface(), "publish_est_window", true);
+        if (!publish_current_scan_) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] publish_current_scan=false: /current_scan disabled "
+                "(visualization only; odometry/map unaffected).");
+        }
+        if (!publish_est_window_) {
+            RCLCPP_WARN(this->get_logger(),
+                "[RESPLE] publish_est_window=false: /est_window disabled. The "
+                "Mapping node consumes ONLY this topic — run with "
+                "use_mapping:=false or the map will silently never build.");
+        }
 
         // HARDENING §6.3 internal-map insertion lag (0 = upstream
         // insert-at-edge; recommended trial value 8 = the convergence
@@ -2167,7 +2504,7 @@ private:
     // gravity-aligned reference frame (Design B). Returns the rotation
     // R_{init_attitude_frame <- frame_id} at the latest available time. No
     // internal blocking — initialization() retries each cycle and bounds the
-    // wait via init_attitude_wait_start_. Time(0) (latest) is used for the
+    // wait via init_attitude_wait_. Time(0) (latest) is used for the
     // same reason updateImuTransform/updateLidarTransform do: exact for a
     // static mount, close enough for a slowly-varying source at init.
     bool lookupInitAttitude(Eigen::Quaterniond& q_wb_out)
@@ -2321,13 +2658,12 @@ private:
         }
         // TF not available yet: wait up to tf_wait_timeout_ seconds (measured
         // from this lidar's first attempt), then fall back to the YAML-only
-        // convention instead of dropping scans forever.
-        const auto now_mono = std::chrono::steady_clock::now();
-        if (!lidar.tf_first_attempt_set) {
-            lidar.tf_first_attempt = now_mono;
-            lidar.tf_first_attempt_set = true;
-        } else if (std::chrono::duration<double>(now_mono - lidar.tf_first_attempt).count()
-                       > tf_wait_timeout_) {
+        // convention instead of dropping scans forever. NODE-CLOCK time
+        // (2026-07-08 clock-domain audit): with use_sim_time this window runs
+        // in bag time, so throttled replay cannot expire it before the bag
+        // publishes the TF; RosTimeWait also survives the pre-/clock zero
+        // reading and bag-loop restarts.
+        if (lidar.tf_wait.elapsedSec(this->now().nanoseconds()) > tf_wait_timeout_) {
             RCLCPP_WARN(this->get_logger(),
                 "[RESPLE] No TF %s -> %s after %.1f s; falling back to the YAML "
                 "q_lb/t_lb extrinsic only (upstream convention). Publish the TF or "
@@ -2615,6 +2951,88 @@ private:
                  static_cast<int>(dropped_scans_.load(std::memory_order_relaxed)));
         stat.add("IMU Samples Dropped (cumulative)",
                  static_cast<int>(dropped_imu_.load(std::memory_order_relaxed)));
+
+        // Overload / real-time health (2026-07-07 hardening). rt_factor is
+        // spline data-time advance / wall time over a ~2 s worker window; with
+        // latency shedding active it stays ~1 BY DESIGN (data time is fast-
+        // forwarded), so read it TOGETHER with the shed counter to tell
+        // "keeping up" from "keeping up by dropping". Backlog is recomputed
+        // here (not the worker's cached value) so a fully stalled worker
+        // still shows it growing.
+        const float rt_factor = rt_factor_.load(std::memory_order_relaxed);
+        const uint64_t shed = shed_scans_.load(std::memory_order_relaxed);
+        float backlog_ms = 0.f;
+        {
+            const int64_t newest_proc = newest_processed_ns_.load(std::memory_order_relaxed);
+            if (newest_proc > 0) {
+                int64_t newest_arrived = 0;
+                for (const auto& [bn, bd] : lidars_data) {
+                    newest_arrived = std::max(
+                        newest_arrived, bd.last_t_ns.load(std::memory_order_relaxed));
+                }
+                if (newest_arrived > newest_proc) {
+                    backlog_ms = static_cast<float>(newest_arrived - newest_proc) / 1e6f;
+                }
+            }
+        }
+        stat.add("RT Factor (data/wall, ~2s window)", static_cast<double>(rt_factor));
+        stat.add("Backlog (ms, data time)", static_cast<double>(backlog_ms));
+        stat.add("Scans Shed by Latency Budget (cumulative)", static_cast<int>(shed));
+        stat.add("Worker Cycle Overruns (cumulative)",
+                 static_cast<int>(cycle_overruns_.load(std::memory_order_relaxed)));
+        // Escalation: rt_factor is only meaningful once a measurement window
+        // has completed (0 until then) and frames advanced this period.
+        if (frame_count > 0 && rt_factor > 0.f) {
+            if (rt_factor < 0.7f) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+                msg = "Real-time factor critically low - worker falling behind the stream";
+            } else if (rt_factor < 0.9f
+                       && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+                msg = "Real-time factor below 0.9 - worker not keeping up";
+            }
+        }
+        // Backlog vs the latency budget (only when the budget is armed; with
+        // it off there is no calibrated scale for what "too much" means).
+        if (max_latency_ns_ > 0 && backlog_ms > 0.f) {
+            const float budget_ms = static_cast<float>(max_latency_ns_) / 1e6f;
+            if (backlog_ms > 3.f * budget_ms) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+                msg = "Input backlog far exceeds max_latency_ms budget";
+            } else if (backlog_ms > budget_ms
+                       && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+                msg = "Input backlog exceeds max_latency_ms budget";
+            }
+        }
+
+        // TF ownership guard (2026-07-07): foreign publisher on the pair we
+        // broadcast. ERROR while actively conflicting; WARN when new foreign
+        // transforms were seen this window but the intruder has gone quiet.
+        {
+            const uint64_t tf_same = tf_own_monitor_.foreignSamePair();
+            const uint64_t tf_parent = tf_own_monitor_.foreignOtherParent();
+            const bool tf_active = tf_own_monitor_.foreignActiveWithin(
+                this->now().nanoseconds(), tf_conflict_quiet_ns_);
+            const bool tf_yielding = tf_yield_active_.load(std::memory_order_relaxed);
+            stat.add("TF Foreign Publishes Same Pair (cumulative)", static_cast<int>(tf_same));
+            stat.add("TF Foreign Parent Claims (cumulative)", static_cast<int>(tf_parent));
+            stat.add("TF Conflict Active", tf_active);
+            stat.add("TF Yielding", tf_yielding);
+            const uint64_t tf_delta =
+                (tf_same + tf_parent) - last_tf_foreign_total_;
+            last_tf_foreign_total_ = tf_same + tf_parent;
+            if (publish_tf && tf_active) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+                msg = tf_yielding
+                    ? "TF ownership conflict active (yielding our broadcast)"
+                    : "TF ownership conflict active (two publishers on our pair)";
+            } else if (publish_tf && tf_delta > 0
+                       && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+                level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+                msg = "Foreign TF publisher observed this window";
+            }
+        }
 
         // HARDENING §3.3 recovery-policy observability: whether odometry/TF
         // publication is currently held, and how many covariance resets the
@@ -3239,6 +3657,21 @@ private:
         pub_odom->publish(odom_msg);
 
         if (publish_tf) {
+            // TF ownership guard 'yield': while a foreign publisher on our
+            // pair was seen within the quiet window, suspend OUR broadcast
+            // (odometry topics above keep flowing) instead of fighting it —
+            // interleaved publishers make the pose flicker. Resumes
+            // automatically once the intruder goes quiet.
+            const bool yield_now = tf_conflict_action_ == "yield"
+                && tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_);
+            tf_yield_active_.store(yield_now, std::memory_order_relaxed);
+            if (yield_now) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] yielding the %s->%s TF to a foreign publisher "
+                    "(tf_conflict_action=yield); odometry topics continue.",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str());
+                return;
+            }
             geometry_msgs::msg::TransformStamped transformStamped;
             transformStamped.transform.translation.x = pose_msg.pose.position.x;
             transformStamped.transform.translation.y = pose_msg.pose.position.y;
@@ -3258,6 +3691,10 @@ private:
                 transformStamped.header.frame_id = odom_id;
                 transformStamped.child_frame_id  = frame_id;
             }
+            // Record the exact wire stamp BEFORE sending so the DDS loopback
+            // of our own message can never race the ring insert.
+            tf_own_monitor_.notePublished(
+                rclcpp::Time(transformStamped.header.stamp).nanoseconds());
             br->sendTransform(transformStamped);
         }
     }
@@ -3370,12 +3807,11 @@ private:
             if (if_lidar_only) {
                 std::lock_guard<std::mutex> lk(m_buff);
                 if (static_cast<int>(imu_buff.size()) < imu_init_num_samples_) {
-                    const auto now_mono = std::chrono::steady_clock::now();
-                    if (!lo_imu_wait_started_) {
-                        lo_imu_wait_start_ = now_mono;
-                        lo_imu_wait_started_ = true;
-                    } else if (std::chrono::duration<double>(now_mono - lo_imu_wait_start_).count()
-                                   > lo_imu_wait_timeout_) {
+                    // NODE-CLOCK wait (2026-07-08 clock-domain audit): sim-time
+                    // aware so throttled replay can't expire it before the bag
+                    // delivers the IMU samples.
+                    if (lo_imu_wait_.elapsedSec(this->now().nanoseconds())
+                            > lo_imu_wait_timeout_) {
                         use_imu_gravity = false;
                         RCLCPP_WARN(this->get_logger(),
                             "[RESPLE] LO mode: insufficient IMU after %.1f s — initializing "
@@ -3545,12 +3981,9 @@ private:
                 // a bounded chance (tf_wait_timeout) before falling to identity,
                 // so a slow static-TF publisher doesn't init the map tilted.
                 if (tf_mode) {
-                    const auto now_mono = std::chrono::steady_clock::now();
-                    if (!init_attitude_wait_started_) {
-                        init_attitude_wait_start_ = now_mono;
-                        init_attitude_wait_started_ = true;
-                    }
-                    if (std::chrono::duration<double>(now_mono - init_attitude_wait_start_).count()
+                    // NODE-CLOCK wait (2026-07-08 clock-domain audit; see
+                    // lo_imu_wait_ above for the rationale).
+                    if (init_attitude_wait_.elapsedSec(this->now().nanoseconds())
                             <= tf_wait_timeout_) {
                         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                             "[RESPLE] waiting for init attitude: TF '%s' -> '%s' (no clean gravity "
@@ -4022,7 +4455,20 @@ int respleMain(int argc, char *argv[])
     }
     RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE active - entering executor spin");
 
-    rclcpp::executors::MultiThreadedExecutor exec;
+    // Overload hardening (2026-07-07): 0 (default) keeps rclcpp's behaviour
+    // (one executor thread per core), which oversubscribes small shared
+    // machines — the sensor group is MutuallyExclusive so >2 threads buy
+    // almost nothing. Low-resource profile sets 2.
+    const int executor_threads = CommonUtils::readParam<int>(
+        node->get_node_parameters_interface(), "executor_threads", 0);
+    if (executor_threads > 0) {
+        RCLCPP_INFO(node->get_logger(),
+            "MultiThreadedExecutor limited to %d threads (executor_threads)",
+            executor_threads);
+    }
+    rclcpp::executors::MultiThreadedExecutor exec(
+        rclcpp::ExecutorOptions(),
+        static_cast<size_t>(std::max(0, executor_threads)));
     exec.add_node(node->get_node_base_interface());
     exec.spin();
 

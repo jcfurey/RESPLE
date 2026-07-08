@@ -62,10 +62,12 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 
 #include "utils/common_utils.h"
 #include "SplineState.h"
 #include "utils/point_cloud_ingest.h"
+#include "utils/tf_ownership.h"
 
 template<typename PointType>
 class MappingBase
@@ -93,6 +95,20 @@ class MappingBase
         frame_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "frame_id", "base_link");
         map_id = CommonUtils::readParam<std::string>(nh->get_node_parameters_interface(), "map/frame_id", "map");
         num_threads_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "num_threads", 5);
+        // Same OpenMP clamp as the RESPLE node (overload hardening 2026-07-07):
+        // configs written for big machines must not oversubscribe a small one.
+        {
+            const unsigned hc = std::thread::hardware_concurrency();
+            if (hc > 0) {
+                const int cap = std::max(1, static_cast<int>(hc) - 2);
+                if (num_threads_ > cap) {
+                    RCLCPP_WARN(nh->get_logger(),
+                        "num_threads=%d exceeds this machine's budget (%u cores - 2); "
+                        "clamping to %d", num_threads_, hc, cap);
+                    num_threads_ = cap;
+                }
+            }
+        }
         // Map lag in knots (see processScan). Default 8 = the convergence
         // horizon plus margin: the IEKF only updates the last 4 RCPs and
         // est_window only resends the last 5 knots, so a knot is FINAL once
@@ -106,6 +122,25 @@ class MappingBase
             RCLCPP_WARN(nh->get_logger(),
                 "map_deskew_lag_knots=%d is negative; using 0 (no lag)", deskew_lag_knots_);
             deskew_lag_knots_ = 0;
+        }
+        // Overload hardening (2026-07-07): the per-sensor scan-buffer cap was
+        // hardcoded 200, duplicated in every callback, and dropped silently
+        // (permanent map holes with no trace). Now parameterized (default 200
+        // = previous behaviour) and counted — see pushScanCapped().
+        max_scan_buffer_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "map/max_scan_buffer", 200);
+        if (max_scan_buffer_ < 1) {
+            RCLCPP_WARN(nh->get_logger(),
+                "map/max_scan_buffer=%d is < 1; using 1", max_scan_buffer_);
+            max_scan_buffer_ = 1;
+        }
+        // Batch publish: accumulate transformed scans and publish /global_map
+        // at most every N ms (0 = per-scan, previous behaviour). Batching
+        // never drops content — see processScan.
+        publish_min_interval_ms_ = CommonUtils::readParam<int>(nh->get_node_parameters_interface(), "map/publish_min_interval_ms", 0);
+        if (publish_min_interval_ms_ > 0) {
+            RCLCPP_INFO(nh->get_logger(),
+                "[Mapping] /global_map batched: publishing at most every %d ms",
+                publish_min_interval_ms_);
         }
 
         RCLCPP_INFO(nh->get_logger(), "Frame IDs -  map: %s, body: %s", 
@@ -131,6 +166,7 @@ class MappingBase
         pc_last.reset(new typename pcl::PointCloud<PointType>());
         pc_last_ds.reset(new typename pcl::PointCloud<PointType>());
         pc.reset(new typename pcl::PointCloud<PointType>());
+        pc_pending_.reset(new typename pcl::PointCloud<PointType>());
     }
 
     Eigen::Affine3d getLidarToBaselink()
@@ -141,6 +177,35 @@ class MappingBase
     Eigen::Affine3d getImuToBaselink()
     {
         return imu_to_baselink_;
+    }
+
+    // Single choke point for buffering a downsampled scan for the worker
+    // (overload hardening 2026-07-07 — replaces 7 identical inline cap blocks).
+    // Drops the OLDEST scans when the worker stalls: map holes are preferred
+    // to OOM, but they are now counted (cap_dropped in the 2 s summary) and
+    // WARNed instead of silent. Called from sensor callbacks only (serialized
+    // on cb_mtx_); the counter is atomic because processScan's summary reads
+    // it from the worker thread.
+    void pushScanCapped(const typename pcl::PointCloud<PointType>& cloud)
+    {
+        size_t n_dropped = 0;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            while (pc_L_buff.size() >= static_cast<size_t>(max_scan_buffer_)) {
+                pc_L_buff.pop_front();
+                ++n_dropped;
+            }
+            pc_L_buff.push_back(cloud);
+        }
+        if (n_dropped > 0) {
+            total_cap_dropped_.fetch_add(n_dropped, std::memory_order_relaxed);
+            RCLCPP_WARN_THROTTLE(node_handle_->get_logger(), *node_handle_->get_clock(), 5000,
+                "[Mapping] scan buffer full (map/max_scan_buffer=%d): dropping oldest "
+                "scans — the map will have holes here (%lu dropped total). The worker "
+                "is not keeping up (CPU contention or spline gate).",
+                max_scan_buffer_,
+                static_cast<unsigned long>(total_cap_dropped_.load(std::memory_order_relaxed)));
+        }
     }
 
     // Single definition of the sensor-callback guard policy: serialize the
@@ -239,8 +304,36 @@ class MappingBase
                 pc_L_buff.pop_front();
             }
             transformCloud(front_cloud, spl, pc);
-            publishMap(pc, pub_global_map);
+            if (publish_min_interval_ms_ <= 0) {
+                publishMap(pc, pub_global_map);
+            } else {
+                // Batch, don't drop (overload hardening 2026-07-07): every
+                // /global_map msg is ONE incremental scan that viewers
+                // accumulate, so a skipped publish would be a permanent map
+                // hole. Accumulate and flush on the interval below instead —
+                // fewer, larger messages for the same total content.
+                *pc_pending_ += *pc;
+            }
             n_published++;
+        }
+        // Interval flush for the batch mode. Runs even on ticks that consumed
+        // no scans so a gated/paused stream still drains the pending batch.
+        // Node clock: with use_sim_time the interval runs in bag time, so the
+        // batch content per publish is invariant to playback rate.
+        if (publish_min_interval_ms_ > 0 && !pc_pending_->points.empty()) {
+            const auto now_pub = node_handle_->get_clock()->now();
+            // Sim clock jumped backwards (bag loop restart): the last-publish
+            // stamp is in the future and the flush would wedge until the
+            // clock re-reaches it — re-arm instead.
+            if (now_pub < last_batch_publish_) {
+                last_batch_publish_ = now_pub;
+            }
+            if ((now_pub - last_batch_publish_).nanoseconds() >=
+                int64_t(publish_min_interval_ms_) * 1000000LL) {
+                publishMap(pc_pending_, pub_global_map);
+                pc_pending_->clear();
+                last_batch_publish_ = now_pub;
+            }
         }
         // Update aggregate counters (cheap; called once per process-loop tick).
         total_published_ += n_published;
@@ -250,6 +343,9 @@ class MappingBase
         // Reading out spline window + buffer state makes it obvious if we're
         // pinned in any of the failure modes (e.g., t_end always > spline_max).
         auto now_clk = node_handle_->get_clock()->now();
+        // Re-arm on a backwards clock jump (bag loop restart) instead of
+        // going silent until the clock re-reaches the stale stamp.
+        if (now_clk < last_processScan_log_) last_processScan_log_ = now_clk;
         if ((now_clk - last_processScan_log_).seconds() >= 2.0) {
             last_processScan_log_ = now_clk;
             int64_t s_min = spl->minTimeNs(), s_max = spl->maxTimeNs();
@@ -260,9 +356,10 @@ class MappingBase
             RCLCPP_INFO(node_handle_->get_logger(),
                 "[Mapping] processScan: pc_L_buff=%zu spline_knots=%ld "
                 "spline=[%ld..%ld] last_t_end=%ld "
-                "totals: published=%zu dropped_old=%zu pending_new=%zu",
+                "totals: published=%zu dropped_old=%zu pending_new=%zu cap_dropped=%lu",
                 buf_remaining, spl->numKnots(), s_min, s_max, last_t_end_ns,
-                total_published_, total_dropped_old_, total_pending_new_);
+                total_published_, total_dropped_old_, total_pending_new_,
+                static_cast<unsigned long>(total_cap_dropped_.load(std::memory_order_relaxed)));
         }
         return (n_published + n_dropped_old) > 0;
     }
@@ -319,13 +416,11 @@ class MappingBase
             }
             // Timed fallback (mirrors RESPLE's updateLidarTransform, finding
             // #22): degrade to the YAML-only convention instead of dropping
-            // scans forever when no TF is ever published.
-            const auto now_mono = std::chrono::steady_clock::now();
-            if (!tf_first_attempt_set_) {
-                tf_first_attempt_ = now_mono;
-                tf_first_attempt_set_ = true;
-            } else if (std::chrono::duration<double>(now_mono - tf_first_attempt_).count()
-                           > tf_wait_timeout_) {
+            // scans forever when no TF is ever published. NODE-CLOCK window
+            // (2026-07-08 clock-domain audit): sim-time aware, so throttled
+            // bag replay cannot expire it before the bag publishes the TF.
+            if (tf_wait_.elapsedSec(node_handle_->now().nanoseconds())
+                    > tf_wait_timeout_) {
                 RCLCPP_WARN(node_handle_->get_logger(),
                     "[Mapping] No TF %s -> %s after %.1f s; falling back to the YAML "
                     "q_lb/t_lb extrinsic only (identity TF).",
@@ -410,6 +505,15 @@ class MappingBase
     size_t total_published_ = 0;
     size_t total_dropped_old_ = 0;
     size_t total_pending_new_ = 0;
+    // Scans evicted by the buffer cap (pushScanCapped). Atomic: written on
+    // the callback threads, read by the worker's 2 s summary.
+    std::atomic<uint64_t> total_cap_dropped_{0};
+    int max_scan_buffer_ = 200;
+    // Batch publish (map/publish_min_interval_ms, 0 = publish every scan).
+    // Worker-thread only.
+    int publish_min_interval_ms_ = 0;
+    rclcpp::Time last_batch_publish_{0, 0, RCL_ROS_TIME};
+    typename pcl::PointCloud<PointType>::Ptr pc_pending_;
     // Last gate-held front t_end — dedupes pending_new across worker cycles.
     int64_t last_gated_t_end_ns_ = 0;
     typename pcl::PointCloud<PointType>::Ptr pc_last;
@@ -435,8 +539,8 @@ class MappingBase
     // false = dataset/upstream mode, no TF consulted, YAML q_lb/t_lb only.
     bool tf_extrinsics_ = true;
     double tf_wait_timeout_ = 10.0;
-    std::chrono::steady_clock::time_point tf_first_attempt_{};
-    bool tf_first_attempt_set_ = false;
+    // NODE-CLOCK wait window (2026-07-08 clock-domain audit).
+    resple::timeutil::RosTimeWait tf_wait_;
     // Per-scan cache for the max-point-time scan end (finding #16).
     std::uint64_t t_end_cache_stamp_ = 0;
     int64_t t_end_cache_ = 0;
@@ -500,12 +604,7 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(ouster_msg_in->header.stamp).nanoseconds() - time_offset;
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -569,12 +668,7 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = stamp_ns - time_offset;
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -635,12 +729,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -699,12 +788,7 @@ public:
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -763,12 +847,7 @@ public:
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -830,12 +909,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(hesai_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -895,12 +969,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
         pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            // Cap cloud buffer to prevent OOM on processing stalls
-            while (this->pc_L_buff.size() >= 200) { this->pc_L_buff.pop_front(); }
-            this->pc_L_buff.push_back(*pc_last_ds);
-        }
+        this->pushScanCapped(*pc_last_ds);
         });
     }
 
@@ -945,6 +1014,29 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
 
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/publish_tf", true);
         invert_tf  = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "map/invert_tf", false);
+
+        // TF ownership guard (2026-07-07): same scheme as the RESPLE node
+        // (see utils/tf_ownership.h), watching the map->odom pair this node
+        // broadcasts. Shared param names — one knob configures both nodes.
+        tf_conflict_action_ = CommonUtils::readParam<std::string>(
+            this->get_node_parameters_interface(), "tf_conflict_action", std::string("warn"));
+        if (tf_conflict_action_ != "warn" && tf_conflict_action_ != "yield") {
+            RCLCPP_WARN(this->get_logger(),
+                "[Mapping] tf_conflict_action='%s' unknown (warn|yield); using 'warn'",
+                tf_conflict_action_.c_str());
+            tf_conflict_action_ = "warn";
+        }
+        tf_conflict_quiet_ns_ = static_cast<int64_t>(1e9 * CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "tf_conflict_quiet_sec", 5.0));
+        tf_absent_warn_sec_ = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "tf_absent_warn_sec", 10.0);
+        if (invert_tf) {
+            tf_own_monitor_.configure(odom_id, map_id);
+        } else {
+            tf_own_monitor_.configure(map_id, odom_id);
+        }
+        tf_absence_warned_.store(false, std::memory_order_relaxed);
+        tf_yield_active_.store(false, std::memory_order_relaxed);
         // amcl-style future-dating for the map->odom TF (seconds added to the
         // stamp). The transform is stamped at the (lagged) path tip, so exact-
         // time lookups in the map frame at fresh sensor stamps fail with
@@ -1011,8 +1103,17 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         auto large_reliable_qos = rclcpp::QoS(10000).reliable();
         sub_start = this->create_subscription<std_msgs::msg::Int64>("start_time", start_qos,
             std::bind(&Mapping::startCallBack, this, std::placeholders::_1));
-        sub_est = this->create_subscription<estimate_msgs::msg::Estimate>("est_window", large_reliable_qos, 
+        sub_est = this->create_subscription<estimate_msgs::msg::Estimate>("est_window", large_reliable_qos,
             std::bind(&Mapping::getEstCallback, this, std::placeholders::_1));
+        // TF ownership guard: raw /tf + /tf_static watchers (mirror of the
+        // RESPLE node's; see tfWatchCallback there for the rationale).
+        sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+            "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
+            std::bind(&Mapping::tfWatchCallback, this, std::placeholders::_1));
+        sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+            "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
+            std::bind(&Mapping::tfWatchCallback, this, std::placeholders::_1));
+        tf_absence_wait_.reset();  // window (re)starts at first valid clock sample
         
         // Start processing thread (exited-flag store last, for the bounded
         // join's join-vs-detach decision — see joinProcessingThreadBounded).
@@ -1043,6 +1144,8 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         // Reset subscriptions
         sub_start.reset();
         sub_est.reset();
+        sub_tf_watch_.reset();
+        sub_tf_static_watch_.reset();
 
         // Clear init flag so a re-activation starts in the unitialized state.
         // Worker is joined; safe to write without ordering concerns. Also drop
@@ -1198,6 +1301,25 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 path_t_ns_ = 0;
                 opt_old_path.poses.clear();
             }
+            // TF ownership absence check (one-shot, mirror of the RESPLE
+            // node's): map/publish_tf=false means an external localizer is
+            // expected to own map->odom — WARN if nobody has published it.
+            if (!publish_tf && tf_absent_warn_sec_ > 0 &&
+                !tf_absence_warned_.load(std::memory_order_relaxed) &&
+                !tf_own_monitor_.pairSeen()) {
+                const double waited = tf_absence_wait_.elapsedSec(
+                    this->now().nanoseconds());
+                if (waited > tf_absent_warn_sec_) {
+                    tf_absence_warned_.store(true, std::memory_order_relaxed);
+                    RCLCPP_WARN(this->get_logger(),
+                        "[Mapping] map/publish_tf=false but NO ONE has published "
+                        "%s->%s in %.0f s. The external owner (global localizer?) "
+                        "is not wired up - the map frame is dangling. Either start "
+                        "it or set map/publish_tf: true.",
+                        tf_own_monitor_.parent().c_str(),
+                        tf_own_monitor_.child().c_str(), waited);
+                }
+            }
             // Acquire-load on if_init_succeed pairs with startCallBack's
             // release-store so the staged start_pending_ / start_bag_time_pending_
             // are visible. Under Option B all spline_active_ mutation (init above
@@ -1207,6 +1329,10 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             // Throttle the publish block to the old ~20 Hz cadence: knots now
             // land at est rate (~100 Hz) since the queue drain, and each
             // publishPath ships the entire accumulated Path message.
+            // DELIBERATELY wall clock (2026-07-08 clock-domain audit): this
+            // paces real publish I/O to protect the CPU, is jump-proof, and
+            // publishPath ships the full accumulated path each time — content
+            // is rate-independent even though the cadence is wall-time.
             const auto now_steady = std::chrono::steady_clock::now();
             if (if_init_succeed.load(std::memory_order_acquire) && spline_active_.totalKnots() > num_knot
                 && now_steady - last_pub_block_ >= std::chrono::milliseconds(50)) {
@@ -1310,6 +1436,56 @@ private:
     bool publish_tf, invert_tf;
     // map->odom TF future-dating in seconds (map/transform_tolerance, 0 = off).
     double map_tf_tolerance_ = 0.0;
+    // TF ownership guard (2026-07-07): mirror of the RESPLE node's, watching
+    // the (post-inversion) map->odom pair this node broadcasts. Both the
+    // dynamic transform and the static identity latch are whitelisted by
+    // stamp (notePublished / notePublishedStatic). Shared param names with
+    // RESPLE (tf_conflict_action / tf_conflict_quiet_sec / tf_absent_warn_sec)
+    // — both nodes read the same YAML.
+    resple::tfown::TfOwnershipMonitor tf_own_monitor_;
+    std::string tf_conflict_action_ = "warn";
+    int64_t tf_conflict_quiet_ns_ = 5000000000LL;
+    double tf_absent_warn_sec_ = 10.0;
+    rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_watch_;
+    rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_static_watch_;
+    std::atomic<bool> tf_absence_warned_{false};
+    std::atomic<bool> tf_yield_active_{false};
+    // NODE-CLOCK absence window + freshness 'now' (2026-07-08 clock-domain
+    // audit) — mirror of the RESPLE node's; see the comments there.
+    resple::timeutil::RosTimeWait tf_absence_wait_;
+
+    void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg)
+    {
+        const int64_t now_ns = this->now().nanoseconds();
+        for (const auto& ts : msg->transforms) {
+            const int64_t stamp_ns = rclcpp::Time(ts.header.stamp).nanoseconds();
+            const auto v = tf_own_monitor_.classify(
+                ts.header.frame_id, ts.child_frame_id, stamp_ns, now_ns);
+            if (!publish_tf) continue;  // demoted: foreign owner is EXPECTED
+            if (v == resple::tfown::Verdict::FOREIGN_SAME_PAIR) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[Mapping] TF ownership conflict: another publisher is broadcasting "
+                    "%s->%s (%lu foreign transforms so far). Two publishers on one TF "
+                    "pair make the map frame flicker. Either set map/publish_tf: false "
+                    "here (a global localizer owns the map frame) or disable the other "
+                    "publisher.%s",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str(),
+                    static_cast<unsigned long>(tf_own_monitor_.foreignSamePair()),
+                    tf_conflict_action_ == "yield"
+                        ? " tf_conflict_action=yield: suspending our broadcast while "
+                          "the other publisher is active." : "");
+            } else if (v == resple::tfown::Verdict::FOREIGN_OTHER_PARENT) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[Mapping] TF tree conflict: frame '%s' is also claimed by parent "
+                    "'%s' while we publish %s->%s (%lu so far). A TF child has exactly "
+                    "one parent - fix the other publisher or our frame configuration.",
+                    tf_own_monitor_.child().c_str(), ts.header.frame_id.c_str(),
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str(),
+                    static_cast<unsigned long>(tf_own_monitor_.foreignOtherParent()));
+            }
+        }
+    }
+
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     // cuda-perf-nano addition: latch identity map→odom on first
     // startCallBack so the REP-105 chain is closed during the cold-start
@@ -1502,10 +1678,23 @@ private:
 
         pub_odom->publish(odom_msg);      
         
-        // Publish map transforms        
+        // Publish map transforms
         if(publish_tf)
         {
-            // Calculate desired frame to map transform            
+            // TF ownership guard 'yield': suspend our map->odom broadcast
+            // while a foreign publisher on the pair was seen within the quiet
+            // window (mirror of the RESPLE node's odom TF yield).
+            const bool yield_now = tf_conflict_action_ == "yield"
+                && tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_);
+            tf_yield_active_.store(yield_now, std::memory_order_relaxed);
+            if (yield_now) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[Mapping] yielding the %s->%s TF to a foreign publisher "
+                    "(tf_conflict_action=yield); odometry/path topics continue.",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str());
+                return;
+            }
+            // Calculate desired frame to map transform
             geometry_msgs::msg::TransformStamped baselink_to_map;
             baselink_to_map.header.stamp = odom_msg.header.stamp;
             baselink_to_map.header.frame_id = map_id;
@@ -1581,6 +1770,10 @@ private:
                     odom_to_map.header.frame_id = map_id;
                     odom_to_map.child_frame_id  = odom_id;
                 }
+                // Record the exact wire stamp BEFORE sending so the DDS
+                // loopback of our own message can never race the ring insert.
+                tf_own_monitor_.notePublished(
+                    rclcpp::Time(odom_to_map.header.stamp).nanoseconds());
                 br->sendTransform(odom_to_map);
             }
         }
@@ -1616,18 +1809,36 @@ private:
         // during the cold-start window before pubOdom() gets its first
         // valid odom→base_link lookup. tf_static is transient_local, so
         // late-joining listeners still receive it.
-        if (publish_tf && static_br_ && !static_map_odom_sent_.exchange(true)) {
-            geometry_msgs::msg::TransformStamped identity;
-            identity.header.stamp = this->get_clock()->now();
-            if (invert_tf) {
-                identity.header.frame_id = odom_id;
-                identity.child_frame_id  = map_id;
-            } else {
-                identity.header.frame_id = map_id;
-                identity.child_frame_id  = odom_id;
+        if (publish_tf && static_br_) {
+            // TF ownership guard 'yield': a foreign map->odom owner active at
+            // start means our identity latch would inject a conflicting
+            // transform onto /tf_static (transient_local — it would linger).
+            // Skip WITHOUT consuming the one-shot, so a later, quiet (re)start
+            // can still latch.
+            if (tf_conflict_action_ == "yield" &&
+                tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_)) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[Mapping] skipping the identity %s->%s static latch: a foreign "
+                    "publisher owns the pair (tf_conflict_action=yield).",
+                    tf_own_monitor_.parent().c_str(), tf_own_monitor_.child().c_str());
+            } else if (!static_map_odom_sent_.exchange(true)) {
+                geometry_msgs::msg::TransformStamped identity;
+                identity.header.stamp = this->get_clock()->now();
+                if (invert_tf) {
+                    identity.header.frame_id = odom_id;
+                    identity.child_frame_id  = map_id;
+                } else {
+                    identity.header.frame_id = map_id;
+                    identity.child_frame_id  = odom_id;
+                }
+                identity.transform.rotation.w = 1.0;
+                // Static whitelist entry: /tf_static is transient_local, so
+                // this exact stamp can be re-delivered arbitrarily late — it
+                // must never age out of the self-stamp ring (tf_ownership.h).
+                tf_own_monitor_.notePublishedStatic(
+                    rclcpp::Time(identity.header.stamp).nanoseconds());
+                static_br_->sendTransform(identity);
             }
-            identity.transform.rotation.w = 1.0;
-            static_br_->sendTransform(identity);
         }
     }
 
@@ -1822,8 +2033,19 @@ int mappingMain(int argc, char** argv) {
         }
     }
     RCLCPP_INFO(node->get_logger(), "Mapping active - entering executor spin");
-    
-    rclcpp::executors::MultiThreadedExecutor exec;
+
+    // Overload hardening (2026-07-07): mirror of the RESPLE node's
+    // executor_threads. 0 (default) = rclcpp's one-thread-per-core.
+    const int executor_threads = CommonUtils::readParam<int>(
+        node->get_node_parameters_interface(), "executor_threads", 0);
+    if (executor_threads > 0) {
+        RCLCPP_INFO(node->get_logger(),
+            "MultiThreadedExecutor limited to %d threads (executor_threads)",
+            executor_threads);
+    }
+    rclcpp::executors::MultiThreadedExecutor exec(
+        rclcpp::ExecutorOptions(),
+        static_cast<size_t>(std::max(0, executor_threads)));
     exec.add_node(node->get_node_base_interface());
     exec.add_node(temp_nh);
     exec.spin();

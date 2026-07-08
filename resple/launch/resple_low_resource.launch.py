@@ -8,32 +8,39 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
 
-
+# LOW-RESOURCE profile (2026-07-07 overload hardening): for machines with few
+# cores shared with other software, where the default profile lags and the
+# odometry "jumps". Pairs with config_low_resource.yaml — see that file's
+# header and doc/PARAMETERS.md "Resource-limited machines" for the
+# symptom -> metric -> knob map.
+#
+# The config disables publish_est_window (Mapping's sole input), so
+# use_mapping stays false here by default. If you enable Mapping, ALSO set
+# publish_est_window: true in the config.
+#
+# Extrinsics follow the production convention: the identity lidar_tf below is
+# a PLACEHOLDER — replace it with your rig's real base_link->os_sensor pose
+# (leave the config's q_lb/t_lb identity), or delete the TF node and run with
+# tf_extrinsics: false + calibrated q_lb/t_lb in the config. Never both.
 def generate_launch_description():
-    # Optional delay (seconds) before launching RESPLE / Mapping. Lets you
-    # wait for /clock under sim time, sensor drivers, or TF publishers to
-    # come up before the estimator starts consuming data.
     start_delay_arg = DeclareLaunchArgument(
         'start_delay', default_value='0.0',
         description='Seconds to wait before launching RESPLE.')
     mapping_delay_arg = DeclareLaunchArgument(
         'mapping_delay', default_value=LaunchConfiguration('start_delay'),
         description='Seconds to wait before launching Mapping (defaults to start_delay).')
-    # The Mapping node is visualization-only: it consumes RESPLE's est_window
-    # and rebuilds a global cloud for rviz/Foxglove. The odometry path
-    # (/odom, /current_scan, odom->base_link TF) lives entirely in the RESPLE
-    # node and is bit-identical without it — see doc/MAPPING_NODE.md.
     use_mapping_arg = DeclareLaunchArgument(
         'use_mapping', default_value='false',
-        description='Start the Mapping node (global map visualization + '
-                    'map->odom TF). Not needed for odometry.')
+        description='Start the Mapping node. The low-resource config disables '
+                    'publish_est_window; set it true in the config before '
+                    'enabling this or the map will never build.')
     _start_delay = PythonExpression(['float(', LaunchConfiguration('start_delay'), ')'])
     _mapping_delay = PythonExpression(['float(', LaunchConfiguration('mapping_delay'), ')'])
 
     config_file_arg = DeclareLaunchArgument(
         'config_file',
         default_value=os.path.join(
-            get_package_share_directory('resple'), 'config', 'config_ouster.yaml'),
+            get_package_share_directory('resple'), 'config', 'config_low_resource.yaml'),
         description='Parameter YAML for both nodes — pass a copied/adapted '
                     'config without editing the installed one.')
     config_yaml_fusion = LaunchConfiguration('config_file')
@@ -46,12 +53,19 @@ def generate_launch_description():
         start_delay_arg,
         mapping_delay_arg,
         use_mapping_arg,
-        # Make the silent default obvious: without Mapping there is no
-        # /global_map and no map->odom TF (doc/MAPPING_NODE.md).
         LogInfo(
             condition=UnlessCondition(LaunchConfiguration('use_mapping')),
             msg='Mapping node disabled (use_mapping:=false): no /global_map or '
-                'map->odom TF will be published. Pass use_mapping:=true to enable.'),
+                'map->odom TF will be published. The low-resource config also '
+                'disables publish_est_window — re-enable it in the config if '
+                'you turn Mapping on.'),
+        LogInfo(
+            condition=IfCondition(LaunchConfiguration('use_mapping')),
+            msg='use_mapping:=true with the low-resource config: make sure '
+                'publish_est_window: true is set in the config, or Mapping '
+                'will receive no spline input and never build the map.'),
+        # PLACEHOLDER identity extrinsic — replace with the rig's real
+        # base_link->os_sensor pose (see file header).
         # If a URDF / robot_state_publisher already provides the sensor
         # mounting (integrated stacks), DELETE this node: two static
         # publishers on one TF pair latch nondeterministically (last writer
@@ -92,4 +106,4 @@ def generate_launch_description():
                 parameters=[config_yaml_fusion],
                 arguments=['--ros-args', '--log-level', 'info'])
             ])
-    ])
+  ])

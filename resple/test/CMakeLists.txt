@@ -41,6 +41,9 @@ set(RESPLE_TEST_SOURCES
   test_geometry_core.cpp
   test_point_cloud_adapter.cpp
   test_filter_health.cpp
+  test_overload_control.cpp
+  test_tf_ownership.cpp
+  test_sim_time_wait.cpp
   test_spline_state.cpp
 )
 
