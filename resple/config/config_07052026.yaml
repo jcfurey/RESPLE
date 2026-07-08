@@ -26,16 +26,20 @@
 #                   base_link_correction->base_link, plus 3x lucid_camera_N
 #                   chains — unrelated to the LiDAR/IMU chain used here.
 #
-# IMPORTANT — frame_id is NOT "base_link" here (unlike config_06042026.yaml):
-# the bag's own /tf_static ALREADY parents base_link under
-# base_link_correction (a foreign rig frame). If RESPLE also claims
-# "base_link" as its odom/frame_id child, that's two different parents for
-# the same TF child frame (base_link_correction->base_link, statically, vs
-# odom->base_link, from RESPLE) — tf2 rejects the loser as "TF_OLD_DATA" and
-# the tree is broken (RESPLE.cpp CLAUDE.md hazard #70). Use a RESPLE-owned
-# frame name instead (resple_base_link) that doesn't already exist in the
-# bag's tree; the launch's static_transform_publisher publishes
-# resple_base_link->os_sensor to match.
+# IMPORTANT — none of RESPLE's own frame names reuse the bag's names (unlike
+# config_06042026.yaml, which had no such collision): the bag's own
+# /tf_static ALREADY defines its own "map"/"odom"/"base_link" as part of the
+# rig's foreign nav tree (map->odom statically, and base_link_correction->
+# base_link statically). If RESPLE/Mapping ALSO claim those same names —
+# odom->base_link (RESPLE) and map->odom (Mapping) — that's two different
+# parents/publishers for the same TF child frame: tf2 rejects the loser as
+# "TF_OLD_DATA" on base_link, and Mapping's own TF-ownership guard fires
+# "TF ownership conflict" on map->odom (both confirmed live before this fix;
+# see RESPLE.cpp CLAUDE.md hazard #70). Every frame RESPLE/Mapping publish
+# here is prefixed resple_ instead (resple_base_link / resple_odom /
+# resple_map) so this dataset's tree is entirely disjoint from the bag's;
+# the launch's static_transform_publisher publishes resple_base_link->os_sensor
+# to match.
 #
 # EXTRINSICS COME FROM TF, NOT q_lb/t_lb — see config_06042026.yaml's header
 # for the full rationale (unchanged here). The launch publishes
@@ -48,12 +52,13 @@
 #   * q_lb/t_lb are left identity here on purpose.
 /**:
   ros__parameters:
-    # Frame IDs for TF tree
-    odom/frame_id: odom              # Odom (odometry frame_id) frame
-    map/frame_id: map                # Map frame (Mapping node publications)
+    # Frame IDs for TF tree — all resple_-prefixed; see header (bag has its
+    # own foreign map/odom/base_link already).
+    odom/frame_id: resple_odom       # Odom (odometry frame_id) frame
+    map/frame_id: resple_map         # Map frame (Mapping node publications)
     frame_id: resple_base_link       # Robot (odometry child_frame_id) frame;
                                      # spline body frame (sensors TF'd into
-                                     # this). NOT "base_link" — see header.
+                                     # this).
 
     odom/publish_tf: True            # RESPLE broadcasts the odom->base_link TF
     odom/invert_tf: False             # invert the odom->base_link broadcast direction
