@@ -309,6 +309,39 @@ per-LiDAR (a lagging-clock lidar is judged only against itself); after a
 shed, the existing fast-forward + admission gate drop other lidars' stale
 points — that is the chosen policy, not a bug.
 
+### Clock domains — bag replay at throttled speeds
+
+Both nodes keep three time domains strictly separated (2026-07-08 audit), so
+**replay behaviour is invariant to `ros2 bag play --rate`** as long as you
+play with `--clock` and run the nodes with `use_sim_time:=true`:
+
+- **Data time** (message stamps): everything the estimator computes — spline
+  knots, deskew, IEKF admission, the `max_latency_ms` shedding decision, the
+  TF-guard self-stamp matching. Never touches any clock.
+- **ROS time** (node clock = sim time on bags): every *wait-for-data*
+  timeout and every data-facing window — `tf_wait_timeout` (both nodes),
+  `lo_imu_wait_timeout`, the init-attitude TF wait, the TF-guard
+  `tf_conflict_quiet_sec` freshness and `tf_absent_warn_sec` absence check,
+  and Mapping's `map/publish_min_interval_ms` batch interval. At
+  `--rate 0.25` a 10 s wait covers 10 s of *bag* time, so slow replay can no
+  longer expire a TF/IMU wait before the bag delivers the data. All of these
+  survive the two sim-time traps: the clock reading 0 before the first
+  `/clock` message (windows start at the first valid sample, not at a bogus
+  epoch delta) and backwards jumps on a bag loop restart (windows re-arm
+  instead of wedging; `utils/sim_time_wait.h`, unit-tested).
+- **Wall time** (monotonic clock): only things that genuinely measure the
+  real machine — per-stage compute timings, `cycle_overruns` (the 50 ms
+  worker budget), the wall denominator of `rt_factor` (its definition), the
+  lifecycle bounded joins, and Mapping's 50 ms publish-I/O pacing (content
+  is unaffected; each publish ships the full accumulated state).
+
+Without `--clock`/`use_sim_time` the node clock is system time, and the ROS
+time domain degrades to the pre-audit wall-clock behaviour — so **always
+replay with `--clock` and `use_sim_time:=true`** when testing at non-1x
+rates. (One known cosmetic residue: `RCLCPP_*_THROTTLE` suppression windows
+use the node clock and may stay quiet briefly after a bag loop restart —
+logging only, no behavioural effect.)
+
 ## Reproducing the original (`main`) behavior for A/B comparison
 
 The Mapping node's map *path* is logic-equivalent to upstream `main` (same

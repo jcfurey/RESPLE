@@ -318,8 +318,16 @@ class MappingBase
         }
         // Interval flush for the batch mode. Runs even on ticks that consumed
         // no scans so a gated/paused stream still drains the pending batch.
+        // Node clock: with use_sim_time the interval runs in bag time, so the
+        // batch content per publish is invariant to playback rate.
         if (publish_min_interval_ms_ > 0 && !pc_pending_->points.empty()) {
             const auto now_pub = node_handle_->get_clock()->now();
+            // Sim clock jumped backwards (bag loop restart): the last-publish
+            // stamp is in the future and the flush would wedge until the
+            // clock re-reaches it — re-arm instead.
+            if (now_pub < last_batch_publish_) {
+                last_batch_publish_ = now_pub;
+            }
             if ((now_pub - last_batch_publish_).nanoseconds() >=
                 int64_t(publish_min_interval_ms_) * 1000000LL) {
                 publishMap(pc_pending_, pub_global_map);
@@ -335,6 +343,9 @@ class MappingBase
         // Reading out spline window + buffer state makes it obvious if we're
         // pinned in any of the failure modes (e.g., t_end always > spline_max).
         auto now_clk = node_handle_->get_clock()->now();
+        // Re-arm on a backwards clock jump (bag loop restart) instead of
+        // going silent until the clock re-reaches the stale stamp.
+        if (now_clk < last_processScan_log_) last_processScan_log_ = now_clk;
         if ((now_clk - last_processScan_log_).seconds() >= 2.0) {
             last_processScan_log_ = now_clk;
             int64_t s_min = spl->minTimeNs(), s_max = spl->maxTimeNs();
@@ -405,13 +416,11 @@ class MappingBase
             }
             // Timed fallback (mirrors RESPLE's updateLidarTransform, finding
             // #22): degrade to the YAML-only convention instead of dropping
-            // scans forever when no TF is ever published.
-            const auto now_mono = std::chrono::steady_clock::now();
-            if (!tf_first_attempt_set_) {
-                tf_first_attempt_ = now_mono;
-                tf_first_attempt_set_ = true;
-            } else if (std::chrono::duration<double>(now_mono - tf_first_attempt_).count()
-                           > tf_wait_timeout_) {
+            // scans forever when no TF is ever published. NODE-CLOCK window
+            // (2026-07-08 clock-domain audit): sim-time aware, so throttled
+            // bag replay cannot expire it before the bag publishes the TF.
+            if (tf_wait_.elapsedSec(node_handle_->now().nanoseconds())
+                    > tf_wait_timeout_) {
                 RCLCPP_WARN(node_handle_->get_logger(),
                     "[Mapping] No TF %s -> %s after %.1f s; falling back to the YAML "
                     "q_lb/t_lb extrinsic only (identity TF).",
@@ -530,8 +539,8 @@ class MappingBase
     // false = dataset/upstream mode, no TF consulted, YAML q_lb/t_lb only.
     bool tf_extrinsics_ = true;
     double tf_wait_timeout_ = 10.0;
-    std::chrono::steady_clock::time_point tf_first_attempt_{};
-    bool tf_first_attempt_set_ = false;
+    // NODE-CLOCK wait window (2026-07-08 clock-domain audit).
+    resple::timeutil::RosTimeWait tf_wait_;
     // Per-scan cache for the max-point-time scan end (finding #16).
     std::uint64_t t_end_cache_stamp_ = 0;
     int64_t t_end_cache_ = 0;
@@ -1104,7 +1113,7 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
             "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
             std::bind(&Mapping::tfWatchCallback, this, std::placeholders::_1));
-        tf_watch_start_ = std::chrono::steady_clock::now();
+        tf_absence_wait_.reset();  // window (re)starts at first valid clock sample
         
         // Start processing thread (exited-flag store last, for the bounded
         // join's join-vs-detach decision — see joinProcessingThreadBounded).
@@ -1298,8 +1307,8 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             if (!publish_tf && tf_absent_warn_sec_ > 0 &&
                 !tf_absence_warned_.load(std::memory_order_relaxed) &&
                 !tf_own_monitor_.pairSeen()) {
-                const double waited = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - tf_watch_start_).count();
+                const double waited = tf_absence_wait_.elapsedSec(
+                    this->now().nanoseconds());
                 if (waited > tf_absent_warn_sec_) {
                     tf_absence_warned_.store(true, std::memory_order_relaxed);
                     RCLCPP_WARN(this->get_logger(),
@@ -1320,6 +1329,10 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             // Throttle the publish block to the old ~20 Hz cadence: knots now
             // land at est rate (~100 Hz) since the queue drain, and each
             // publishPath ships the entire accumulated Path message.
+            // DELIBERATELY wall clock (2026-07-08 clock-domain audit): this
+            // paces real publish I/O to protect the CPU, is jump-proof, and
+            // publishPath ships the full accumulated path each time — content
+            // is rate-independent even though the cadence is wall-time.
             const auto now_steady = std::chrono::steady_clock::now();
             if (if_init_succeed.load(std::memory_order_acquire) && spline_active_.totalKnots() > num_knot
                 && now_steady - last_pub_block_ >= std::chrono::milliseconds(50)) {
@@ -1437,16 +1450,13 @@ private:
     rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_static_watch_;
     std::atomic<bool> tf_absence_warned_{false};
     std::atomic<bool> tf_yield_active_{false};
-    std::chrono::steady_clock::time_point tf_watch_start_{};
-
-    static int64_t steadyNowNs() {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-    }
+    // NODE-CLOCK absence window + freshness 'now' (2026-07-08 clock-domain
+    // audit) — mirror of the RESPLE node's; see the comments there.
+    resple::timeutil::RosTimeWait tf_absence_wait_;
 
     void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg)
     {
-        const int64_t now_ns = steadyNowNs();
+        const int64_t now_ns = this->now().nanoseconds();
         for (const auto& ts : msg->transforms) {
             const int64_t stamp_ns = rclcpp::Time(ts.header.stamp).nanoseconds();
             const auto v = tf_own_monitor_.classify(
@@ -1675,7 +1685,7 @@ private:
             // while a foreign publisher on the pair was seen within the quiet
             // window (mirror of the RESPLE node's odom TF yield).
             const bool yield_now = tf_conflict_action_ == "yield"
-                && tf_own_monitor_.foreignActiveWithin(steadyNowNs(), tf_conflict_quiet_ns_);
+                && tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_);
             tf_yield_active_.store(yield_now, std::memory_order_relaxed);
             if (yield_now) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1806,7 +1816,7 @@ private:
             // Skip WITHOUT consuming the one-shot, so a later, quiet (re)start
             // can still latch.
             if (tf_conflict_action_ == "yield" &&
-                tf_own_monitor_.foreignActiveWithin(steadyNowNs(), tf_conflict_quiet_ns_)) {
+                tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_)) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "[Mapping] skipping the identity %s->%s static latch: a foreign "
                     "publisher owns the pair (tf_conflict_action=yield).",

@@ -325,7 +325,7 @@ public:
         sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
             "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
             std::bind(&RESPLE::tfWatchCallback, this, std::placeholders::_1));
-        tf_watch_start_ = std::chrono::steady_clock::now();
+        tf_absence_wait_.reset();  // window (re)starts at first valid clock sample
 
         // Start processing thread. The exited-flag store is the lambda's last
         // action so joinProcessingThreadBounded can tell "worker finished,
@@ -448,8 +448,8 @@ public:
         // TF until the new timeline overtakes the old one (finding #12). The
         // LO IMU-wait and frame-id state must restart with it (findings #9/#10).
         last_pose_pub_time_ns_ = std::numeric_limits<int64_t>::min();
-        lo_imu_wait_started_ = false;
-        init_attitude_wait_started_ = false;
+        lo_imu_wait_.reset();
+        init_attitude_wait_.reset();
         init_attitude_delta_deg_.store(-1.0, std::memory_order_relaxed);
         imu_frame_id_.clear();
         
@@ -599,6 +599,10 @@ public:
                 // Diagnostic only — read-only, no lock-order interactions.
                 {
                     auto now_clk = this->get_clock()->now();
+                    // Node clock can jump backwards (bag loop restart under
+                    // use_sim_time): re-arm instead of going silent until the
+                    // clock re-reaches the stale stamp.
+                    if (now_clk < hb_last_log) hb_last_log = now_clk;
                     if ((now_clk - hb_last_log).seconds() >= 2.0) {
                         hb_last_log = now_clk;
                         size_t pc_buff_total = 0, pt_buff_total = 0;
@@ -649,8 +653,8 @@ public:
                         if (!publish_tf && tf_absent_warn_sec_ > 0 &&
                             !tf_absence_warned_.load(std::memory_order_relaxed) &&
                             !tf_own_monitor_.pairSeen()) {
-                            const double waited = std::chrono::duration<double>(
-                                std::chrono::steady_clock::now() - tf_watch_start_).count();
+                            const double waited = tf_absence_wait_.elapsedSec(
+                                this->now().nanoseconds());
                             if (waited > tf_absent_warn_sec_) {
                                 tf_absence_warned_.store(true, std::memory_order_relaxed);
                                 RCLCPP_WARN(this->get_logger(),
@@ -1362,13 +1366,16 @@ public:
                     dmsg.tf_foreign_same_pair = tf_own_monitor_.foreignSamePair();
                     dmsg.tf_foreign_other_parent = tf_own_monitor_.foreignOtherParent();
                     dmsg.tf_conflict_active = tf_own_monitor_.foreignActiveWithin(
-                        steadyNowNs(), tf_conflict_quiet_ns_);
+                        this->now().nanoseconds(), tf_conflict_quiet_ns_);
                     dmsg.tf_yielding = tf_yield_active_.load(std::memory_order_relaxed);
                     pub_diag_->publish(dmsg);
                 }
 
-                // Update diagnostics at 1 Hz
-                if ((this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) >= 1000000000LL) {
+                // Update diagnostics at 1 Hz. llabs: the node clock can jump
+                // backwards (bag loop restart under use_sim_time) — a plain
+                // difference would silence the tick until the clock re-reaches
+                // the stale stamp.
+                if (std::llabs(this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) >= 1000000000LL) {
                     diagnostics_.force_update();
                     last_process_ns_.store(this->now().nanoseconds(), std::memory_order_relaxed);
                 }
@@ -1550,8 +1557,8 @@ private:
     // initialization() to resolve the mounting rotation for gravity (finding #9).
     std::string imu_frame_id_;
     // LO-without-IMU init timeout state (finding #10; worker thread only).
-    bool lo_imu_wait_started_ = false;
-    std::chrono::steady_clock::time_point lo_imu_wait_start_{};
+    // NODE-CLOCK window (2026-07-08 clock-domain audit).
+    resple::timeutil::RosTimeWait lo_imu_wait_;
     double lo_imu_wait_timeout_ = 10.0;
 
     // Initial-attitude source (Design B). "gravity" (default) = accelerometer
@@ -1570,9 +1577,8 @@ private:
     double init_attitude_consistency_deg_ = 3.0;
     // TF-wait deadline for the attitude lookup (mirrors the LO-IMU wait): after
     // this, a tf-mode init that has neither TF nor a gravity window proceeds
-    // with identity rather than blocking forever.
-    bool init_attitude_wait_started_ = false;
-    std::chrono::steady_clock::time_point init_attitude_wait_start_{};
+    // with identity rather than blocking forever. NODE-CLOCK window.
+    resple::timeutil::RosTimeWait init_attitude_wait_;
     // Last TF-vs-gravity roll/pitch disagreement (deg) from tf_gravity_check;
     // -1 = not computed. Read by the diagnostics thread.
     std::atomic<double> init_attitude_delta_deg_{-1.0};
@@ -1601,19 +1607,19 @@ private:
     rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_static_watch_;
     std::atomic<bool> tf_absence_warned_{false};
     std::atomic<bool> tf_yield_active_{false};  // diagnostics: yield currently holding our TF
-    std::chrono::steady_clock::time_point tf_watch_start_{};  // set in on_activate
-
-    static int64_t steadyNowNs() {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-    }
+    // Absence-check window in NODE-CLOCK time (2026-07-08 clock-domain audit):
+    // sim-time aware, survives the pre-/clock zero reading and loop restarts.
+    // Written from on_activate/heartbeat (worker) via elapsedSec; the guard's
+    // freshness 'now' likewise comes from the node clock so yield/resume is
+    // invariant to bag playback rate.
+    resple::timeutil::RosTimeWait tf_absence_wait_;
 
     // Raw /tf + /tf_static watcher (default callback group; O(frames) string
     // compares per message, no allocation). Runs on the executor; the monitor
     // synchronizes internally against the worker's notePublished.
     void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg)
     {
-        const int64_t now_ns = steadyNowNs();
+        const int64_t now_ns = this->now().nanoseconds();
         for (const auto& ts : msg->transforms) {
             const int64_t stamp_ns = rclcpp::Time(ts.header.stamp).nanoseconds();
             const auto v = tf_own_monitor_.classify(
@@ -2498,7 +2504,7 @@ private:
     // gravity-aligned reference frame (Design B). Returns the rotation
     // R_{init_attitude_frame <- frame_id} at the latest available time. No
     // internal blocking — initialization() retries each cycle and bounds the
-    // wait via init_attitude_wait_start_. Time(0) (latest) is used for the
+    // wait via init_attitude_wait_. Time(0) (latest) is used for the
     // same reason updateImuTransform/updateLidarTransform do: exact for a
     // static mount, close enough for a slowly-varying source at init.
     bool lookupInitAttitude(Eigen::Quaterniond& q_wb_out)
@@ -2652,13 +2658,12 @@ private:
         }
         // TF not available yet: wait up to tf_wait_timeout_ seconds (measured
         // from this lidar's first attempt), then fall back to the YAML-only
-        // convention instead of dropping scans forever.
-        const auto now_mono = std::chrono::steady_clock::now();
-        if (!lidar.tf_first_attempt_set) {
-            lidar.tf_first_attempt = now_mono;
-            lidar.tf_first_attempt_set = true;
-        } else if (std::chrono::duration<double>(now_mono - lidar.tf_first_attempt).count()
-                       > tf_wait_timeout_) {
+        // convention instead of dropping scans forever. NODE-CLOCK time
+        // (2026-07-08 clock-domain audit): with use_sim_time this window runs
+        // in bag time, so throttled replay cannot expire it before the bag
+        // publishes the TF; RosTimeWait also survives the pre-/clock zero
+        // reading and bag-loop restarts.
+        if (lidar.tf_wait.elapsedSec(this->now().nanoseconds()) > tf_wait_timeout_) {
             RCLCPP_WARN(this->get_logger(),
                 "[RESPLE] No TF %s -> %s after %.1f s; falling back to the YAML "
                 "q_lb/t_lb extrinsic only (upstream convention). Publish the TF or "
@@ -3008,7 +3013,7 @@ private:
             const uint64_t tf_same = tf_own_monitor_.foreignSamePair();
             const uint64_t tf_parent = tf_own_monitor_.foreignOtherParent();
             const bool tf_active = tf_own_monitor_.foreignActiveWithin(
-                steadyNowNs(), tf_conflict_quiet_ns_);
+                this->now().nanoseconds(), tf_conflict_quiet_ns_);
             const bool tf_yielding = tf_yield_active_.load(std::memory_order_relaxed);
             stat.add("TF Foreign Publishes Same Pair (cumulative)", static_cast<int>(tf_same));
             stat.add("TF Foreign Parent Claims (cumulative)", static_cast<int>(tf_parent));
@@ -3658,7 +3663,7 @@ private:
             // interleaved publishers make the pose flicker. Resumes
             // automatically once the intruder goes quiet.
             const bool yield_now = tf_conflict_action_ == "yield"
-                && tf_own_monitor_.foreignActiveWithin(steadyNowNs(), tf_conflict_quiet_ns_);
+                && tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_);
             tf_yield_active_.store(yield_now, std::memory_order_relaxed);
             if (yield_now) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -3802,12 +3807,11 @@ private:
             if (if_lidar_only) {
                 std::lock_guard<std::mutex> lk(m_buff);
                 if (static_cast<int>(imu_buff.size()) < imu_init_num_samples_) {
-                    const auto now_mono = std::chrono::steady_clock::now();
-                    if (!lo_imu_wait_started_) {
-                        lo_imu_wait_start_ = now_mono;
-                        lo_imu_wait_started_ = true;
-                    } else if (std::chrono::duration<double>(now_mono - lo_imu_wait_start_).count()
-                                   > lo_imu_wait_timeout_) {
+                    // NODE-CLOCK wait (2026-07-08 clock-domain audit): sim-time
+                    // aware so throttled replay can't expire it before the bag
+                    // delivers the IMU samples.
+                    if (lo_imu_wait_.elapsedSec(this->now().nanoseconds())
+                            > lo_imu_wait_timeout_) {
                         use_imu_gravity = false;
                         RCLCPP_WARN(this->get_logger(),
                             "[RESPLE] LO mode: insufficient IMU after %.1f s — initializing "
@@ -3977,12 +3981,9 @@ private:
                 // a bounded chance (tf_wait_timeout) before falling to identity,
                 // so a slow static-TF publisher doesn't init the map tilted.
                 if (tf_mode) {
-                    const auto now_mono = std::chrono::steady_clock::now();
-                    if (!init_attitude_wait_started_) {
-                        init_attitude_wait_start_ = now_mono;
-                        init_attitude_wait_started_ = true;
-                    }
-                    if (std::chrono::duration<double>(now_mono - init_attitude_wait_start_).count()
+                    // NODE-CLOCK wait (2026-07-08 clock-domain audit; see
+                    // lo_imu_wait_ above for the rationale).
+                    if (init_attitude_wait_.elapsedSec(this->now().nanoseconds())
                             <= tf_wait_timeout_) {
                         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                             "[RESPLE] waiting for init attitude: TF '%s' -> '%s' (no clean gravity "

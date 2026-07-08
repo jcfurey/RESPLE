@@ -103,6 +103,20 @@ TEST(TfOwnership, FreshnessWindowExpires) {
   EXPECT_FALSE(quiet.foreignActiveWithin(0, INT64_MAX / 2));
 }
 
+TEST(TfOwnership, FreshnessSurvivesClockJumps) {
+  // now comes from the node clock (sim time on bags), which can step
+  // backwards on a bag loop restart. A small backwards step stays
+  // conservatively active; a large jump releases instead of wedging.
+  TfOwnershipMonitor m;
+  m.configure("odom", "base_footprint");
+  m.classify("odom", "base_footprint", 1 * S, /*now=*/100 * S);
+  EXPECT_TRUE(m.foreignActiveWithin(98 * S, 5 * S));   // -2 s: still active
+  EXPECT_FALSE(m.foreignActiveWithin(10 * S, 5 * S));  // loop restart: release
+  // Re-observation in the new time base re-arms normally.
+  m.classify("odom", "base_footprint", 2 * S, /*now=*/11 * S);
+  EXPECT_TRUE(m.foreignActiveWithin(12 * S, 5 * S));
+}
+
 TEST(TfOwnership, PairSeenDrivesAbsenceCheck) {
   TfOwnershipMonitor m;
   m.configure("odom", "base_footprint");

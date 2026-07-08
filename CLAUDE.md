@@ -457,6 +457,17 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `tf_conflict_action` | TF ownership guard, both nodes: `warn` (throttled ERROR + diagnostics) or `yield` (suspend own TF while a foreign publisher on the pair is active; topics keep flowing) | `warn` |
 | `tf_conflict_quiet_sec` / `tf_absent_warn_sec` | yield-resume quiet window / one-shot WARN when `publish_tf=false` but nobody publishes the pair (0 = off) | `5.0` / `10.0` |
 
+**Clock domains (2026-07-08 audit):** all *wait-for-data* timeouts and
+data-facing windows (`tf_wait_timeout`, `lo_imu_wait_timeout`, init-attitude
+wait, TF-guard freshness/absence, Mapping batch interval) run on the NODE
+clock via `utils/sim_time_wait.h` (`RosTimeWait`: starts at the first nonzero
+clock sample, re-arms on backwards jumps) — bag replay at throttled rates
+with `--clock` + `use_sim_time` cannot expire them early. Wall/monotonic time
+is reserved for real-machine measurements (stage timings, `cycle_overruns`,
+`rt_factor`'s wall denominator, bounded joins, Mapping's publish pacing) —
+when adding a timeout, pick the domain deliberately and comment it; see
+PARAMETERS.md "Clock domains".
+
 `num_threads` is clamped at runtime to `max(1, hardware_concurrency − 2)`
 with a WARN (both nodes) — the shipped configs assume a big machine. The one
 deliberate default-behaviour change of the overload-hardening series.

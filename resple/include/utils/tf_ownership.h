@@ -122,9 +122,20 @@ class TfOwnershipMonitor {
   // True while a foreign observation happened within the trailing window —
   // drives the 'yield' action (suspend own broadcast until the intruder goes
   // quiet) and the diagnostics "conflict active" flag.
+  //
+  // now_ns comes from the NODE clock (2026-07-08 clock-domain audit): with
+  // use_sim_time the quiet window is measured in bag time, so yield/resume
+  // behaviour is invariant to playback rate. Jump tolerance: the clock can
+  // step backwards (bag loop restart, seeked replay, NTP live), leaving
+  // last_foreign in the future. |dt| <= window keeps a small backwards step
+  // conservatively "active", while a large jump (loop restart) releases the
+  // hold instead of wedging until the clock re-reaches the stale stamp; the
+  // next foreign observation re-arms it in the new time base anyway.
   bool foreignActiveWithin(int64_t now_ns, int64_t window_ns) const {
     std::lock_guard<std::mutex> lk(m_);
-    return last_foreign_ns_ != kNever && now_ns - last_foreign_ns_ <= window_ns;
+    if (last_foreign_ns_ == kNever) return false;
+    const int64_t dt = now_ns - last_foreign_ns_;
+    return dt <= window_ns && dt >= -window_ns;
   }
 
   // True once the watched pair has been observed at all (self or foreign).

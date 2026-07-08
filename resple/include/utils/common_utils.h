@@ -21,6 +21,7 @@
 
 #include "utils/eigen_utils.hpp"
 #include "utils/geometry_core.h"
+#include "utils/sim_time_wait.h"
 
 // NOTE: NUM_OF_THREAD and NUM_MATCH_POINTS are now ROS parameters in RESPLE node
 // They were previously global variables but are now configurable per-node instance
@@ -304,8 +305,10 @@ struct LidarConfig {
     Eigen::Affine3d lidar_to_baselink = Eigen::Affine3d::Identity();
     bool tf_latched = false;       // TF found and cached for THIS lidar's frame
     bool extrinsic_ready = false;  // scans may be processed (TF latched, YAML-only mode, or timed fallback)
-    std::chrono::steady_clock::time_point tf_first_attempt{};
-    bool tf_first_attempt_set = false;
+    // tf_wait_timeout window in NODE-CLOCK time (2026-07-08 clock-domain
+    // audit): sim-time-aware, so throttled bag replay cannot expire the wait
+    // before the bag publishes the TF. Fed now().nanoseconds() by the caller.
+    resple::timeutil::RosTimeWait tf_wait;
 
     LidarConfig() = default;
 
