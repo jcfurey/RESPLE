@@ -2041,8 +2041,18 @@ private:
         // Dense publish floor (0 = off — the pre-feature behaviour: one pose
         // per knot in steady state, holes when the edge jumps several knots).
         // See publishPoseAndTf / utils/dense_pub.h.
-        // Clamped to <= 1 kHz: the TF-guard self-stamp ring (256 slots) needs
-        // publish-rate x DDS-loopback-latency well under its capacity.
+        // Clamped to <= 1 kHz. The binding constraint is the worst-case
+        // back-fill BURST vs the TF-guard self-stamp ring, not the steady
+        // rate: one publishPoseAndTf call can emit up to
+        // 1 kHz x kDensePubMaxBackfillNs = ~1001 stamps before the executor
+        // drains a single DDS loopback echo, and every one must still be in
+        // the ring when its echo classifies or the node flags ITSELF as a
+        // foreign publisher (ERROR spam in 'warn'; a self-inflicted TF hole
+        // in 'yield'). kRingSlots = 1024 covers it; the static_assert in
+        // test_tf_ownership.cpp pins the invariant.
+        static_assert(1001 <= static_cast<int64_t>(
+                          resple::tfown::TfOwnershipMonitor::kRingSlots),
+                      "dense back-fill worst burst must fit the TF-guard ring");
         const double dense_pub_hz = CommonUtils::readParam<double>(
             this->get_node_parameters_interface(), "odom/dense_pub_hz", 0.0);
         dense_pub_interval_ns_ = dense_pub_hz > 0.0
@@ -3708,26 +3718,12 @@ private:
         // stamps belong to it. The NIS 'hold' gate is upstream at the call
         // site, so a held window is never back-filled densely either (the
         // cap bounds the burst at release).
-        for (int64_t t_ns = resple::densepub::firstDenseSampleNs(
-                 last_pose_pub_time_ns_, pose_time_ns, dense_pub_interval_ns_,
-                 kDensePubMaxBackfillNs);
-             t_ns < pose_time_ns; t_ns += dense_pub_interval_ns_) {
-            publishPoseAtNs(t_ns);
-        }
-        publishPoseAtNs(pose_time_ns);
-        last_pose_pub_time_ns_ = pose_time_ns;
-    }
-
-    void publishPoseAtNs(int64_t pose_time_ns)
-    {
-        Eigen::Vector3d t_pose = spline->itpPosition(pose_time_ns);
-        Eigen::Quaterniond q_pose;
-        spline->itpQuaternion(pose_time_ns, &q_pose);
-
-        geometry_msgs::msg::PoseStamped pose_msg =
-            CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose);
-        pub_pose->publish(pose_msg);
-
+        // One posterior per batch: getLastPoseCovariance projects the current
+        // IEKF posterior through the spline Jacobian AT THE EDGE, so every
+        // sample of this batch carries the same matrices by design — compute
+        // them once here instead of per publishPoseAtNs call (a 6x24 Jacobian
+        // product each; up to ~1000 calls in a worst-case back-fill burst).
+        //
         // Pull the IEKF posterior covariance from the active estimator and
         // project it through the spline Jacobian so downstream consumers
         // (robot_localization, sierra) actually see per-step uncertainty
@@ -3748,6 +3744,28 @@ private:
         const Eigen::Matrix<double, 6, 6> P_twist =
             if_lidar_only ? estimator_lo.getLastTwistCovariance()
                           : estimator_lio.getLastTwistCovariance();
+
+        for (int64_t t_ns = resple::densepub::firstDenseSampleNs(
+                 last_pose_pub_time_ns_, pose_time_ns, dense_pub_interval_ns_,
+                 kDensePubMaxBackfillNs);
+             t_ns < pose_time_ns; t_ns += dense_pub_interval_ns_) {
+            publishPoseAtNs(t_ns, P_pose, P_twist);
+        }
+        publishPoseAtNs(pose_time_ns, P_pose, P_twist);
+        last_pose_pub_time_ns_ = pose_time_ns;
+    }
+
+    void publishPoseAtNs(int64_t pose_time_ns,
+                         const Eigen::Matrix<double, 6, 6>& P_pose,
+                         const Eigen::Matrix<double, 6, 6>& P_twist)
+    {
+        Eigen::Vector3d t_pose = spline->itpPosition(pose_time_ns);
+        Eigen::Quaterniond q_pose;
+        spline->itpQuaternion(pose_time_ns, &q_pose);
+
+        geometry_msgs::msg::PoseStamped pose_msg =
+            CommonUtils::pose2msg(odom_id, pose_time_ns, t_pose, q_pose);
+        pub_pose->publish(pose_msg);
 
         geometry_msgs::msg::PoseWithCovarianceStamped pose_cov_msg;
         pose_cov_msg.header.frame_id = odom_id;

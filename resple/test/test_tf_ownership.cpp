@@ -73,12 +73,40 @@ TEST(TfOwnership, EmptyRingNeverMatchesStampZero) {
 TEST(TfOwnership, RingEvictsOldestAfterWraparound) {
   TfOwnershipMonitor m;
   m.configure("odom", "base_footprint");
-  // Publish 300 stamps into the 256-slot ring: stamp 0..43 are evicted.
-  for (int i = 0; i < 300; ++i) m.notePublished(i);
-  EXPECT_EQ(m.classify("odom", "base_footprint", 299, 0), Verdict::SELF);
-  EXPECT_EQ(m.classify("odom", "base_footprint", 44, 0), Verdict::SELF);
+  // Overfill the ring by 50: the oldest 50 stamps are evicted.
+  const int64_t n = static_cast<int64_t>(TfOwnershipMonitor::kRingSlots);
+  for (int64_t i = 0; i < n + 50; ++i) m.notePublished(i);
+  EXPECT_EQ(m.classify("odom", "base_footprint", n + 49, 0), Verdict::SELF);
+  EXPECT_EQ(m.classify("odom", "base_footprint", 50, 0), Verdict::SELF);
   // Documented bound: an echo older than the ring depth reads as foreign.
   EXPECT_EQ(m.classify("odom", "base_footprint", 0, 0), Verdict::FOREIGN_SAME_PAIR);
+  EXPECT_EQ(m.classify("odom", "base_footprint", 49, 0), Verdict::FOREIGN_SAME_PAIR);
+}
+
+TEST(TfOwnership, WorstCaseDensePublishBurstStaysSelf) {
+  // Sizing invariant against the dense back-fill (odom/dense_pub_hz): the
+  // worst burst is the 1 kHz clamp x the 1 s history cap = 1001 stamps
+  // published in one tight worker loop, whose DDS loopback echoes may all be
+  // processed only AFTER the burst finishes. Every stamp must still be in
+  // the ring at that point — an evicted own-stamp would classify
+  // FOREIGN_SAME_PAIR: ERROR spam in 'warn' mode, and in 'yield' mode a
+  // self-inflicted TF hole right after the stall the burst was back-filling.
+  constexpr int64_t kWorstBurst = 1001;
+  static_assert(kWorstBurst <= static_cast<int64_t>(TfOwnershipMonitor::kRingSlots),
+                "dense back-fill worst burst must fit the self-stamp ring");
+  TfOwnershipMonitor m;
+  m.configure("odom", "base_footprint");
+  const int64_t MS_ = 1'000'000;
+  for (int64_t i = 0; i < kWorstBurst; ++i) {
+    m.notePublished(1 * S + i * MS_);  // 1 kHz dense samples
+  }
+  // Echoes drain afterwards: every one must be SELF, zero foreign counts.
+  for (int64_t i = 0; i < kWorstBurst; ++i) {
+    ASSERT_EQ(m.classify("odom", "base_footprint", 1 * S + i * MS_, 0),
+              Verdict::SELF)
+        << "burst stamp " << i << " evicted before its echo classified";
+  }
+  EXPECT_EQ(m.foreignSamePair(), 0u);
 }
 
 TEST(TfOwnership, StaticStampsAreNeverEvicted) {

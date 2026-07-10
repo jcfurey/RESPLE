@@ -54,6 +54,12 @@ enum class Verdict {
 
 class TfOwnershipMonitor {
  public:
+  // Self-stamp ring capacity. Sizing invariant: must exceed the worst-case
+  // publish BURST between executor turns — the dense back-fill's 1 kHz clamp
+  // x 1 s history cap (RESPLE.cpp) = ~1001 stamps. Public so the tests and
+  // the dense-publish clamp can pin the invariant against this constant.
+  static constexpr std::size_t kRingSlots = 1024;
+
   // (Re)arm the monitor for the pair actually broadcast (post-invert_tf).
   // Resets all state — call from on_configure so lifecycle re-cycles start
   // clean.
@@ -71,9 +77,15 @@ class TfOwnershipMonitor {
   }
 
   // Record the header stamp (ns) of a transform THIS node just broadcast on
-  // /tf. Bounded ring: at <= ~100 Hz publishes and <= O(100 ms) DDS + executor
-  // delivery latency, 256 slots give seconds of slack before a self stamp can
-  // be evicted while its echo is still in flight.
+  // /tf. Bounded ring; the sizing invariant is the WORST-CASE BURST, not the
+  // steady rate: the dense back-fill (odom/dense_pub_hz, clamped <= 1 kHz,
+  // history cap 1 s) can emit up to ~1001 stamps in one tight worker loop,
+  // and the executor may not drain the DDS loopback echoes until the burst
+  // finishes — every stamp of the burst must still be in the ring when its
+  // own echo classifies, or the node flags itself FOREIGN (log spam in
+  // 'warn', a self-inflicted TF hole in 'yield'). kRingSlots = 1024 covers
+  // that burst with margin; steady state (<= ~100 Hz publishes, O(100 ms)
+  // loopback latency) uses a tiny fraction of it.
   void notePublished(int64_t stamp_ns) {
     std::lock_guard<std::mutex> lk(m_);
     ring_[ring_next_] = stamp_ns;
@@ -173,8 +185,8 @@ class TfOwnershipMonitor {
   static constexpr int64_t kNever = INT64_MIN;
   static constexpr std::size_t kMaxStaticStamps = 8;
 
-  static std::array<int64_t, 256> unsetRing() {
-    std::array<int64_t, 256> a;
+  static std::array<int64_t, kRingSlots> unsetRing() {
+    std::array<int64_t, kRingSlots> a;
     a.fill(kUnsetStamp);
     return a;
   }
@@ -198,7 +210,7 @@ class TfOwnershipMonitor {
   std::string child_;
   // Pre-filled with kUnsetStamp so a default-constructed monitor can never
   // false-match a real stamp (configure() also re-fills).
-  std::array<int64_t, 256> ring_ = unsetRing();
+  std::array<int64_t, kRingSlots> ring_ = unsetRing();
   std::size_t ring_next_ = 0;
   std::vector<int64_t> static_stamps_;
   uint64_t foreign_same_pair_ = 0;
