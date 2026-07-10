@@ -33,6 +33,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_listener.hpp>
 #include <tf2_ros/buffer.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -76,6 +77,7 @@
 #include "utils/filter_health.h"
 #include "utils/overload_control.h"
 #include "utils/tf_ownership.h"
+#include "utils/dense_pub.h"
 #ifdef RESPLE_USE_CUDA
 #include "gpu/cuda_knn.h"
 #endif
@@ -202,6 +204,12 @@ public:
             "odom", rclcpp::QoS(10).reliable());
         pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
         br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        // Latched base->sensor extrinsic frames (publish_extrinsic_tf, dliio
+        // lesson 2026-07-10). Created only when enabled so the /tf_static
+        // publisher doesn't exist otherwise; readParameters() ran above.
+        if (publish_extrinsic_tf_) {
+            static_br_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
+        }
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
         
@@ -462,6 +470,7 @@ public:
         pub_odom.reset();
         pub_cur_scan.reset();
         br.reset();
+        static_br_.reset();
 
         // Reset action server: created in on_configure, must be released so a
         // re-configure cycle doesn't orphan the original (and re-creation
@@ -1543,6 +1552,9 @@ private:
     rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;
     rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
+    // Latched base->sensor extrinsic frames in YAML-extrinsic mode
+    // (publish_extrinsic_tf; see latchExtrinsicTf). Null unless enabled.
+    std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_br_;
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     bool have_imu_transform_ = false;
@@ -1584,6 +1596,13 @@ private:
     std::atomic<double> init_attitude_delta_deg_{-1.0};
 
     bool publish_tf, invert_tf;
+    // dliio lesson (2026-07-10): when the YAML q_lb/t_lb convention is in
+    // effect, latch the frame_id -> <sensor frame> extrinsic once on
+    // /tf_static so the TF tree is complete without an external
+    // static_transform_publisher (scripts/run_replay.sh has leaked stale
+    // ones before). Default false — a bag's own /tf_static may already
+    // define these frames (see config_07052026.yaml's frame prefixing).
+    bool publish_extrinsic_tf_ = false;
     std::string frame_id;
     std::string odom_id;
 
@@ -2019,6 +2038,22 @@ private:
         // Frame ID parameters
         publish_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "odom/publish_tf", true);
         invert_tf = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "odom/invert_tf", false);
+        // Dense publish floor (0 = off — the pre-feature behaviour: one pose
+        // per knot in steady state, holes when the edge jumps several knots).
+        // See publishPoseAndTf / utils/dense_pub.h.
+        // Clamped to <= 1 kHz: the TF-guard self-stamp ring (256 slots) needs
+        // publish-rate x DDS-loopback-latency well under its capacity.
+        const double dense_pub_hz = CommonUtils::readParam<double>(
+            this->get_node_parameters_interface(), "odom/dense_pub_hz", 0.0);
+        dense_pub_interval_ns_ = dense_pub_hz > 0.0
+            ? std::max<int64_t>(static_cast<int64_t>(1e9 / dense_pub_hz), 1000000)
+            : 0;
+        if (dense_pub_interval_ns_ > 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] dense odom/TF back-fill enabled: %.1f Hz (interval %.1f ms)",
+                1e9 / static_cast<double>(dense_pub_interval_ns_),
+                static_cast<double>(dense_pub_interval_ns_) / 1e6);
+        }
         frame_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "frame_id", "base_link");
         odom_id = CommonUtils::readParam<std::string>(this->get_node_parameters_interface(), "odom/frame_id", "odom");
 
@@ -2052,6 +2087,7 @@ private:
         // the production TF-based flow; dataset replay launches pass false so
         // the YAML q_lb/t_lb is the single source of truth (upstream parity).
         tf_extrinsics_ = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "tf_extrinsics", true);
+        publish_extrinsic_tf_ = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_extrinsic_tf", false);
         tf_wait_timeout_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "tf_wait_timeout", 10.0);
         lo_imu_wait_timeout_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "lo_imu_wait_timeout", 10.0);
 
@@ -2611,6 +2647,7 @@ private:
             // in pointBodyToWorld / prepLiDAR. sensor_origin_body stays zero
             // (points remain in the sensor frame).
             lidar.extrinsic_ready = true;
+            latchExtrinsicTf(source_frame_id, lidar);
             return true;
         }
         try {
@@ -2670,12 +2707,75 @@ private:
                 "set tf_extrinsics:=false to silence this.",
                 source_frame_id.c_str(), this->frame_id.c_str(), tf_wait_timeout_);
             lidar.extrinsic_ready = true;   // identity TF from here on
+            latchExtrinsicTf(source_frame_id, lidar);
             return true;
         }
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                             "[RESPLE] Waiting for LiDAR transform: %s -> %s",
                             source_frame_id.c_str(), this->frame_id.c_str());
         return false;
+    }
+
+    // dliio lesson (2026-07-10 review): dliio broadcasts its param extrinsics
+    // as base->imu/lidar TFs so its tree is complete out of the box; RESPLE in
+    // the YAML q_lb/t_lb convention leaves the sensor frames dangling, forcing
+    // replay harnesses to run an external static_transform_publisher (which
+    // has leaked stale extrinsics across runs before — scripts/run_replay.sh).
+    // When publish_extrinsic_tf is set, latch frame_id -> <cloud header frame>
+    // ONCE on /tf_static with (q_bl, t_bl) — exactly the T_base<-sensor that
+    // pointBodyToWorld applies, so TF consumers and the estimator agree by
+    // construction. Latched (not dliio's per-cycle /tf re-broadcast): the
+    // extrinsic is static, and /tf traffic stays untouched.
+    //
+    // LiDAR frames only: RESPLE has no YAML IMU extrinsic, and asserting an
+    // identity base->imu we don't actually know would mislead downstream
+    // (dliio's 06042026 180-yaw-as-identity bug is the cautionary tale).
+    //
+    // Runs on the sensor callback group (mutually exclusive) via
+    // updateLidarTransform, once per lidar (extrinsic_ready gates re-entry).
+    void latchExtrinsicTf(const std::string& source_frame_id, const LidarConfig& lidar)
+    {
+        if (!publish_extrinsic_tf_ || !static_br_) {
+            return;
+        }
+        if (source_frame_id.empty() || source_frame_id == this->frame_id) {
+            RCLCPP_WARN(this->get_logger(),
+                "[RESPLE] publish_extrinsic_tf: cloud frame_id '%s' is empty or "
+                "equals frame_id '%s' — no extrinsic TF latched for this LiDAR.",
+                source_frame_id.c_str(), this->frame_id.c_str());
+            return;
+        }
+        // Collision guard: if ANY transform already references this frame
+        // (a bag's /tf_static, a URDF publisher), someone else owns it — a
+        // second static latch on the same child would fight it (tf2 keeps
+        // one parent per child). Best-effort: a late-arriving latched TF can
+        // still slip past; prefix RESPLE's frames (config_07052026.yaml
+        // pattern) when replaying a bag that carries its own tree.
+        if (tf_buffer_ && tf_buffer_->_frameExists(source_frame_id)) {
+            RCLCPP_WARN(this->get_logger(),
+                "[RESPLE] publish_extrinsic_tf: frame '%s' already exists in the "
+                "TF tree (bag /tf_static? URDF?) — not latching %s -> %s to avoid "
+                "a two-owner conflict.",
+                source_frame_id.c_str(), this->frame_id.c_str(), source_frame_id.c_str());
+            return;
+        }
+        geometry_msgs::msg::TransformStamped ts;
+        ts.header.stamp = this->now();
+        ts.header.frame_id = this->frame_id;
+        ts.child_frame_id = source_frame_id;
+        ts.transform.translation.x = lidar.t_bl.x();
+        ts.transform.translation.y = lidar.t_bl.y();
+        ts.transform.translation.z = lidar.t_bl.z();
+        ts.transform.rotation.w = lidar.q_bl.w();
+        ts.transform.rotation.x = lidar.q_bl.x();
+        ts.transform.rotation.y = lidar.q_bl.y();
+        ts.transform.rotation.z = lidar.q_bl.z();
+        static_br_->sendTransform(ts);
+        RCLCPP_INFO(this->get_logger(),
+            "[RESPLE] latched static extrinsic TF %s -> %s from YAML q_lb/t_lb "
+            "(t=[%.3f %.3f %.3f])",
+            this->frame_id.c_str(), source_frame_id.c_str(),
+            lidar.t_bl.x(), lidar.t_bl.y(), lidar.t_bl.z());
     }
 
     sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::ConstSharedPtr& imu_raw, 
@@ -3580,16 +3680,46 @@ private:
     // from publishCurrentScan so the odom frame keeps flowing even when
     // the background map mutation lambda is wedged inside ikd-Tree.
     int64_t last_pose_pub_time_ns_ = std::numeric_limits<int64_t>::min();
+    // odom/dense_pub_hz interval (0 = off) and the back-fill cap after a
+    // stall / NIS-hold release / bag restart. See utils/dense_pub.h.
+    int64_t dense_pub_interval_ns_ = 0;
+    static constexpr int64_t kDensePubMaxBackfillNs = 1000000000;  // 1 s
 
     void publishPoseAndTf()
     {
-        int64_t pose_time_ns = spline->maxTimeNs();
+        const int64_t pose_time_ns = spline->maxTimeNs();
         // Skip duplicates: the inner collectMeasurements loop can fire many
         // times before the spline advances, and tf2 / nav listeners reject
         // identical-stamp transforms anyway.
         if (pose_time_ns <= last_pose_pub_time_ns_) return;
+        // Dense back-fill (odom/dense_pub_hz, dliio-lessons review
+        // 2026-07-10). Steady state already publishes once per knot (this
+        // function runs per collectMeasurements iteration; measured ~100 Hz
+        // on R_Campus baseline), so this is a FLOOR, not the normal rate:
+        // whenever the edge advances by more than one knot per call (propRCP
+        // jumping a scan gap, overload shedding — hazard 69 — or an NIS-hold
+        // release), the duplicate gate would emit one pose at the new edge
+        // and leave a hole in the published chain exactly where downstream
+        // tf2 lookups are most fragile. Back-fill the segment (last publish,
+        // edge) by spline interpolation — data-time stamps, never
+        // extrapolated, latency unchanged; also upsamples past knot_hz if
+        // configured higher. All samples in a batch reuse the current IEKF
+        // posterior covariance — there is one posterior per batch and these
+        // stamps belong to it. The NIS 'hold' gate is upstream at the call
+        // site, so a held window is never back-filled densely either (the
+        // cap bounds the burst at release).
+        for (int64_t t_ns = resple::densepub::firstDenseSampleNs(
+                 last_pose_pub_time_ns_, pose_time_ns, dense_pub_interval_ns_,
+                 kDensePubMaxBackfillNs);
+             t_ns < pose_time_ns; t_ns += dense_pub_interval_ns_) {
+            publishPoseAtNs(t_ns);
+        }
+        publishPoseAtNs(pose_time_ns);
         last_pose_pub_time_ns_ = pose_time_ns;
+    }
 
+    void publishPoseAtNs(int64_t pose_time_ns)
+    {
         Eigen::Vector3d t_pose = spline->itpPosition(pose_time_ns);
         Eigen::Quaterniond q_pose;
         spline->itpQuaternion(pose_time_ns, &q_pose);
