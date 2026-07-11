@@ -63,6 +63,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
+#include <diagnostic_updater/diagnostic_updater.hpp>
 
 #include "utils/common_utils.h"
 #include "SplineState.h"
@@ -207,6 +208,12 @@ class MappingBase
                 static_cast<unsigned long>(total_cap_dropped_.load(std::memory_order_relaxed)));
         }
     }
+
+    // Executor-read counters for the Mapping node's /diagnostics (2026-07-11).
+    size_t totalPublished() const { return total_published_.load(std::memory_order_relaxed); }
+    size_t totalDroppedOld() const { return total_dropped_old_.load(std::memory_order_relaxed); }
+    size_t totalPendingNew() const { return total_pending_new_.load(std::memory_order_relaxed); }
+    uint64_t capDropped() const { return total_cap_dropped_.load(std::memory_order_relaxed); }
 
     // Single definition of the sensor-callback guard policy: serialize the
     // callback body on cb_mtx_ (see above) and convert any exception into a
@@ -358,7 +365,9 @@ class MappingBase
                 "spline=[%ld..%ld] last_t_end=%ld "
                 "totals: published=%zu dropped_old=%zu pending_new=%zu cap_dropped=%lu",
                 buf_remaining, spl->numKnots(), s_min, s_max, last_t_end_ns,
-                total_published_, total_dropped_old_, total_pending_new_,
+                total_published_.load(std::memory_order_relaxed),
+                total_dropped_old_.load(std::memory_order_relaxed),
+                total_pending_new_.load(std::memory_order_relaxed),
                 static_cast<unsigned long>(total_cap_dropped_.load(std::memory_order_relaxed)));
         }
         return (n_published + n_dropped_old) > 0;
@@ -502,9 +511,11 @@ class MappingBase
     // Diagnostic counters + last-log time (see processScan / publishMap).
     bool publishMap_logged_ = false;
     rclcpp::Time last_processScan_log_{0, 0, RCL_ROS_TIME};
-    size_t total_published_ = 0;
-    size_t total_dropped_old_ = 0;
-    size_t total_pending_new_ = 0;
+    // Atomics: incremented on the worker, read by the Mapping node's
+    // /diagnostics callback on the executor (2026-07-11).
+    std::atomic<size_t> total_published_{0};
+    std::atomic<size_t> total_dropped_old_{0};
+    std::atomic<size_t> total_pending_new_{0};
     // Scans evicted by the buffer cap (pushScanCapped). Atomic: written on
     // the callback threads, read by the worker's 2 s summary.
     std::atomic<uint64_t> total_cap_dropped_{0};
@@ -986,8 +997,14 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     : rclcpp_lifecycle::LifecycleNode("Mapping", 
           rclcpp::NodeOptions(options).use_intra_process_comms(true)),
       processing_active_(false),
-      vis_maps(mappings)
+      vis_maps(mappings),
+      diagnostics_(this)
     {
+        // Registered in the CONSTRUCTOR (not on_configure) so a lifecycle
+        // re-cycle cannot double-register the task; the callback reads only
+        // caches/atomics, so it is safe in any lifecycle state.
+        diagnostics_.setHardwareID("Mapping");
+        diagnostics_.add("Mapping Health", this, &Mapping::updateDiagnostics);
         RCLCPP_INFO(this->get_logger(), "Mapping LifecycleNode created (unconfigured state)");
         spl_window_st_ns = 0;
         opt_old_path.header.frame_id = map_id;
@@ -1109,10 +1126,10 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         // RESPLE node's; see tfWatchCallback there for the rationale).
         sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
             "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
-            std::bind(&Mapping::tfWatchCallback, this, std::placeholders::_1));
+            [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, false); });
         sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
             "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
-            std::bind(&Mapping::tfWatchCallback, this, std::placeholders::_1));
+            [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, true); });
         tf_absence_wait_.reset();  // window (re)starts at first valid clock sample
         
         // Start processing thread (exited-flag store last, for the bounded
@@ -1290,6 +1307,9 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                         est_window_queue_.pop_front();
                     }
                     spline_pending_ready_.store(false);
+                    cached_est_queue_.store(0, std::memory_order_relaxed);
+                    cached_knots_.store(spline_active_.numKnots(),
+                                        std::memory_order_relaxed);
                 }
             }
             // Consume a (re)start signal: reset worker-local trackers so a
@@ -1301,23 +1321,44 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 path_t_ns_ = 0;
                 opt_old_path.poses.clear();
             }
-            // TF ownership absence check (one-shot, mirror of the RESPLE
-            // node's): map/publish_tf=false means an external localizer is
-            // expected to own map->odom — WARN if nobody has published it.
-            if (!publish_tf && tf_absent_warn_sec_ > 0 &&
-                !tf_absence_warned_.load(std::memory_order_relaxed) &&
-                !tf_own_monitor_.pairSeen()) {
-                const double waited = tf_absence_wait_.elapsedSec(
-                    this->now().nanoseconds());
-                if (waited > tf_absent_warn_sec_) {
-                    tf_absence_warned_.store(true, std::memory_order_relaxed);
-                    RCLCPP_WARN(this->get_logger(),
-                        "[Mapping] map/publish_tf=false but NO ONE has published "
-                        "%s->%s in %.0f s. The external owner (global localizer?) "
-                        "is not wired up - the map frame is dangling. Either start "
-                        "it or set map/publish_tf: true.",
-                        tf_own_monitor_.parent().c_str(),
-                        tf_own_monitor_.child().c_str(), waited);
+            // TF ownership absence check (mirror of the RESPLE node's):
+            // map/publish_tf=false means an external localizer is expected
+            // to own map->odom. Never-wired warns once after the grace;
+            // owner-died-mid-run warns once per outage (re-arms when the
+            // pair is seen again).
+            if (!publish_tf && tf_absent_warn_sec_ > 0) {
+                const int64_t last_seen = tf_own_monitor_.lastPairSeenNs();
+                if (last_seen != tf_last_pair_seen_ns_) {
+                    tf_last_pair_seen_ns_ = last_seen;
+                    tf_absence_warned_.store(false, std::memory_order_relaxed);
+                }
+                if (!tf_absence_warned_.load(std::memory_order_relaxed)) {
+                    if (last_seen == 0) {
+                        const double waited = tf_absence_wait_.elapsedSec(
+                            this->now().nanoseconds());
+                        if (waited > tf_absent_warn_sec_) {
+                            tf_absence_warned_.store(true, std::memory_order_relaxed);
+                            RCLCPP_WARN(this->get_logger(),
+                                "[Mapping] map/publish_tf=false but NO ONE has published "
+                                "%s->%s in %.0f s. The external owner (global localizer?) "
+                                "is not wired up - the map frame is dangling. Either start "
+                                "it or set map/publish_tf: true.",
+                                tf_own_monitor_.parent().c_str(),
+                                tf_own_monitor_.child().c_str(), waited);
+                        }
+                    } else {
+                        const double stale_s =
+                            (this->now().nanoseconds() - last_seen) / 1e9;
+                        if (stale_s > tf_absent_warn_sec_) {
+                            tf_absence_warned_.store(true, std::memory_order_relaxed);
+                            RCLCPP_WARN(this->get_logger(),
+                                "[Mapping] the external owner of %s->%s STOPPED "
+                                "publishing %.0f s ago (died mid-run?). The map frame "
+                                "is going stale for downstream consumers.",
+                                tf_own_monitor_.parent().c_str(),
+                                tf_own_monitor_.child().c_str(), stale_s);
+                        }
+                    }
                 }
             }
             // Acquire-load on if_init_succeed pairs with startCallBack's
@@ -1428,6 +1469,18 @@ private:
     // to processing_thread_).
     std::atomic<bool> processing_thread_exited_{false};
     std::vector<MappingBase<pcl::PointXYZINormal>*> vis_maps;
+    // /diagnostics (2026-07-11): string-keyed diagnostic_updater only — the
+    // typed Diagnostics msg stays RESPLE-side. Caches are written on the
+    // worker under the locks that guard the underlying state; the callback
+    // reads caches + atomics only.
+    diagnostic_updater::Updater diagnostics_;
+    std::atomic<int64_t> cached_knots_{0};
+    std::atomic<int64_t> cached_est_queue_{0};
+    std::atomic<uint64_t> cached_est_dropped_{0};
+    // Per-window baselines (executor-only, updateDiagnostics).
+    uint64_t last_tf_foreign_total_ = 0;
+    uint64_t last_cap_dropped_ = 0;
+    uint64_t last_est_dropped_ = 0;
     std::string frame_id;
     std::string odom_id;
     std::string map_id;
@@ -1453,14 +1506,16 @@ private:
     // NODE-CLOCK absence window + freshness 'now' (2026-07-08 clock-domain
     // audit) — mirror of the RESPLE node's; see the comments there.
     resple::timeutil::RosTimeWait tf_absence_wait_;
+    // Worker-only snapshot of lastPairSeenNs for the outage re-arm.
+    int64_t tf_last_pair_seen_ns_ = 0;
 
-    void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg)
+    void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool from_static)
     {
         const int64_t now_ns = this->now().nanoseconds();
         for (const auto& ts : msg->transforms) {
             const int64_t stamp_ns = rclcpp::Time(ts.header.stamp).nanoseconds();
             const auto v = tf_own_monitor_.classify(
-                ts.header.frame_id, ts.child_frame_id, stamp_ns, now_ns);
+                ts.header.frame_id, ts.child_frame_id, stamp_ns, now_ns, from_static);
             if (!publish_tf) continue;  // demoted: foreign owner is EXPECTED
             if (v == resple::tfown::Verdict::FOREIGN_SAME_PAIR) {
                 RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1595,11 +1650,86 @@ private:
             est_window_queue_.push_back(
                 EstWindow{std::move(spline_w), spline_msg.start_t - spline_msg.dt});
             spline_pending_ready_.store(true);
+            cached_est_queue_.store(static_cast<int64_t>(est_window_queue_.size()),
+                                    std::memory_order_relaxed);
+            cached_est_dropped_.store(est_windows_dropped_, std::memory_order_relaxed);
         }
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                 "[Mapping] getEstCallback dropped a malformed est_window: %s", e.what());
         }
+    }
+
+    // /diagnostics callback (2026-07-11): Mapping previously surfaced its
+    // health only in throttled logs; RESPLE's typed Diagnostics msg covers
+    // the estimator, not the map side. Reads caches + atomics only — safe on
+    // the executor in any lifecycle state.
+    void updateDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& stat)
+    {
+        uint8_t level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+        std::string msg = "Mapping healthy";
+
+        stat.add("Initialized", if_init_succeed.load(std::memory_order_relaxed));
+        stat.add("Spline Knots (replica)",
+                 static_cast<int>(cached_knots_.load(std::memory_order_relaxed)));
+        stat.add("Est Window Queue Depth",
+                 static_cast<int>(cached_est_queue_.load(std::memory_order_relaxed)));
+        const uint64_t est_dropped = cached_est_dropped_.load(std::memory_order_relaxed);
+        stat.add("Est Windows Dropped (cumulative)", static_cast<int>(est_dropped));
+
+        // Per-sensor scan funnel, summed across the map buffers.
+        size_t published = 0, dropped_old = 0, pending = 0;
+        uint64_t cap_dropped = 0;
+        for (const auto* m : vis_maps) {
+            published += m->totalPublished();
+            dropped_old += m->totalDroppedOld();
+            pending += m->totalPendingNew();
+            cap_dropped += m->capDropped();
+        }
+        stat.add("Scans Published (cumulative)", static_cast<int>(published));
+        stat.add("Scans Dropped Old (cumulative)", static_cast<int>(dropped_old));
+        stat.add("Scans Gated Pending (cumulative)", static_cast<int>(pending));
+        stat.add("Scans Cap-Dropped (cumulative)", static_cast<int>(cap_dropped));
+
+        // TF ownership guard (map->odom pair).
+        const uint64_t tf_same = tf_own_monitor_.foreignSamePair();
+        const uint64_t tf_parent = tf_own_monitor_.foreignOtherParent();
+        const bool tf_active = tf_own_monitor_.foreignActiveWithin(
+                this->now().nanoseconds(), tf_conflict_quiet_ns_)
+            || tf_own_monitor_.foreignStaticSeen();
+        stat.add("TF Foreign Publishes Same Pair (cumulative)", static_cast<int>(tf_same));
+        stat.add("TF Foreign Parent Claims (cumulative)", static_cast<int>(tf_parent));
+        stat.add("TF Conflict Active", tf_active);
+        stat.add("TF Yielding", tf_yield_active_.load(std::memory_order_relaxed));
+
+        // Escalation: cap drops are permanent map holes; est_window drops
+        // misalign the replica until restart; an active TF conflict flickers
+        // the map frame for every consumer.
+        if (cap_dropped > last_cap_dropped_) {
+            level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            msg = "Scan buffer cap dropping scans (map holes) - worker not keeping up";
+        }
+        if (est_dropped > last_est_dropped_) {
+            level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            msg = "est_window queue overflow - replica misaligned until restart";
+        }
+        const uint64_t tf_total = tf_same + tf_parent;
+        if (publish_tf && tf_total > last_tf_foreign_total_
+            && level < diagnostic_msgs::msg::DiagnosticStatus::WARN) {
+            level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            msg = "Foreign TF publisher observed this window";
+        }
+        if (publish_tf && tf_active) {
+            level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+            msg = tf_yield_active_.load(std::memory_order_relaxed)
+                ? "TF ownership conflict active (yielding our broadcast)"
+                : "TF ownership conflict active (two publishers on map->odom)";
+        }
+        last_cap_dropped_ = cap_dropped;
+        last_est_dropped_ = est_dropped;
+        last_tf_foreign_total_ = tf_total;
+
+        stat.summary(level, msg);
     }
 
     void pubOdom()
@@ -1684,8 +1814,12 @@ private:
             // TF ownership guard 'yield': suspend our map->odom broadcast
             // while a foreign publisher on the pair was seen within the quiet
             // window (mirror of the RESPLE node's odom TF yield).
+            // Sticky static claims hold the yield regardless of the quiet
+            // window (a foreign /tf_static transform persists in consumers'
+            // buffers forever; cleared only by a lifecycle re-configure).
             const bool yield_now = tf_conflict_action_ == "yield"
-                && tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_);
+                && (tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_)
+                    || tf_own_monitor_.foreignStaticSeen());
             tf_yield_active_.store(yield_now, std::memory_order_relaxed);
             if (yield_now) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1816,7 +1950,8 @@ private:
             // Skip WITHOUT consuming the one-shot, so a later, quiet (re)start
             // can still latch.
             if (tf_conflict_action_ == "yield" &&
-                tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_)) {
+                (tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_)
+                 || tf_own_monitor_.foreignStaticSeen())) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "[Mapping] skipping the identity %s->%s static latch: a foreign "
                     "publisher owns the pair (tf_conflict_action=yield).",

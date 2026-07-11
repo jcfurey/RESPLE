@@ -191,6 +191,59 @@ TEST(TfOwnership, LeadingSlashNormalization) {
   EXPECT_EQ(m.classify("odom", "/base", 1 * S, 0), Verdict::UNRELATED);
 }
 
+TEST(TfOwnership, StaticForeignClaimIsSticky) {
+  // A foreign transform arriving via /tf_static persists in every running
+  // consumer's tf2 buffer forever — the conflict cannot "go quiet", so the
+  // sticky flag must hold regardless of the freshness window. This also
+  // covers the sim-time corner: delivery before the first /clock message
+  // (now == 0) would age out of the window instantly, but stickiness won't.
+  TfOwnershipMonitor m;
+  m.configure("map", "odom");
+  EXPECT_FALSE(m.foreignStaticSeen());
+  // Pre-/clock delivery (now == 0), static foreign same-pair.
+  EXPECT_EQ(m.classify("map", "odom", 7 * S, /*now=*/0, /*from_static=*/true),
+            Verdict::FOREIGN_SAME_PAIR);
+  EXPECT_TRUE(m.foreignStaticSeen());
+  // Freshness window long expired — stickiness unaffected.
+  EXPECT_FALSE(m.foreignActiveWithin(1000 * S, 5 * S));
+  EXPECT_TRUE(m.foreignStaticSeen());
+  // Static other-parent claims stick too; dynamic foreigns never set it.
+  TfOwnershipMonitor m2;
+  m2.configure("map", "odom");
+  m2.classify("earth", "odom", 1 * S, 0, /*from_static=*/true);
+  EXPECT_TRUE(m2.foreignStaticSeen());
+  TfOwnershipMonitor m3;
+  m3.configure("map", "odom");
+  m3.classify("map", "odom", 1 * S, 0, /*from_static=*/false);
+  EXPECT_FALSE(m3.foreignStaticSeen());
+  // Our OWN static latch (whitelisted stamp) must not stick.
+  TfOwnershipMonitor m4;
+  m4.configure("map", "odom");
+  m4.notePublishedStatic(3 * S);
+  EXPECT_EQ(m4.classify("map", "odom", 3 * S, 0, /*from_static=*/true),
+            Verdict::SELF);
+  EXPECT_FALSE(m4.foreignStaticSeen());
+  // configure() re-arms (lifecycle re-cycle).
+  m.configure("map", "odom");
+  EXPECT_FALSE(m.foreignStaticSeen());
+}
+
+TEST(TfOwnership, LastPairSeenDrivesAbsenceRearm) {
+  // publish_tf=false: the external owner published for a while, then died.
+  // lastPairSeenNs going stale is the "owner stopped" signal, distinct from
+  // pairSeen()==false ("never wired up").
+  TfOwnershipMonitor m;
+  m.configure("odom", "base_footprint");
+  EXPECT_EQ(m.lastPairSeenNs(), 0);  // never
+  m.classify("odom", "base_footprint", 1 * S, /*now=*/10 * S);
+  EXPECT_EQ(m.lastPairSeenNs(), 10 * S);
+  m.classify("odom", "base_footprint", 2 * S, /*now=*/12 * S);
+  EXPECT_EQ(m.lastPairSeenNs(), 12 * S);
+  // Other-parent observations are NOT the watched pair — no update.
+  m.classify("map", "base_footprint", 3 * S, /*now=*/20 * S);
+  EXPECT_EQ(m.lastPairSeenNs(), 12 * S);
+}
+
 TEST(TfOwnership, InvertedPairIsJustTheWatchedPair) {
   // invert_tf swaps the broadcast direction; the node configures the monitor
   // with the POST-inversion pair, so base->odom is then the exact pair and

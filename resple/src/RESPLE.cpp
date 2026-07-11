@@ -329,10 +329,10 @@ public:
         // group: the callback is O(frames) string compares, no heavy work.
         sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
             "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
-            std::bind(&RESPLE::tfWatchCallback, this, std::placeholders::_1));
+            [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, false); });
         sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
             "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
-            std::bind(&RESPLE::tfWatchCallback, this, std::placeholders::_1));
+            [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, true); });
         tf_absence_wait_.reset();  // window (re)starts at first valid clock sample
 
         // Start processing thread. The exited-flag store is the lambda's last
@@ -654,25 +654,50 @@ public:
                             rtf_prev_spline_max_ = spline_max;
                             rtf_prev_wall_ = now_mono;
                         }
-                        // TF ownership absence check (one-shot): demoted
+                        // TF ownership absence check: demoted
                         // (odom/publish_tf=false, external owner expected —
-                        // e.g. the robot_localization odom EKF) but nobody
-                        // has published our pair since activation. Downstream
-                        // TF consumers are silently starving.
-                        if (!publish_tf && tf_absent_warn_sec_ > 0 &&
-                            !tf_absence_warned_.load(std::memory_order_relaxed) &&
-                            !tf_own_monitor_.pairSeen()) {
-                            const double waited = tf_absence_wait_.elapsedSec(
-                                this->now().nanoseconds());
-                            if (waited > tf_absent_warn_sec_) {
-                                tf_absence_warned_.store(true, std::memory_order_relaxed);
-                                RCLCPP_WARN(this->get_logger(),
-                                    "[RESPLE] odom/publish_tf=false but NO ONE has published "
-                                    "%s->%s in %.0f s. The external owner (odom EKF?) is not "
-                                    "wired up - TF consumers downstream are starving. Either "
-                                    "start it or set odom/publish_tf: true.",
-                                    tf_own_monitor_.parent().c_str(),
-                                    tf_own_monitor_.child().c_str(), waited);
+                        // e.g. the robot_localization odom EKF) but the pair
+                        // is not being published. Two distinct failures:
+                        // never wired up (one-shot after the grace window),
+                        // and owner DIED MID-RUN (lastPairSeen goes stale;
+                        // re-arms whenever the owner resumes, so each outage
+                        // warns once). Both leave downstream TF consumers
+                        // silently starving.
+                        if (!publish_tf && tf_absent_warn_sec_ > 0) {
+                            const int64_t last_seen = tf_own_monitor_.lastPairSeenNs();
+                            if (last_seen != tf_last_pair_seen_ns_) {
+                                // Owner is alive (pair observed since last
+                                // check): re-arm the outage warning.
+                                tf_last_pair_seen_ns_ = last_seen;
+                                tf_absence_warned_.store(false, std::memory_order_relaxed);
+                            }
+                            if (!tf_absence_warned_.load(std::memory_order_relaxed)) {
+                                if (last_seen == 0) {
+                                    const double waited = tf_absence_wait_.elapsedSec(
+                                        this->now().nanoseconds());
+                                    if (waited > tf_absent_warn_sec_) {
+                                        tf_absence_warned_.store(true, std::memory_order_relaxed);
+                                        RCLCPP_WARN(this->get_logger(),
+                                            "[RESPLE] odom/publish_tf=false but NO ONE has published "
+                                            "%s->%s in %.0f s. The external owner (odom EKF?) is not "
+                                            "wired up - TF consumers downstream are starving. Either "
+                                            "start it or set odom/publish_tf: true.",
+                                            tf_own_monitor_.parent().c_str(),
+                                            tf_own_monitor_.child().c_str(), waited);
+                                    }
+                                } else {
+                                    const double stale_s =
+                                        (this->now().nanoseconds() - last_seen) / 1e9;
+                                    if (stale_s > tf_absent_warn_sec_) {
+                                        tf_absence_warned_.store(true, std::memory_order_relaxed);
+                                        RCLCPP_WARN(this->get_logger(),
+                                            "[RESPLE] the external owner of %s->%s STOPPED "
+                                            "publishing %.0f s ago (died mid-run?). TF consumers "
+                                            "downstream are starving on a stale transform.",
+                                            tf_own_monitor_.parent().c_str(),
+                                            tf_own_monitor_.child().c_str(), stale_s);
+                                    }
+                                }
                             }
                         }
                         bool map_busy = map_update_pending_.load(std::memory_order_acquire)
@@ -1375,7 +1400,8 @@ public:
                     dmsg.tf_foreign_same_pair = tf_own_monitor_.foreignSamePair();
                     dmsg.tf_foreign_other_parent = tf_own_monitor_.foreignOtherParent();
                     dmsg.tf_conflict_active = tf_own_monitor_.foreignActiveWithin(
-                        this->now().nanoseconds(), tf_conflict_quiet_ns_);
+                            this->now().nanoseconds(), tf_conflict_quiet_ns_)
+                        || tf_own_monitor_.foreignStaticSeen();
                     dmsg.tf_yielding = tf_yield_active_.load(std::memory_order_relaxed);
                     pub_diag_->publish(dmsg);
                 }
@@ -1559,6 +1585,12 @@ private:
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     bool have_imu_transform_ = false;
     geometry_msgs::msg::TransformStamped imu_to_baselink_;
+    // YAML IMU extrinsic (q_ib/t_ib params, 2026-07-11), pre-inverted to the
+    // base<-imu TransformStamped form transformImu consumes. Consulted only
+    // in the YAML convention (tf_extrinsics=false); false = identity default
+    // (legacy pass-through). Set once in readParameters.
+    bool have_yaml_imu_extrinsic_ = false;
+    geometry_msgs::msg::TransformStamped yaml_imu_tf_;
     // Extrinsic convention switch (findings #5/#22/#26): true (default) = TF
     // carries the mounting extrinsic, YAML q_lb/t_lb is an extra offset on
     // top; false = upstream/dataset mode, no TF consulted, YAML applied once.
@@ -1632,17 +1664,21 @@ private:
     // freshness 'now' likewise comes from the node clock so yield/resume is
     // invariant to bag playback rate.
     resple::timeutil::RosTimeWait tf_absence_wait_;
+    // Worker-only snapshot of lastPairSeenNs for the outage re-arm.
+    int64_t tf_last_pair_seen_ns_ = 0;
 
     // Raw /tf + /tf_static watcher (default callback group; O(frames) string
     // compares per message, no allocation). Runs on the executor; the monitor
-    // synchronizes internally against the worker's notePublished.
-    void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg)
+    // synchronizes internally against the worker's notePublished. from_static
+    // marks /tf_static deliveries — a foreign STATIC claim is sticky in the
+    // monitor (it persists in consumers' tf2 buffers forever).
+    void tfWatchCallback(const tf2_msgs::msg::TFMessage::SharedPtr msg, bool from_static)
     {
         const int64_t now_ns = this->now().nanoseconds();
         for (const auto& ts : msg->transforms) {
             const int64_t stamp_ns = rclcpp::Time(ts.header.stamp).nanoseconds();
             const auto v = tf_own_monitor_.classify(
-                ts.header.frame_id, ts.child_frame_id, stamp_ns, now_ns);
+                ts.header.frame_id, ts.child_frame_id, stamp_ns, now_ns, from_static);
             if (!publish_tf) continue;  // demoted: foreign owner is EXPECTED here
             if (v == resple::tfown::Verdict::FOREIGN_SAME_PAIR) {
                 RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -2098,6 +2134,44 @@ private:
         // the YAML q_lb/t_lb is the single source of truth (upstream parity).
         tf_extrinsics_ = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "tf_extrinsics", true);
         publish_extrinsic_tf_ = CommonUtils::readParam<bool>(this->get_node_parameters_interface(), "publish_extrinsic_tf", false);
+        // YAML IMU extrinsic (2026-07-11): p_imu = q_ib * p_body + t_ib —
+        // the same direction convention as the per-lidar q_lb/t_lb. Only
+        // consulted in the YAML convention (tf_extrinsics=false); TF mode
+        // gets the IMU mounting from the tree. Identity (default) keeps the
+        // legacy pass-through bit-identical.
+        {
+            std::vector<double> q_ib_v = CommonUtils::readParam<std::vector<double>>(
+                this->get_node_parameters_interface(), "q_ib", {1.0, 0.0, 0.0, 0.0});
+            Eigen::Quaterniond q_ib(q_ib_v.at(0), q_ib_v.at(1), q_ib_v.at(2), q_ib_v.at(3));
+            q_ib.normalize();
+            const Eigen::Vector3d t_ib = CommonUtils::readVector3d(
+                this->get_node_parameters_interface(), "t_ib");
+            have_yaml_imu_extrinsic_ =
+                q_ib.angularDistance(Eigen::Quaterniond::Identity()) > 1e-6 ||
+                t_ib.norm() > 1e-6;
+            if (have_yaml_imu_extrinsic_) {
+                const Eigen::Quaterniond q_bi = q_ib.inverse();
+                const Eigen::Vector3d t_bi = q_bi * (-t_ib);
+                yaml_imu_tf_ = geometry_msgs::msg::TransformStamped();
+                yaml_imu_tf_.transform.rotation.w = q_bi.w();
+                yaml_imu_tf_.transform.rotation.x = q_bi.x();
+                yaml_imu_tf_.transform.rotation.y = q_bi.y();
+                yaml_imu_tf_.transform.rotation.z = q_bi.z();
+                yaml_imu_tf_.transform.translation.x = t_bi.x();
+                yaml_imu_tf_.transform.translation.y = t_bi.y();
+                yaml_imu_tf_.transform.translation.z = t_bi.z();
+                if (tf_extrinsics_) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "[RESPLE] q_ib/t_ib set but tf_extrinsics=true: the YAML IMU "
+                        "extrinsic is IGNORED in TF mode (the tree carries the "
+                        "mounting). Set tf_extrinsics: false or remove q_ib/t_ib.");
+                } else {
+                    RCLCPP_INFO(this->get_logger(),
+                        "[RESPLE] YAML IMU extrinsic armed (q_ib/t_ib): IMU samples "
+                        "and gravity init will be rotated into the body frame.");
+                }
+            }
+        }
         tf_wait_timeout_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "tf_wait_timeout", 10.0);
         lo_imu_wait_timeout_ = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "lo_imu_wait_timeout", 10.0);
 
@@ -2580,11 +2654,32 @@ private:
 
     bool updateImuTransform(std::string source_frame_id)
     {
-        // YAML-only mode (tf_extrinsics=false): never consult TF; the caller
-        // falls back to pass-through, matching upstream (IMU assumed to be in
-        // the body frame, as the dataset configs are calibrated for).
+        // YAML-only mode (tf_extrinsics=false): never consult TF. If a YAML
+        // IMU extrinsic (q_ib/t_ib) is configured, apply IT through the same
+        // transformImu path the TF mode uses (2026-07-11: closes the gap
+        // where a tilted IMU was silently fused unrotated in YAML mode —
+        // rotation, lever arm and the finding-#9 gravity-init rotation all
+        // reuse the TF-mode machinery). Identity default = the legacy
+        // pass-through, bit-identical.
         if (!tf_extrinsics_) {
-            return false;
+            if (!have_yaml_imu_extrinsic_) {
+                return false;
+            }
+            if (!have_imu_transform_) {
+                imu_to_baselink_ = yaml_imu_tf_;
+                imu_to_baselink_.header.frame_id = this->frame_id;
+                imu_to_baselink_.child_frame_id = source_frame_id;
+                have_imu_transform_ = true;
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] IMU extrinsic from YAML q_ib/t_ib (%s -> %s): "
+                    "t=[%.3f %.3f %.3f]",
+                    this->frame_id.c_str(), source_frame_id.c_str(),
+                    imu_to_baselink_.transform.translation.x,
+                    imu_to_baselink_.transform.translation.y,
+                    imu_to_baselink_.transform.translation.z);
+                latchImuExtrinsicTf(source_frame_id);
+            }
+            return true;
         }
         if (!have_imu_transform_) {
             try {
@@ -2788,7 +2883,38 @@ private:
             lidar.t_bl.x(), lidar.t_bl.y(), lidar.t_bl.z());
     }
 
-    sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::ConstSharedPtr& imu_raw, 
+    // publish_extrinsic_tf companion for the IMU (2026-07-11): only fires
+    // when a YAML q_ib/t_ib is actually configured — unlike the earlier
+    // "asserting identity would be a guess" objection, here the mounting IS
+    // known. Same collision guard as the LiDAR latch. Called once from
+    // updateImuTransform's YAML path (the /tf_static publish is a
+    // non-blocking DDS write; one-shot).
+    void latchImuExtrinsicTf(const std::string& source_frame_id)
+    {
+        if (!publish_extrinsic_tf_ || !static_br_ || !have_yaml_imu_extrinsic_) {
+            return;
+        }
+        if (source_frame_id.empty() || source_frame_id == this->frame_id) {
+            return;
+        }
+        if (tf_buffer_ && tf_buffer_->_frameExists(source_frame_id)) {
+            RCLCPP_WARN(this->get_logger(),
+                "[RESPLE] publish_extrinsic_tf: IMU frame '%s' already exists in "
+                "the TF tree - not latching %s -> %s to avoid a two-owner conflict.",
+                source_frame_id.c_str(), this->frame_id.c_str(), source_frame_id.c_str());
+            return;
+        }
+        geometry_msgs::msg::TransformStamped ts = yaml_imu_tf_;
+        ts.header.stamp = this->now();
+        ts.header.frame_id = this->frame_id;
+        ts.child_frame_id = source_frame_id;
+        static_br_->sendTransform(ts);
+        RCLCPP_INFO(this->get_logger(),
+            "[RESPLE] latched static IMU extrinsic TF %s -> %s from YAML q_ib/t_ib",
+            this->frame_id.c_str(), source_frame_id.c_str());
+    }
+
+    sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::ConstSharedPtr& imu_raw,
                                                    const geometry_msgs::msg::TransformStamped& transform)
     {
         sensor_msgs::msg::Imu::SharedPtr imu(new sensor_msgs::msg::Imu);
@@ -2928,7 +3054,8 @@ private:
             sensor_msgs::msg::Imu::SharedPtr transformed_imu = transformImu(imu_msg, imu_to_baselink_);
             imu_int_buff.push_back(transformed_imu);
         } else {
-            // Transform not yet available — pass through (assumes IMU already in base_link frame)
+            // Transform not yet available — pass through (assumes IMU already
+            // in the body frame; set q_ib/t_ib in YAML mode if it is not)
             imu_int_buff.push_back(imu_msg);
         }
       } catch (const std::exception& e) {
@@ -3123,7 +3250,8 @@ private:
             const uint64_t tf_same = tf_own_monitor_.foreignSamePair();
             const uint64_t tf_parent = tf_own_monitor_.foreignOtherParent();
             const bool tf_active = tf_own_monitor_.foreignActiveWithin(
-                this->now().nanoseconds(), tf_conflict_quiet_ns_);
+                    this->now().nanoseconds(), tf_conflict_quiet_ns_)
+                || tf_own_monitor_.foreignStaticSeen();
             const bool tf_yielding = tf_yield_active_.load(std::memory_order_relaxed);
             stat.add("TF Foreign Publishes Same Pair (cumulative)", static_cast<int>(tf_same));
             stat.add("TF Foreign Parent Claims (cumulative)", static_cast<int>(tf_parent));
@@ -3810,8 +3938,12 @@ private:
             // (odometry topics above keep flowing) instead of fighting it —
             // interleaved publishers make the pose flicker. Resumes
             // automatically once the intruder goes quiet.
+            // Sticky static claims hold the yield regardless of the quiet
+            // window: a foreign /tf_static transform lives in consumers'
+            // buffers forever (cleared only by a lifecycle re-configure).
             const bool yield_now = tf_conflict_action_ == "yield"
-                && tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_);
+                && (tf_own_monitor_.foreignActiveWithin(this->now().nanoseconds(), tf_conflict_quiet_ns_)
+                    || tf_own_monitor_.foreignStaticSeen());
             tf_yield_active_.store(yield_now, std::memory_order_relaxed);
             if (yield_now) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -4063,7 +4195,8 @@ private:
                 if (window_ok) {
                     // Rotate sensor-frame gravity into base_link when the IMU
                     // mounting rotation is known (finding #9): pre-init samples
-                    // are buffered RAW. No-op in YAML-only mode.
+                    // are buffered RAW. In YAML mode this rotates only when
+                    // q_ib/t_ib is configured (identity default = no-op).
                     if (updateImuTransform(imu_frame_id_)) {
                         const Eigen::Quaterniond R_bi(
                             tf2::transformToEigen(imu_to_baselink_).rotation());
