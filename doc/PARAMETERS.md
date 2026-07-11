@@ -52,6 +52,7 @@ odometry never depends on. Launch files start it only with `use_mapping:=true`
 | `traj_path` | `nav_msgs/Path` | Trajectory history (capped at 10 000 poses) |
 | `active_control_points` | `sensor_msgs/PointCloud` | The 4 active B-spline knots |
 | `global_map` | `sensor_msgs/PointCloud2` | Accumulated map cloud |
+| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | Mapping health (2026-07-11): replica knots, est_window queue depth/drops, scan funnel + cap drops, TF-guard verdicts; WARN on drops, ERROR on an active TF conflict |
 
 ### `estimate_msgs/Diagnostics` (the `resple_diagnostics` topic)
 
@@ -86,7 +87,7 @@ for the authoritative field list.
 | `cov_pose`, `cov_twist` | `[0.2, 0.2, 0.2, 0.1, 0.1, 0.1]` | Diagonals for the Mapping node's odometry covariance (position/linear first three, orientation/angular last three) |
 | `tf_extrinsics` | `true` | `true`: the `base_link ← sensor` TF carries the mounting extrinsic (production convention; YAML `q_lb`/`t_lb` is an *extra* offset, normally identity). `false`: no TF consulted; clouds/IMU stay in their native frames and YAML `q_lb`/`t_lb` is the single extrinsic (upstream/dataset-replay convention). **Set per-rig in each config YAML** (next to `q_lb`/`t_lb`), not in the launch — the dataset configs ship `false`, the production/template configs ship `true`. Never publish a TF that duplicates a non-identity YAML extrinsic: the two compose and cancel. |
 | `tf_wait_timeout` | `10.0` | Seconds to wait for the sensor TF before falling back to the YAML-only convention (was: scans dropped forever) |
-| `publish_extrinsic_tf` | `false` | When the YAML `q_lb`/`t_lb` convention is in effect (`tf_extrinsics: false`, or the `tf_wait_timeout` fallback fired), latch `frame_id → <cloud header frame>` **once on `/tf_static`** with exactly the `T_base←sensor` the estimator applies — so the TF tree is complete without an external `static_transform_publisher` (which has leaked stale extrinsics across replay runs before). LiDAR frames only (RESPLE has no YAML IMU extrinsic — an identity `base → imu` assertion would be a guess). Skipped with a WARN if the sensor frame already exists in the TF tree (a bag's own `/tf_static`, a URDF) — prefix RESPLE's frames in that case, see `config_07052026.yaml`. |
+| `publish_extrinsic_tf` | `false` | When the YAML `q_lb`/`t_lb` convention is in effect (`tf_extrinsics: false`, or the `tf_wait_timeout` fallback fired), latch `frame_id → <cloud header frame>` **once on `/tf_static`** with exactly the `T_base←sensor` the estimator applies — so the TF tree is complete without an external `static_transform_publisher` (which has leaked stale extrinsics across replay runs before). LiDAR frames always; the IMU frame too **when `q_ib`/`t_ib` is configured** (2026-07-11 — the mounting is then known, unlike the identity-guess case). Skipped with a WARN if the sensor frame already exists in the TF tree (a bag's own `/tf_static`, a URDF) — prefix RESPLE's frames in that case, see `config_07052026.yaml`. |
 | `tf_conflict_action` | `"warn"` | TF ownership guard (both nodes, shared name): what to do when **another node** publishes the TF pair this node broadcasts (RESPLE: `odom → frame_id`; Mapping: `map → odom`; post-inversion). `"warn"` = throttled ERROR + diagnostics, transforms unchanged. `"yield"` = keep publishing odometry/path **topics** but suspend our own TF broadcast while the foreign publisher is active — resumes automatically once it goes quiet for `tf_conflict_quiet_sec`. Self-published transforms are recognized by exact stamp match, so the guard never trips on its own DDS loopback. Also detects the watched **child** frame being claimed by a *different* parent (a TF child has exactly one parent — two parents break the tree even without a same-pair collision). See "TF ownership" below. |
 | `tf_conflict_quiet_sec` | `5.0` | How long the foreign publisher must stay quiet before `yield` resumes our broadcast (also the window for the `tf_conflict_active` diagnostic). |
 | `tf_absent_warn_sec` | `10.0` | Reverse misconfiguration check: when `publish_tf` is **false** (an external owner is expected — e.g. the odom EKF), WARN once if *nobody* has published the pair after this many seconds. `0` disables. |
@@ -135,6 +136,16 @@ publishing `odom → base_footprint`, nobody collides on a *pair*, but the URDF
 static `base_footprint → base_link` plus RESPLE's `odom → base_link` give
 `base_link` **two parents** — the tree is just as broken. The guard reports
 this as a foreign-parent claim.
+
+Two guard refinements (2026-07-11): a foreign transform arriving on
+`/tf_static` is **sticky** — tf2 buffers keep static transforms forever, so
+the conflict persists for every running consumer even if the publisher dies;
+`yield` therefore holds until a lifecycle re-configure, and the pre-`/clock`
+sim-time corner can no longer age the claim out of the freshness window. And
+the absence check now **re-arms**: with `publish_tf: false`, an external
+owner that published and then *died mid-run* triggers a fresh one-shot WARN
+("owner stopped publishing"), distinct from the never-wired-up case; it
+re-arms each time the owner resumes.
 
 Worked example — `robot_localization` odom EKF fusing wheel odometry +
 RESPLE (illustrative; tune the config vectors to your platform). RESPLE side:
@@ -205,6 +216,7 @@ when the robot starts on a slope or is already moving at launch.
 | `range_ref` | `3.0` | Close-range down-weighting reference (m): point variance is inflated by `(range_ref/r)²` for `r < range_ref` so one nearby surface cannot dominate the update. **Absolute, not relative** — in a narrow space where every return is close it starves the whole update (9× at 1 m walls, 36× at 0.5 m) and the estimator gets jittery. Lower it (e.g. `1.0`) or set `0` (off) for narrow-tunnel missions |
 | `range_noise_scale_max` | `900.0` | Cap on that variance inflation (default = the old implicit `(3/0.1)²` ceiling) |
 | `cov_bias_acc_rw`, `cov_bias_gyro_rw` | `cov_RCP_pos_new·cov_sys_pos`, `cov_RCP_ort_new·cov_sys_ort` | LIO bias random-walk variance per knot step (rows 24–29 of Q). Defaults reproduce the magnitude the bias block received before the 2026-07-02 Q-indexing fix |
+| `q_ib`, `t_ib` | identity, `[0,0,0]` | **YAML IMU extrinsic** (2026-07-11): `p_imu = q_ib · p_body + t_ib`, the same direction convention as the per-lidar `q_lb`/`t_lb`. Only consulted in the YAML convention (`tf_extrinsics: false`) — TF mode gets the IMU mounting from the tree. When non-identity, IMU samples are rotated (with the lever-arm correction) through the same `transformImu` path TF mode uses, and gravity init applies the rotation too; previously a tilted IMU was **silently fused unrotated** in YAML mode. Identity default = the legacy pass-through, bit-identical. Also latched to `/tf_static` under `publish_extrinsic_tf` (the mounting is known here, unlike the identity-guess case) |
 
 ### Estimator core
 
@@ -302,6 +314,14 @@ same metrics in `/diagnostics`):
 `config_low_resource.yaml` bundles the recommended values (budget 200 ms,
 decay 0.9, 3 OpenMP + 2 executor threads, both publishers gated, Mapping
 assumed off).
+
+**Validation harness:** `scripts/overload_rehearsal.sh <bag>` runs the same
+bag three times under a CPU constraint (baseline / `max_latency_ms` /
+`+ gap_extrap_decay`) and prints the per-leg overload metrics side by side —
+including the max pose step, the "jump" this hardening exists to remove. Run
+it on the target machine with a representative bag; CI's bag-free
+`e2e-smoke` job (`scripts/e2e_smoke.sh`) covers gross pipeline regressions
+but not this closed-loop behaviour.
 
 Caveats: `rt_factor` reads ≈1 *by design* once shedding is active (data time
 is fast-forwarded) — read it together with `shed_scans`; `backlog_ms` is the

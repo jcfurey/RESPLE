@@ -322,7 +322,7 @@ directory). Summary:
 | 2   | Concurrency hardening              | 2.1 + 2.2 subsumed by 1.5; 2.3 capability landed (default-off scan cap); 2.5 #1 fixed |
 | 3   | Spline / mapping accuracy          | 3.1 knot pruning done; 3.2 instrumented/parameterized (tuning pending bags); 3.3 detection + recovery (off/hold/reset) done; 3.4 radius pruning done (off by default) |
 | 4   | Diagnostics publisher              | done (`estimate_msgs/Diagnostics` on `resple_diagnostics`, ~20 Hz typed; see HARDENING §4) |
-| 5   | Regression tests                   | done except bag-gated smoke (CI: ROS-free + ASan/UBSan + ikd-Tree TSan jobs; Eigen-pin + STATIC_ROOT_NODE leak fixed via the ASan gate) |
+| 5   | Regression tests                   | done except bag-gated ACCURACY test (CI: ROS-free + ASan/UBSan + ikd-Tree TSan + the 2026-07-11 bag-free `e2e-smoke` job — full node driven by `data_injector`'s stationary scene, pose must hold the origin; `scripts/overload_rehearsal.sh` covers the bag A/B manually) |
 
 ### Known hazards (compact view)
 
@@ -455,7 +455,8 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `publish_current_scan` / `publish_est_window` | publisher gates; est_window may only be disabled with Mapping off (its sole input) | `true` |
 | `map/max_scan_buffer` / `map/publish_min_interval_ms` | Mapping: per-sensor buffer cap (was silent hardcoded 200; drops now counted) / batch-don't-drop `/global_map` interval (0 = per-scan) | `200` / `0` |
 | `tf_conflict_action` | TF ownership guard, both nodes: `warn` (throttled ERROR + diagnostics) or `yield` (suspend own TF while a foreign publisher on the pair is active; topics keep flowing) | `warn` |
-| `tf_conflict_quiet_sec` / `tf_absent_warn_sec` | yield-resume quiet window / one-shot WARN when `publish_tf=false` but nobody publishes the pair (0 = off) | `5.0` / `10.0` |
+| `tf_conflict_quiet_sec` / `tf_absent_warn_sec` | yield-resume quiet window / WARN when `publish_tf=false` but nobody publishes the pair — one-shot for never-wired, re-armed per outage when the owner dies mid-run; foreign /tf_static claims are sticky (yield holds until re-configure) | `5.0` / `10.0` |
+| `q_ib` / `t_ib` | YAML IMU extrinsic (`p_imu = q_ib·p_body + t_ib`, q_lb convention); only in `tf_extrinsics=false` mode — rotates IMU samples + gravity init through the transformImu path (was: tilted IMU silently fused unrotated). Identity = legacy pass-through | identity |
 
 **Clock domains (2026-07-08 audit):** all *wait-for-data* timeouts and
 data-facing windows (`tf_wait_timeout`, `lo_imu_wait_timeout`, init-attitude
