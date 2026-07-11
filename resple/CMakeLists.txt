@@ -349,7 +349,12 @@ if(BUILD_TESTING)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/test_spline_state.cpp)
     ament_add_gtest(test_spline_state test/test_spline_state.cpp)
     target_include_directories(test_spline_state PRIVATE include)
-    ament_target_dependencies(test_spline_state estimate_msgs)
+    # ament_target_dependencies() was removed in ament_cmake 2.8 (ROS
+    # 'lyrical'). Link the message package's exported typesupport targets
+    # directly — ${estimate_msgs_TARGETS} (populated by find_package via
+    # ament_auto_find_build_dependencies) carries include dirs + libs as
+    # modern-CMake usage requirements, the same thing the old macro added.
+    target_link_libraries(test_spline_state ${estimate_msgs_TARGETS})
     if(TARGET Eigen3::Eigen)
       target_link_libraries(test_spline_state Eigen3::Eigen)
     endif()
@@ -396,9 +401,15 @@ if(BUILD_TESTING)
         get_filename_component(_it_name ${_it_src} NAME_WE)
         ament_add_gtest(${_it_name} ${_it_src})
         target_include_directories(${_it_name} PRIVATE include)
-        # ament_auto exposes the package's resolved deps (sensor_msgs, PCL, ...)
-        ament_target_dependencies(${_it_name}
-          ${${PROJECT_NAME}_FOUND_BUILD_DEPENDS})
+        # ament_auto exposes the package's resolved deps (sensor_msgs, PCL, ...).
+        # ament_target_dependencies() was removed in ament_cmake 2.8; link each
+        # dep's exported targets instead. Deps that export no *_TARGETS (PCL)
+        # are linked explicitly just below.
+        foreach(_dep ${${PROJECT_NAME}_FOUND_BUILD_DEPENDS})
+          if(DEFINED ${_dep}_TARGETS)
+            target_link_libraries(${_it_name} ${${_dep}_TARGETS})
+          endif()
+        endforeach()
         target_link_libraries(${_it_name} ${PCL_LIBRARIES})
         if(BLAS_FOUND)
           target_link_libraries(${_it_name} ${BLAS_LIBRARIES})

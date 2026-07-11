@@ -35,6 +35,11 @@
   <depend>tf2_sensor_msgs</depend>
   <!-- Phase 4: Advanced ROS 2 features -->
   <depend>diagnostic_updater</depend>
+  <!-- diagnostic_updater's headers pull in diagnostic_msgs; declare it directly
+       ("include what you use") — ament_cmake 2.8's modern-target linking no
+       longer propagates a transitive dep's include dirs the way the removed
+       ament_target_dependencies did. -->
+  <depend>diagnostic_msgs</depend>
   <depend>rclcpp_action</depend>
   <depend>rclcpp_lifecycle</depend>
 
