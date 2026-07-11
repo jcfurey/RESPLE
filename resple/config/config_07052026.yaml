@@ -60,14 +60,13 @@
                                      # spline body frame (sensors TF'd into
                                      # this).
 
-    odom/publish_tf: True            # RESPLE broadcasts the odom->base_link TF
-    odom/invert_tf: False             # invert the odom->base_link broadcast direction
-    map/publish_tf: True             # Mapping node broadcasts the map->odom TF
-    map/invert_tf: False              # invert the map->odom broadcast direction
+    odom/publish_tf: True            # RESPLE broadcasts the resple_odom->resple_base_link TF
+    odom/invert_tf: False             # invert the broadcast direction
+    map/publish_tf: True             # Mapping node broadcasts the resple_map->resple_odom TF
+    map/invert_tf: False              # invert the broadcast direction
 
     cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
     cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
-    publish_tf: true            # DEAD param (unused no-op); real toggles are odom/publish_tf and map/publish_tf
 
     topic_imu: /ouster/imu
     acc_ratio: false                 # Ouster IMU publishes accel in m/s^2

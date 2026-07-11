@@ -9,8 +9,15 @@ name: unit-tests
 #    Needs PCL point types (plain libpcl-dev, still no ROS). TSan slows the
 #    stress ~30x, so this is a separate job with its own generous timeout.
 #
-# Still pending from the Phase 5 table: a bag-replay smoke test — blocked on a
-# representative bag being available to CI.
+#  - e2e-smoke: bag-FREE end-to-end gate (2026-07-11) — installs ROS 2 Jazzy,
+#    builds the real node, drives it with data_injector's deterministic
+#    stationary scene, and asserts the pose holds the origin, /odom flows,
+#    NIS never DIVERGES and the TF guard stays quiet (scripts/e2e_smoke.sh).
+#    Catches gross pipeline regressions in ~10 min without a bag.
+#
+# Still pending from the Phase 5 table: a bag-replay ACCURACY test (APE/RPE on
+# a real dataset) — blocked on a representative bag being available to CI;
+# scripts/overload_rehearsal.sh covers it manually on developer machines.
 on:
   push:
     branches: ["**"]
@@ -71,3 +78,30 @@ jobs:
         run: |
           TSAN_OPTIONS="halt_on_error=1:suppressions=$PWD/resple/test/tsan_suppressions.txt" \
             ./build/tsan/test_ikdtree_concurrency
+
+  e2e-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ROS 2 Jazzy + build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl gnupg lsb-release ca-certificates
+          sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+            -o /usr/share/keyrings/ros-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+            | sudo tee /etc/apt/sources.list.d/ros2.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git python3-numpy python3-dev python3-yaml \
+            libeigen3-dev libyaml-cpp-dev libblas-dev liblapack-dev libomp-dev \
+            ros-jazzy-ros-base ros-dev-tools python3-colcon-common-extensions \
+            libpcl-dev ros-jazzy-pcl-conversions \
+            ros-jazzy-visualization-msgs ros-jazzy-nav-msgs ros-jazzy-std-srvs \
+            ros-jazzy-tf2-ros ros-jazzy-tf2-eigen \
+            ros-jazzy-tf2-geometry-msgs ros-jazzy-tf2-sensor-msgs \
+            ros-jazzy-rclcpp-lifecycle ros-jazzy-rclcpp-action ros-jazzy-rclcpp-components \
+            ros-jazzy-diagnostic-updater ros-jazzy-ament-cmake-gtest
+      - name: Build + run smoke
+        run: SECONDS_RUN=45 ./scripts/e2e_smoke.sh

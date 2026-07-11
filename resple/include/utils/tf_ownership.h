@@ -54,6 +54,12 @@ enum class Verdict {
 
 class TfOwnershipMonitor {
  public:
+  // Self-stamp ring capacity. Sizing invariant: must exceed the worst-case
+  // publish BURST between executor turns — the dense back-fill's 1 kHz clamp
+  // x 1 s history cap (RESPLE.cpp) = ~1001 stamps. Public so the tests and
+  // the dense-publish clamp can pin the invariant against this constant.
+  static constexpr std::size_t kRingSlots = 1024;
+
   // (Re)arm the monitor for the pair actually broadcast (post-invert_tf).
   // Resets all state — call from on_configure so lifecycle re-cycles start
   // clean.
@@ -68,12 +74,20 @@ class TfOwnershipMonitor {
     foreign_other_parent_ = 0;
     last_foreign_ns_ = kNever;
     pair_seen_ = false;
+    foreign_static_ = false;
+    last_pair_seen_ns_ = 0;
   }
 
   // Record the header stamp (ns) of a transform THIS node just broadcast on
-  // /tf. Bounded ring: at <= ~100 Hz publishes and <= O(100 ms) DDS + executor
-  // delivery latency, 256 slots give seconds of slack before a self stamp can
-  // be evicted while its echo is still in flight.
+  // /tf. Bounded ring; the sizing invariant is the WORST-CASE BURST, not the
+  // steady rate: the dense back-fill (odom/dense_pub_hz, clamped <= 1 kHz,
+  // history cap 1 s) can emit up to ~1001 stamps in one tight worker loop,
+  // and the executor may not drain the DDS loopback echoes until the burst
+  // finishes — every stamp of the burst must still be in the ring when its
+  // own echo classifies, or the node flags itself FOREIGN (log spam in
+  // 'warn', a self-inflicted TF hole in 'yield'). kRingSlots = 1024 covers
+  // that burst with margin; steady state (<= ~100 Hz publishes, O(100 ms)
+  // loopback latency) uses a tiny fraction of it.
   void notePublished(int64_t stamp_ns) {
     std::lock_guard<std::mutex> lk(m_);
     ring_[ring_next_] = stamp_ns;
@@ -91,13 +105,22 @@ class TfOwnershipMonitor {
     }
   }
 
-  // Classify one observed transform. now_ns is a MONOTONIC node-side clock
-  // (std::chrono::steady_clock), used only for the freshness window — never
-  // compared against the message stamp.
+  // Classify one observed transform. now_ns is the NODE clock (sim-time
+  // aware; see foreignActiveWithin), used for the freshness window and the
+  // last-pair-seen tracking — never compared against the message stamp.
+  //
+  // from_static marks a /tf_static delivery. A FOREIGN static claim is
+  // STICKY (foreignStaticSeen): tf2 buffers keep static transforms forever,
+  // so the conflict persists for every already-running consumer even if the
+  // publisher dies — and unlike dynamic conflicts it cannot "go quiet".
+  // Stickiness also closes the sim-time corner where a static foreign
+  // transform delivered before the first /clock message (now_ns == 0) would
+  // otherwise age out of the freshness window immediately.
   Verdict classify(const std::string& parent_seen,
                    const std::string& child_seen,
                    int64_t stamp_ns,
-                   int64_t now_ns) {
+                   int64_t now_ns,
+                   bool from_static = false) {
     std::lock_guard<std::mutex> lk(m_);
     if (!frameEq(child_seen, child_)) {
       return Verdict::UNRELATED;
@@ -105,9 +128,11 @@ class TfOwnershipMonitor {
     if (!frameEq(parent_seen, parent_)) {
       ++foreign_other_parent_;
       last_foreign_ns_ = now_ns;
+      if (from_static) foreign_static_ = true;
       return Verdict::FOREIGN_OTHER_PARENT;
     }
     pair_seen_ = true;
+    last_pair_seen_ns_ = now_ns;
     for (const int64_t s : ring_) {
       if (s == stamp_ns) return Verdict::SELF;
     }
@@ -116,6 +141,7 @@ class TfOwnershipMonitor {
     }
     ++foreign_same_pair_;
     last_foreign_ns_ = now_ns;
+    if (from_static) foreign_static_ = true;
     return Verdict::FOREIGN_SAME_PAIR;
   }
 
@@ -138,6 +164,15 @@ class TfOwnershipMonitor {
     return dt <= window_ns && dt >= -window_ns;
   }
 
+  // True once a FOREIGN transform arrived via /tf_static (sticky — see
+  // classify). The 'yield' action must hold while this is set regardless of
+  // the freshness window: the static claim lives in consumers' tf2 buffers
+  // permanently. Cleared only by configure() (lifecycle re-cycle).
+  bool foreignStaticSeen() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return foreign_static_;
+  }
+
   // True once the watched pair has been observed at all (self or foreign).
   // With publish_tf=false the ring stays empty, so any same-pair observation
   // sets this — the absence check ("external owner expected but nobody
@@ -145,6 +180,16 @@ class TfOwnershipMonitor {
   bool pairSeen() const {
     std::lock_guard<std::mutex> lk(m_);
     return pair_seen_;
+  }
+
+  // Node-clock time of the most recent exact-pair observation (self or
+  // foreign); 0 = never (also the pre-/clock sim-time reading, which is the
+  // conservative interpretation). Lets the absence check RE-ARM: with
+  // publish_tf=false, an external owner that published and then died shows
+  // up as this going stale — distinct from "never wired up".
+  int64_t lastPairSeenNs() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return last_pair_seen_ns_;
   }
 
   uint64_t foreignSamePair() const {
@@ -173,8 +218,8 @@ class TfOwnershipMonitor {
   static constexpr int64_t kNever = INT64_MIN;
   static constexpr std::size_t kMaxStaticStamps = 8;
 
-  static std::array<int64_t, 256> unsetRing() {
-    std::array<int64_t, 256> a;
+  static std::array<int64_t, kRingSlots> unsetRing() {
+    std::array<int64_t, kRingSlots> a;
     a.fill(kUnsetStamp);
     return a;
   }
@@ -198,13 +243,15 @@ class TfOwnershipMonitor {
   std::string child_;
   // Pre-filled with kUnsetStamp so a default-constructed monitor can never
   // false-match a real stamp (configure() also re-fills).
-  std::array<int64_t, 256> ring_ = unsetRing();
+  std::array<int64_t, kRingSlots> ring_ = unsetRing();
   std::size_t ring_next_ = 0;
   std::vector<int64_t> static_stamps_;
   uint64_t foreign_same_pair_ = 0;
   uint64_t foreign_other_parent_ = 0;
   int64_t last_foreign_ns_ = kNever;
   bool pair_seen_ = false;
+  bool foreign_static_ = false;      // sticky /tf_static foreign claim
+  int64_t last_pair_seen_ns_ = 0;    // node-clock; 0 = never
 };
 
 }  // namespace tfown

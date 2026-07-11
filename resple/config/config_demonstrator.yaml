@@ -15,7 +15,6 @@
 
     cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
     cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
-    publish_tf: true            # DEAD param (unused no-op); real toggles are odom/publish_tf and map/publish_tf
 
     topic_imu: /imu/data
     acc_ratio: true

@@ -120,6 +120,12 @@ slow-varying drift-correction frame trades latency for accuracy.
   `yield` mode the latch is skipped — not consumed — while a foreign
   owner is active.
 
+**Diagnostics (2026-07-11):** Mapping publishes string-keyed health on
+`/diagnostics` (replica knot count, est_window queue depth and drops, the
+per-sensor scan funnel with cap drops, and the TF-guard verdicts, with
+WARN/ERROR escalation) — previously all of this surfaced only in throttled
+logs. The typed `resple_diagnostics` msg remains RESPLE-side only.
+
 **Do not feed Mapping's `odometry` topic to a fusion EKF.** Its pose is in
 the `map` frame and its covariance is the static `cov_pose`/`cov_twist`
 config diagonal — it exists for visualization parity. The fusion input is

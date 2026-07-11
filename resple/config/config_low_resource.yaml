@@ -18,8 +18,6 @@
 # content).
 /**:
   ros__parameters:
-    # Frame IDs for TF tree
-
     # TF ownership: this file's defaults assume RESPLE owns odom->base_link
     # and Mapping owns map->odom. Running inside a larger stack (wheel-odom
     # EKF owning the odom frame, a global localizer owning map)? Set
