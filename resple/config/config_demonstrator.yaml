@@ -3,7 +3,12 @@
 # Copy and adapt topics/extrinsics for your own platform.
 /**:
   ros__parameters:
-    # Frame IDs for TF tree
+    # Frame IDs for TF tree. Defaults: RESPLE owns odom->base_link, the
+    # optional Mapping node owns map->odom. Running inside a larger stack
+    # (an odom EKF owning odom->base, a global localizer owning map)? Set the
+    # matching publish_tf flag False and let the external owner publish — the
+    # runtime guard below catches a wrong flag. Recipe: doc/PARAMETERS.md
+    # "TF ownership".
     odom/frame_id: odom              # Odom (odometry frame_id) frame
     map/frame_id: map                # Map frame (Mapping node publications)
     frame_id: base_link              # Robot (odometry child_frame_id) frame
@@ -95,3 +100,25 @@
     max_scan_buffer: 0             # per-LiDAR raw-scan cap (scans, drop-oldest);
                                    # 0 = unbounded
     max_imu_staging: 2000          # IMU staging cap (samples, drop-oldest)
+
+    # TF ownership guard (both nodes; see the frame block at the top and
+    # doc/PARAMETERS.md "TF ownership"). Detects another node publishing the
+    # TF pair this node owns. Self-broadcasts are stamp-matched out, so the
+    # guard never trips on its own transforms.
+    tf_conflict_action: "warn"     # "warn" = throttled ERROR + diagnostics;
+                                   # "yield" = additionally suspend OUR TF
+                                   # broadcast while a foreign owner is active
+                                   # (topics keep flowing). Keep quotes.
+    tf_conflict_quiet_sec: 5.0     # quiet window before yield resumes
+    tf_absent_warn_sec: 10.0       # with publish_tf: False: one-shot WARN if
+                                   # nobody publishes the pair within this
+                                   # (0 = off)
+
+    # This rig runs the YAML extrinsic convention (tf_extrinsics: false), so
+    # the sensor frames dangle by default; publish_extrinsic_tf latches
+    # frame_id -> <cloud frame> once on /tf_static from q_lb/t_lb, and q_ib/
+    # t_ib (below, identity here) supplies the IMU mounting if it is not
+    # already in the body frame. See doc/PARAMETERS.md.
+    publish_extrinsic_tf: false    # true = latch the base->sensor extrinsic
+    q_ib: [1.0, 0.0, 0.0, 0.0]     # YAML IMU extrinsic (w,x,y,z); identity =
+    t_ib: [0.0, 0.0, 0.0]          # IMU already in the body frame (legacy)
