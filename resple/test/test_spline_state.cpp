@@ -485,3 +485,27 @@ TEST(SplineQuery, QOutWrittenForAllPointerCombinations)
         EXPECT_LT(q_both.angularDistance(q_ref), 1e-12) << "t=" << t;
     }
 }
+
+// --- Regression twin of the above for w_out: the (q_out, w_out, J_q!=null,
+// --- J_w==null) combination entered the Jacobian branch, whose only w_out
+// --- write was gated on J_w — leaving a requested angular velocity unwritten
+// --- (caller-side garbage). No production caller passes this combo today, but
+// --- the "write every non-null out-param" contract must hold for w_out too.
+
+TEST(SplineQuery, WOutWrittenOnJQOnlyPath)
+{
+    SplineState s = makeSpline(40);
+    for (int64_t t : {s.minTimeNs(), s.minTimeNs() + 37 * kDtNs / 10,
+                      (s.minTimeNs() + s.maxTimeNs()) / 2, s.maxTimeNs()}) {
+        Eigen::Vector3d w_ref;
+        s.itpQuaternion(t, nullptr, &w_ref);  // plain path: known-good angular velocity
+
+        const Eigen::Vector3d poison(1e300, 1e300, 1e300);
+        Eigen::Quaterniond q = Eigen::Quaterniond(1e300, -3.14, 42.0, 7.7);
+        Eigen::Vector3d w = poison;
+        Jacobian43 J_q;
+        s.itpQuaternion(t, &q, &w, &J_q, nullptr);  // J_q set, J_w null
+        ASSERT_NE(w.x(), poison.x()) << "w_out not written (J_q-only path) t=" << t;
+        EXPECT_LT((w - w_ref).norm(), 1e-12) << "w_out wrong (J_q-only path) t=" << t;
+    }
+}

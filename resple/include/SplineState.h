@@ -520,6 +520,22 @@ class SplineState
                     J_w->d_val_d_knot[i] = dw_dslot[(4 - size_J) + i];
                 }
 
+            } else if (w_out) {
+                // Symmetric twin of the q_out write above (2026-07-02 finding).
+                // On the J_q-only path (J_w == nullptr) a requested w_out was
+                // left unwritten — the caller's (uninitialized) vector survived.
+                // No production caller passes this combination today, but the
+                // "write every non-null out-param" contract now holds for w_out
+                // as it does for q_out. Value only; the Jacobian is produced
+                // solely via a non-null J_w. Mirrors the recursion in the
+                // non-Jacobian branch below and the if(J_w) block above.
+                baseCoeffsWithTime<1>(p, u);
+                dcoeff = inv_dt * cumulative_blending_matrix * p;
+                w_itps[0].setZero();
+                w_itps[1] = 2 * dcoeff[1] * t_delta[1];
+                w_itps[2] = q_delta_scale[2].inverse() * w_itps[1] + 2 * dcoeff[2] * t_delta[2];
+                w_itps[3] = q_delta_scale[3].inverse() * w_itps[2] + 2 * dcoeff[3] * t_delta[3];
+                *w_out = w_itps[3];
             }
         } else {
             t_delta_scale[0] = t_delta[0] * coeff[0];
