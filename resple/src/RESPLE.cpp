@@ -327,12 +327,20 @@ public:
         // transient_local so a latched foreign static transform on our pair is
         // seen even if it was published before we activated). Default callback
         // group: the callback is O(frames) string compares, no heavy work.
-        sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
-            "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
-            [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, false); });
-        sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
-            "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
-            [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, true); });
+        //
+        // Only subscribe when the guard can actually act: we OWN the pair
+        // (publish_tf → conflict detection / yield), or the absence check is
+        // armed (publish_tf=false but tf_absent_warn_sec>0 → "external owner
+        // expected"). A demoted node with the absence check off has nothing to
+        // defend and nothing to watch for — skip the /tf processing entirely.
+        if (publish_tf || tf_absent_warn_sec_ > 0.0) {
+            sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+                "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
+                [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, false); });
+            sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+                "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
+                [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, true); });
+        }
         tf_absence_wait_.reset();  // window (re)starts at first valid clock sample
 
         // Start processing thread. The exited-flag store is the lambda's last

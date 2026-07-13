@@ -1123,13 +1123,18 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         sub_est = this->create_subscription<estimate_msgs::msg::Estimate>("est_window", large_reliable_qos,
             std::bind(&Mapping::getEstCallback, this, std::placeholders::_1));
         // TF ownership guard: raw /tf + /tf_static watchers (mirror of the
-        // RESPLE node's; see tfWatchCallback there for the rationale).
-        sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
-            "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
-            [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, false); });
-        sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
-            "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
-            [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, true); });
+        // RESPLE node's; see tfWatchCallback there for the rationale). Only
+        // subscribe when the guard can act — we own map->odom (publish_tf) or
+        // the absence check is armed (tf_absent_warn_sec>0). A demoted node
+        // with the absence check off skips the /tf processing entirely.
+        if (publish_tf || tf_absent_warn_sec_ > 0.0) {
+            sub_tf_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+                "/tf", rclcpp::QoS(rclcpp::KeepLast(100)),
+                [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, false); });
+            sub_tf_static_watch_ = this->create_subscription<tf2_msgs::msg::TFMessage>(
+                "/tf_static", rclcpp::QoS(rclcpp::KeepLast(100)).transient_local(),
+                [this](const tf2_msgs::msg::TFMessage::SharedPtr msg) { tfWatchCallback(msg, true); });
+        }
         tf_absence_wait_.reset();  // window (re)starts at first valid clock sample
         
         // Start processing thread (exited-flag store last, for the bounded
