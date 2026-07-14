@@ -237,6 +237,20 @@ inline bool convertCloud(const uint8_t* data, size_t data_size,
       static_cast<size_t>(num_points) * point_step > data_size) {
     return false;
   }
+  // Every used field must lie fully within one point stride. resolveLayout takes
+  // the field descriptors from the message verbatim; a malformed cloud can
+  // declare a field whose offset+size exceeds point_step, and readFieldAsDouble
+  // below would then read past the last point's row (OOB heap read on `data`).
+  const auto field_fits = [point_step](const FieldInfo& f) {
+    const size_t sz = datatypeSize(f.datatype);
+    return sz != 0 &&
+           static_cast<size_t>(f.offset) + sz <= static_cast<size_t>(point_step);
+  };
+  if (!field_fits(layout.x) || !field_fits(layout.y) || !field_fits(layout.z) ||
+      (layout.has_time && !field_fits(layout.time)) ||
+      (layout.has_intensity && !field_fits(layout.intensity))) {
+    return false;
+  }
   out.resize(num_points);
 
   double t_scale =

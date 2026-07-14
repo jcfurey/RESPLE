@@ -892,7 +892,13 @@ void KD_TREE<PointType>::Rebuild(KD_TREE_NODE **root)
         // RESPLE drains Points_deleted, so recording was an unbounded leak.
         flatten(*root, PCL_Storage, NOT_RECORD);
         delete_tree_nodes(root);
-        BuildTree(root, 0, PCL_Storage.size() - 1, PCL_Storage);
+        // Guard the empty flatten, matching Build() and multi_thread_rebuild():
+        // PCL_Storage.size()-1 underflows to SIZE_MAX and only the size_t->int
+        // conversion to a negative `r` keeps BuildTree's l>r base case benign.
+        // Explicit so a future index/signature change can't turn this into an
+        // out-of-bounds Storage[mid] read.
+        if (!PCL_Storage.empty())
+            BuildTree(root, 0, PCL_Storage.size() - 1, PCL_Storage);
         if (*root != nullptr)
             (*root)->father_ptr = father_ptr;
         if (*root == Root_Node)

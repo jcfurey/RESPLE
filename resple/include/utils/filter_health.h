@@ -36,7 +36,11 @@ namespace health {
 enum class FilterState { OK, WARN, DIVERGED };
 
 struct NisDetectorConfig {
-  // Sliding window length (number of updates) for the NIS mean.
+  // Tumbling (non-overlapping) window length in updates: a verdict is produced
+  // once per `window` samples over DISJOINT blocks (window_ is cleared after
+  // each), and breach_limit/recover_limit count CONSECUTIVE such blocks — so
+  // DIVERGED needs ~breach_limit*window sustained high-NIS samples. This is not
+  // a per-sample sliding mean.
   int window = 32;
   // WARN when windowed mean NIS exceeds warn_ratio * dof.
   double warn_ratio = 2.0;

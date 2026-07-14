@@ -32,8 +32,11 @@ namespace overload {
 //   * max_latency_ns <= 0  -> feature off, always 0.
 //   * Data time, same-LiDAR stamps: independent of bag playback rate, needs
 //     no wall clock, and survives sim-time jumps.
-//   * Never counts the last element: the newest queued scan is always kept,
-//     so the estimator keeps receiving data even when everything is "late".
+//   * Keeps the newest queued element UNLESS the caller pushes a fresh scan
+//     immediately after (the sole caller, pushScanBounded, always does): then a
+//     lone stale entry may be shed too, because the pushed scan becomes the
+//     newest content. See the final-element check in the body — a caller that
+//     does NOT push-after must not rely on the last element surviving.
 //   * Non-monotonic input (newest_ns older than the newest queued stamp,
 //     e.g. a bag loop restart) -> 0; the existing count-cap and the
 //     estimator's own admission gate handle that case.

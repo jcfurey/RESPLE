@@ -2383,7 +2383,16 @@ private:
             const int gap_free = CommonUtils::readParam<int>(
                 this->get_node_parameters_interface(), "gap_extrap_free_knots", 3);
             resple::overload::GapExtrapDamping gd;
-            gd.decay = gap_decay;
+            // Clamp out a negative decay: scale(k)=pow(decay,excess) sign-flips
+            // for odd excess when decay<0, which would push propRCP's gap
+            // extrapolation the WRONG direction. 0 = hard hold (the intended
+            // floor); >=1 = off.
+            if (gap_decay < 0.0) {
+                RCLCPP_WARN(this->get_logger(),
+                    "[RESPLE] gap_extrap_decay=%.3f < 0 is invalid; clamping to 0 (hard hold)",
+                    gap_decay);
+            }
+            gd.decay = std::max(0.0, gap_decay);
             gd.free_knots = std::max(0, gap_free);
             estimator_lo.gap_extrap = gd;
             estimator_lio.gap_extrap = gd;
@@ -3526,8 +3535,14 @@ private:
         size_t write_idx = 0;
         for (size_t i = 0; i < pc_last->points.size(); ++i) {
             const pcl::PointXYZINormal& pt = pc_last->points[i];
-            // Non-finite xyz would poison the ikd-Tree / IEKF downstream.
-            if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
+            // Non-finite xyz would poison the ikd-Tree / IEKF downstream. Include
+            // the per-point time (.intensity): a non-finite time-field value from
+            // the generic adapter would make ms2ns(NaN) a UB cast below and, once
+            // buffered, poison the deskew std::sort comparator (NaN breaks its
+            // strict-weak-ordering). The hand-written loaders drop it implicitly
+            // via their intensity>=0 gate; the generic path must gate it too.
+            if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z) ||
+                !std::isfinite(pt.intensity)) {
                 continue;
             }
             int64_t ofs = CommonUtils::ms2ns(pt.intensity);
@@ -3579,7 +3594,7 @@ private:
         // ship point_num > points.size(), which would OOB the points[i] loop below.
         plsize = std::min<int>(plsize, static_cast<int>(livox_msg_in->points.size()));
         pc_last->reserve(plsize);
-        int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds() - time_offset;
         LidarData& lidar_buffs = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -3649,7 +3664,7 @@ private:
         // ship point_num > points.size(), which would OOB the points[i] loop below.
         plsize = std::min<int>(plsize, static_cast<int>(livox_msg_in->points.size()));
         pc_last->reserve(plsize);
-        int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds() - time_offset;
         LidarData& lidar_buffs = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -3718,7 +3733,7 @@ private:
         // ship point_num > points.size(), which would OOB the points[i] loop below.
         plsize = std::min<int>(plsize, static_cast<int>(livox_msg_in->points.size()));
         pc_last->reserve(plsize);
-        int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds() - time_offset;
         LidarData& lidar_buffs = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -3784,7 +3799,7 @@ private:
         if (plsize == 0) return;
         pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(hesai_msg_in->header.stamp);
-        int64_t time_begin = timestamp_begin.nanoseconds();
+        int64_t time_begin = timestamp_begin.nanoseconds() - time_offset;
         LidarData& lidar_buffs_hesai = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs_hesai.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -3842,7 +3857,7 @@ private:
         if (plsize == 0) return;
         pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(livox_msg_in->header.stamp);
-        int64_t time_begin = timestamp_begin.nanoseconds();
+        int64_t time_begin = timestamp_begin.nanoseconds() - time_offset;
         LidarData& lidar_buffs_boxi = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs_boxi.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -4380,9 +4395,21 @@ private:
             // and the subscription is destroyed in on_deactivate / on_cleanup.
             {
                 std::lock_guard<std::mutex> lock(m_buff);
+                // Purge the pre-init IMU staged for gravity alignment. Those
+                // samples were pushed RAW (sensor frame) — getImuCallback applies
+                // the base_link extrinsic (transformImu) only POST-init — and in
+                // LIO the ones >= start_t_ns survive the trim above. Feeding them
+                // to the IEKF (which treats imu_meas as base_link-frame) would
+                // fuse the first ~scan of IMU in the sensor frame: a systematic
+                // accel/gyro-direction error at startup scaling with the IMU
+                // mounting rotation (finding #9 corrected only the gravity-init
+                // MEAN, not the per-sample data actually fed to the filter). LO
+                // disables IMU hereafter; LIO resumes with transformImu-corrected
+                // samples on the next callbacks, so dropping these only delays
+                // the IMU's first contribution by ~one cycle.
+                imu_int_buff.clear();
+                imu_buff.clear();
                 if (if_lidar_only) {
-                    imu_int_buff.clear();
-                    imu_buff.clear();
                     RCLCPP_INFO(this->get_logger(), "LO mode: IMU input disabled after gravity alignment");
                 }
                 if_init_filter = true;

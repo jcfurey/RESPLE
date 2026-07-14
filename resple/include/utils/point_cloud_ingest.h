@@ -98,7 +98,13 @@ inline bool ingestPointCloud2(const sensor_msgs::msg::PointCloud2& msg,
   std::vector<uint8_t> dense;
   if (msg.height > 1 &&
       msg.row_step != msg.width * msg.point_step) {
-    if (static_cast<size_t>(msg.row_step) * msg.height > msg.data.size()) {
+    // A row_step SMALLER than width*point_step (malformed) would make the
+    // per-row memcpy of width*point_step bytes overread `msg.data`: the
+    // row_step*height bound below does not cover it (it is < width*point_step*
+    // height). Reject rather than read past the buffer.
+    if (static_cast<size_t>(msg.row_step) <
+            static_cast<size_t>(msg.width) * msg.point_step ||
+        static_cast<size_t>(msg.row_step) * msg.height > msg.data.size()) {
       return false;
     }
     dense.resize(static_cast<size_t>(msg.width) * msg.height * msg.point_step);
