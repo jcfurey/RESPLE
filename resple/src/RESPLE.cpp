@@ -15,6 +15,8 @@
 #define EIGEN_MAX_ALIGN_BYTES 16
 #endif
 
+#include <algorithm>
+
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
@@ -111,7 +113,14 @@ public:
     on_configure(const rclcpp_lifecycle::State&)
     {
         RCLCPP_INFO(this->get_logger(), "Configuring RESPLE...");
+        // Reset the transform AND its latch together: on_cleanup also clears
+        // the latch (hazard 71), but a transition-callback error routes
+        // ErrorProcessing → Unconfigured WITHOUT running on_cleanup — a stale
+        // true latch here would then skip the re-lookup and fuse the IMU
+        // through this zeroed transform. Resetting both in one place makes
+        // every path to a configured node consistent by construction.
         imu_to_baselink_ = geometry_msgs::msg::TransformStamped();
+        have_imu_transform_ = false;
         
         // Parameter validation with constraints
         // Guard direct declare_parameter calls with has_parameter checks so a
@@ -190,12 +199,14 @@ public:
         sensor_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         
         // Create publishers (inactive until activated)
-        // Depth sized to the Mapping subscriber's application queue (2000):
-        // RELIABLE bounds loss only up to the WRITER's history depth, so a
-        // shallow KEEP_LAST(50) here (~0.5 s at knot_hz) meant a brief Mapping
-        // stall dropped est_windows at the writer that the replica cannot
-        // recover, skewing its knot time axis. est_window is the Mapping
-        // node's sole input and is loss-sensitive.
+        // Depth sized to the Mapping subscriber's application queue
+        // (kEstWindowQueueCap = 2000 in Mapping.cpp — keep the two in sync):
+        // RELIABLE bounds loss only up to the WRITER's history depth, so the
+        // old KEEP_LAST(50) meant a Mapping stall beyond ~2.5-5 s (est_window
+        // publishes once per processed scan, ~10-20 Hz — NOT per knot)
+        // dropped est_windows at the writer that the replica cannot recover,
+        // skewing its knot time axis. est_window is the Mapping node's sole
+        // input and is loss-sensitive; 2000 msgs ≈ 2-3 MB writer history.
         pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(2000).reliable());
         // HARDENING Phase 4: consolidated, typed estimator diagnostics for
         // plotting (Foxglove / PlotJuggler). Relative topic so the production
@@ -453,23 +464,43 @@ public:
         waitForMapUpdateBounded(std::chrono::seconds(2));
 
         // A map-update future abandoned in waitForMapUpdateBounded (>2s stall)
-        // leaves map_update_future_ moved-from (invalid) and the pending flag
-        // stuck true (the wedged lambda never cleared it). Without resetting
-        // them, the next activation's worker sees pending==true and calls
-        // wait_for on the invalid future every cycle (std::future_error, caught
-        // and retried) → map updates never resume while odom keeps publishing.
-        map_update_pending_.store(false, std::memory_order_release);
+        // leaves map_update_future_ moved-from (invalid) while the zombie
+        // lambda may still be running. Reset the (already-invalid or
+        // already-completed) future as hygiene, but deliberately do NOT clear
+        // map_update_pending_: only the lambda itself clears it (release-store
+        // as its last act), and the worker treats pending+invalid as "zombie
+        // alive — skip map updates" (see processData). Force-clearing here
+        // would let the next activation swap the bg buffers and launch a
+        // second lambda while the zombie still reads them, and the zombie's
+        // trailing store(false) would then mask the NEW lambda (2026-07-14
+        // review; supersedes the earlier hazard-76 reset).
         map_update_future_ = std::future<void>{};
 
         // Clear buffers and data structures. `lidars` is iterated by
         // lasermapFovSegment inside the async map-update lambda under mtx_map_;
         // if that lambda was abandoned above and is still running, destroying
-        // the container here would invalidate its iterator (UAF). Clear under
-        // mtx_map_ so the two serialize (the worker itself is already joined).
+        // the container here would invalidate its iterator (UAF). Serialize via
+        // mtx_map_ — but with a BOUNDED acquisition: a lambda wedged INSIDE its
+        // mtx_map_ hold (the canonical abandonment cause) would otherwise hang
+        // this lifecycle callback forever, defeating the bounded-teardown
+        // design the 2s waits above implement. On timeout, leak the containers
+        // (leak-but-safe; the zombie holds the lock, so nothing else can touch
+        // them either) and log loudly.
         {
-            std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
-            lidars.clear();
-            lidars_data.clear();
+            std::unique_lock<std::shared_mutex> map_lock(mtx_map_, std::defer_lock);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!map_lock.try_lock()) {
+                if (std::chrono::steady_clock::now() >= deadline) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (map_lock.owns_lock()) {
+                lidars.clear();
+                lidars_data.clear();
+            } else {
+                RCLCPP_ERROR(this->get_logger(),
+                    "[RESPLE] mtx_map_ still held (wedged map update?) after 2s; "
+                    "leaking lidars/lidars_data to keep cleanup bounded");
+            }
         }
         imu_buff.clear();
         imu_meas.clear();
@@ -597,11 +628,23 @@ public:
             RCLCPP_WARN(this->get_logger(),
                 "background map-update did not finish within timeout; "
                 "abandoning to avoid blocking shutdown");
-            // Move into a thread-local to keep the future alive (and the
-            // task running to completion in the background) without making
-            // the lifecycle callback wait on it.
-            static thread_local std::future<void> abandoned;
-            abandoned = std::move(map_update_future_);
+            // Park in a thread-local LIST to keep the future alive (and the
+            // task running to completion) without making the lifecycle
+            // callback wait on it. A list, not a single slot: overwriting a
+            // single slot destroys the previously-parked future, and a
+            // std::async future's destructor JOINS its task — a second
+            // abandonment would block unboundedly on the first zombie
+            // (2026-07-14 review). Reap finished zombies first (their
+            // destructors are instant), then append.
+            static thread_local std::vector<std::future<void>> abandoned;
+            abandoned.erase(
+                std::remove_if(abandoned.begin(), abandoned.end(),
+                    [](std::future<void>& f) {
+                        return f.wait_for(std::chrono::seconds(0)) ==
+                               std::future_status::ready;
+                    }),
+                abandoned.end());
+            abandoned.push_back(std::move(map_update_future_));
         }
     }
 
@@ -1240,7 +1283,22 @@ public:
                     // above the worst-case observed lambda duration (~150 ms at -O3
                     // on a well-loaded sim) but still bounded.
                     if (map_update_pending_.load(std::memory_order_acquire)
-                        && map_update_future_.valid()) {
+                        && !map_update_future_.valid()) {
+                        // pending==true with an INVALID future means a prior
+                        // lambda was abandoned by waitForMapUpdateBounded (>2s
+                        // stall) and may STILL BE RUNNING — reachable via
+                        // deactivate→activate, which skips on_cleanup's reset.
+                        // Falling through to the swap would race its
+                        // mapIncremental(pc_world_bg_, …); waiting is
+                        // impossible (no future). Skip this cycle: the zombie
+                        // clears pending as its last act, after which map
+                        // updates resume cleanly (2026-07-14 review).
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "[RESPLE] abandoned map-update still pending; "
+                            "skipping map update this cycle until it clears.");
+                        continue;
+                    }
+                    if (map_update_pending_.load(std::memory_order_acquire)) {
                         // Poll the future in 100ms slices instead of one 5s wait so
                         // the worker checks rclcpp::ok() and processing_active_
                         // between slices. Without this, a SIGINT delivered while
@@ -3594,7 +3652,9 @@ private:
         // ship point_num > points.size(), which would OOB the points[i] loop below.
         plsize = std::min<int>(plsize, static_cast<int>(livox_msg_in->points.size()));
         pc_last->reserve(plsize);
-        int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds() - time_offset;
+        const int64_t stamp_ns = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;  // skip early sim-time messages (matches Ouster/generic)
+        int64_t time_begin = stamp_ns - time_offset;
         LidarData& lidar_buffs = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -3664,7 +3724,9 @@ private:
         // ship point_num > points.size(), which would OOB the points[i] loop below.
         plsize = std::min<int>(plsize, static_cast<int>(livox_msg_in->points.size()));
         pc_last->reserve(plsize);
-        int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds() - time_offset;
+        const int64_t stamp_ns = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;  // skip early sim-time messages (matches Ouster/generic)
+        int64_t time_begin = stamp_ns - time_offset;
         LidarData& lidar_buffs = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -3733,7 +3795,9 @@ private:
         // ship point_num > points.size(), which would OOB the points[i] loop below.
         plsize = std::min<int>(plsize, static_cast<int>(livox_msg_in->points.size()));
         pc_last->reserve(plsize);
-        int64_t time_begin = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds() - time_offset;
+        const int64_t stamp_ns = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;  // skip early sim-time messages (matches Ouster/generic)
+        int64_t time_begin = stamp_ns - time_offset;
         LidarData& lidar_buffs = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -3799,7 +3863,9 @@ private:
         if (plsize == 0) return;
         pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(hesai_msg_in->header.stamp);
-        int64_t time_begin = timestamp_begin.nanoseconds() - time_offset;
+        const int64_t stamp_ns = timestamp_begin.nanoseconds();
+        if (stamp_ns < time_offset) return;  // skip early sim-time messages (matches Ouster/generic)
+        int64_t time_begin = stamp_ns - time_offset;
         LidarData& lidar_buffs_hesai = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs_hesai.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -3857,7 +3923,9 @@ private:
         if (plsize == 0) return;
         pc_last->reserve(plsize);
         rclcpp::Time timestamp_begin = rclcpp::Time(livox_msg_in->header.stamp);
-        int64_t time_begin = timestamp_begin.nanoseconds() - time_offset;
+        const int64_t stamp_ns = timestamp_begin.nanoseconds();
+        if (stamp_ns < time_offset) return;  // skip early sim-time messages (matches Ouster/generic)
+        int64_t time_begin = stamp_ns - time_offset;
         LidarData& lidar_buffs_boxi = lidars_data.at(name);
         int64_t last_t_ns = lidar_buffs_boxi.last_t_ns.load();
         int64_t max_ofs_ns = 0;
@@ -4366,23 +4434,14 @@ private:
             // is exactly [0,0,9.81] since g2R maps ĝ→+Z.
             gravity = Eigen::Vector3d(0.0, 0.0, gravity_magnitude_);
 
-            // Drop pre-start IMU so the first LIO update consumes only samples
-            // at/after the spline origin (all paths, not just the gravity one).
-            {
-                std::lock_guard<std::mutex> imu_lock(m_buff);
-                while (!imu_buff.empty() && imu_buff.front().time_ns < start_t_ns) {
-                    imu_buff.pop_front();
-                }
-            }
-
             // Initialize the filter BEFORE flipping if_init_filter — this way
             // when the callback acquires m_buff and sees if_init_filter=true,
             // the SplineState is already fully constructed.
             initFilter(start_t_ns, Eigen::Vector3d(0, 0, 0), q_WI);
 
             // Flip if_init_filter under m_buff so getImuCallback's snapshot
-            // observes a coherent pre→post transition. In LO mode we also
-            // clear the IMU buffers here — callbacks that already acquired
+            // observes a coherent pre→post transition. The IMU buffers are
+            // cleared in BOTH modes here — callbacks that already acquired
             // m_buff and are waiting (or about to run) will observe the
             // post-init state and either early-return (LO) or take the
             // LIO transform path.
@@ -4395,18 +4454,23 @@ private:
             // and the subscription is destroyed in on_deactivate / on_cleanup.
             {
                 std::lock_guard<std::mutex> lock(m_buff);
-                // Purge the pre-init IMU staged for gravity alignment. Those
-                // samples were pushed RAW (sensor frame) — getImuCallback applies
-                // the base_link extrinsic (transformImu) only POST-init — and in
-                // LIO the ones >= start_t_ns survive the trim above. Feeding them
-                // to the IEKF (which treats imu_meas as base_link-frame) would
-                // fuse the first ~scan of IMU in the sensor frame: a systematic
+                // Purge ALL pre-init IMU staged for gravity alignment (the
+                // full buffers — no pre-start trim is needed first, the clear
+                // subsumes it). Those samples were pushed RAW (sensor frame)
+                // — getImuCallback applies the base_link extrinsic
+                // (transformImu) only POST-init — and feeding them to the
+                // IEKF (which treats imu_meas as base_link-frame) would fuse
+                // the first ~scan of IMU in the sensor frame: a systematic
                 // accel/gyro-direction error at startup scaling with the IMU
-                // mounting rotation (finding #9 corrected only the gravity-init
-                // MEAN, not the per-sample data actually fed to the filter). LO
-                // disables IMU hereafter; LIO resumes with transformImu-corrected
-                // samples on the next callbacks, so dropping these only delays
-                // the IMU's first contribution by ~one cycle.
+                // mounting rotation (finding #9 corrected only the
+                // gravity-init MEAN, not the per-sample data actually fed to
+                // the filter). LO disables IMU hereafter; LIO resumes with
+                // transformImu-corrected samples on the next callbacks, so
+                // the spline's earliest window [start_t_ns, first post-init
+                // sample] is fused LiDAR-only (up to ~a scan of staged
+                // backlog) — a deliberate trade of a short IMU gap for a
+                // correct frame. Do NOT make this clear conditional again:
+                // that reintroduces hazard 79.
                 imu_int_buff.clear();
                 imu_buff.clear();
                 if (if_lidar_only) {
@@ -4552,6 +4616,16 @@ private:
 
     void lasermapFovSegment()
     {
+        // No configured LiDARs → nothing to segment. Reachable only by a
+        // zombie map-update lambda that acquires mtx_map_ AFTER on_cleanup
+        // cleared `lidars`: without this guard the loop below would leave the
+        // ±DBL_MAX position sentinels untouched and, if it also observed the
+        // post-cleanup localmap_initialized_==false, latch garbage inverted
+        // cube vertices that silently disable FOV segmentation for the NEXT
+        // activation (2026-07-14 review). Live nodes always have ≥1 lidar.
+        if (lidars.empty()) {
+            return;
+        }
         cub_needrm.shrink_to_fit();
         Eigen::Vector3d pos_lidar_min(std::numeric_limits<double>::max(), std::numeric_limits<double>::max(),
             std::numeric_limits<double>::max());

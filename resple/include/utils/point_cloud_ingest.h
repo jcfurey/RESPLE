@@ -24,6 +24,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -125,12 +126,24 @@ inline bool ingestPointCloud2(const sensor_msgs::msg::PointCloud2& msg,
 
   const float blind_sq = blind > 0.f ? blind * blind : 0.f;
   const int stride = point_filter_num > 1 ? point_filter_num : 1;
+  // Per-point RELATIVE time-offset ceiling (ms). Non-finite values pass both
+  // gates below (NaN comparisons are false), and a finite-but-huge offset
+  // (malformed field surviving the auto-scaler) overflows the int64 ns cast
+  // downstream (CommonUtils::ms2ns in RESPLE, transformCloud in Mapping) —
+  // UB, the hazards-80/82 threat model. 10 minutes is orders above any real
+  // scan and orders below the cast limit. Gating HERE covers both nodes'
+  // generic paths in one place.
+  constexpr float kMaxTimeOffsetMs = 6.0e5f;
   out_cloud.points.reserve(pts.size() / static_cast<size_t>(stride) + 1);
   for (size_t i = 0; i < pts.size(); ++i) {
     if (stride > 1 && (i % static_cast<size_t>(stride)) != 0) {
       continue;
     }
     const pc2::OutPoint& s = pts[i];
+    if (!std::isfinite(s.x) || !std::isfinite(s.y) || !std::isfinite(s.z) ||
+        !std::isfinite(s.time_ms) || s.time_ms > kMaxTimeOffsetMs) {
+      continue;
+    }
     const float r_sq = s.x * s.x + s.y * s.y + s.z * s.z;
     if (s.time_ms < 0.f || r_sq <= blind_sq) {
       continue;

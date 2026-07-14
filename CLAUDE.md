@@ -185,6 +185,20 @@ lock.
 - Hold `mtx_map_` or `spline_mutex_` across a `rate.sleep()` or any point
   where the worker might exit.
 
+### Leaf locks (outside the four-mutex ordering)
+
+A few auxiliary mutexes exist beside the four above. Each is a **strict
+leaf**: you may take it while holding any of the four, but you must never
+acquire ANY other lock while holding it. Current leaves: `static_br_mutex_`
+(serializes `static_br_->sendTransform` between the sensor-callback LiDAR
+latch and the worker's IMU latch; note the IMU-callback path reaches it
+while HOLDING `m_buff` — that nesting is legal, m_buff→leaf, but it means a
+one-shot DDS write happens under `m_buff`), `save_map_mutex_` (SaveMap
+thread handoff), and the TF-ownership monitor's internal mutex
+(`tf_ownership.h`, fully self-contained). When adding a mutex, either slot
+it into the ordering above or document it here as a leaf — a lock that is
+neither is where the next ABBA deadlock comes from.
+
 ### Buffer-swap protocol (map update)
 
 `processData` accumulates `pc_world` + `accum_nearest_points` frame-by-frame,
@@ -385,6 +399,20 @@ reference (status as of latest pass):
 | 82 | Generic adapter: `convertCloud` bounded only `num_points*point_step <= data_size`, not each field's `offset+size <= point_step`, and `ingestPointCloud2`'s organized-cloud repack bounded `row_step*height` but not `row_step >= width*point_step` → a malformed PointCloud2 (field past the stride, or `row_step` under-declared) drove an OOB heap read in `readFieldAsDouble`/the per-row `memcpy` | **fixed** (field-fits guard in `convertCloud`; `row_step` lower-bound in `ingestPointCloud2`) | 2026-07-14 |
 | 83 | `gap_extrap_decay` was assigned to `GapExtrapDamping::decay` unclamped; a negative value makes `scale(k)=pow(decay,excess)` sign-flip for odd excess → propRCP's gap extrapolation pushed the wrong way (misconfig; overload feature is default-off) | **fixed** (clamp to ≥0 with a WARN; 0 = hard hold) | 2026-07-14 |
 | 84 | ikd-Tree inline `Rebuild` called `BuildTree(...,PCL_Storage.size()-1,...)` with no empty-flatten guard (benign only via the `size_t→int` underflow to a negative `r`; the two sibling rebuild sites already guard). Plus doc-vs-code drift: `overload_control.h` "never counts the last element" (it can) and `filter_health.h` NIS window labelled "sliding" (it is tumbling) | **fixed** (empty guard on the inline rebuild; both comments corrected) | 2026-07-14 |
+
+| 85 | The hazard-81 `lidar_time_offset` fix was ONE-SIDED: RESPLE's 5 non-Ouster callbacks got the subtraction but Mapping's matching buffs kept raw stamps (only Ouster/Generic read the param there) → with a nonzero offset the two nodes disagreed on the scan time base for 5 sensor types — map smear ≈ velocity×offset, or scans dropped by the replica's window gate. The 5 RESPLE sites also lacked the `stamp_ns < time_offset` early-sim-time guard their Ouster/generic siblings pair with the subtraction | **fixed** (param read hoisted into `MappingBase` — one read, all 7 buffs shift identically; guard + subtraction added to all 5 buffs and all 5 RESPLE callbacks) | 2026-07-14 |
+| 86 | The hazard-80 non-finite-time gate was also one-sided (RESPLE's generic callback only; Mapping's `GenericPC2Buff` passed NaN time/xyz to a UB `int64_t(NaN*1e6)` cast and `/global_map`), and it missed finite-but-huge values — `ms2ns(1e24 ms)` is an out-of-range float→int64 cast (UB) under the same malformed-input threat model | **fixed** (gate moved into the shared `ingestPointCloud2`: isfinite on x/y/z/time + a 10-minute relative-offset ceiling, covering both nodes in one place) | 2026-07-14 |
+| 87 | Map-update zombie protocol: the hazard-76 `.valid()` guard FELL THROUGH to the unlocked bg-buffer swap + a new async launch when `pending && !valid` (deactivate→activate skips on_cleanup) — racing a still-running abandoned lambda; on_cleanup's pending reset enabled a double-lambda whose generation-blind trailing `store(false)` could mask the new one; a SECOND abandonment joined the first zombie via the single `thread_local` future slot (async future dtor joins); on_cleanup's new unbounded `mtx_map_` wait could hang forever on a wedged lambda; and a zombie acquiring `mtx_map_` after cleanup's clear could latch garbage ±1.8e308 cube vertices that persist into the next activation | **fixed** (worker treats `pending && !valid` as zombie-alive and SKIPS the map-update cycle — self-heals when the zombie's release-store lands; on_cleanup no longer clears `pending` (only the lambda does); abandoned futures parked in a reap-then-append list; cleanup's `mtx_map_` acquisition bounded (2 s try_lock loop, leak-but-safe on timeout); `lasermapFovSegment` early-returns on empty `lidars`) | 2026-07-14 |
+| 88 | Mapping `on_cleanup` reset publishers/broadcasters/tf_buffer without checking whether the worker actually exited — `joinProcessingThreadBounded` DETACHES a >2 s-wedged worker (canonically stuck in `canTransform` under a frozen sim clock), which still dereferences them in `pubOdom` → shared_ptr race + UAF into a destroyed `tf2_ros::Buffer`. The old leak accidentally kept the detach path memory-safe | **fixed** (gate the resets on `processing_thread_exited_`; deliberate leak-but-alive fallback with an ERROR log when detached) | 2026-07-14 |
+| 89 | Post-review tail: `have_imu_transform_` was reset only in `on_cleanup`, which the lifecycle ERROR path (ErrorProcessing→Unconfigured) skips — hazard 71 re-manifested on error recovery; `/global_map` stamped `now()` (publish time) sits AHEAD of every TF on the live timeline → stamped lookups fail with extrapolation-into-the-future (mirror of the stamp-0 bug); `itpQuaternion`'s `if(J_w)` branch dereferenced `w_out` unguarded and the w_out fix had triplicated the angular-velocity recursion; the pre-start IMU trim was dead code under the hazard-79 clear with a stale "LO mode" comment inviting its reintroduction; the fifth mutex wasn't in the lock-ordering section its own rule requires | **fixed** (latch reset duplicated into `on_configure` beside the transform reset; `/global_map` stamped with batch data time; `if (J_w \|\| w_out)` hoist — one recursion copy, guarded value write; dead trim deleted + comments corrected; "Leaf locks" subsection added to the Locking section) | 2026-07-14 |
+
+**2026-07-14 series self-review (hazards 85–89):** an xhigh-effort 10-angle ×
+adversarial-verify code review of this branch's own 5-commit series found 15
+defects in the fixes themselves — dominated by one-sided fixes (RESPLE patched,
+Mapping missed) and teardown-boundedness regressions in the wedged-lambda
+paths. All 15 applied. The load-bearing protocol change: `map_update_pending_`
+is now cleared ONLY by the map-update lambda itself; every other reader treats
+`pending && !future.valid()` as "zombie still alive — skip, don't swap".
 
 **2026-07-14 ingestion/utils sweep (hazards 79–84):** a three-lens audit (sensor
 data-ingestion → `PointData`/`ImuData`, the ikd-Tree *sequential* algorithm, the

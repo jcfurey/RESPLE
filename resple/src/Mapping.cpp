@@ -143,6 +143,15 @@ class MappingBase
                 "[Mapping] /global_map batched: publishing at most every %d ms",
                 publish_min_interval_ms_);
         }
+        // LiDAR-vs-spline time-base correction, read ONCE in the base so every
+        // sensor buff applies the identical shift (2026-07-14 review: it was
+        // read per-buff and only Ouster/Generic applied it, so a nonzero
+        // offset put RESPLE's spline and this node's scan stamps on time axes
+        // `offset` apart for the other 5 sensor types — smeared/holey map).
+        // Callbacks must stamp with `stamp_ns - time_offset` and guard early
+        // sim-time messages with `stamp_ns < time_offset`.
+        time_offset = static_cast<int64_t>(
+            1e9 * CommonUtils::readParam<double>(nh->get_node_parameters_interface(), "lidar_time_offset", 0.0));
 
         RCLCPP_INFO(nh->get_logger(), "Frame IDs -  map: %s, body: %s", 
                     map_id.c_str(), frame_id.c_str());        
@@ -312,7 +321,7 @@ class MappingBase
             }
             transformCloud(front_cloud, spl, pc);
             if (publish_min_interval_ms_ <= 0) {
-                publishMap(pc, pub_global_map);
+                publishMap(pc, pub_global_map, last_t_end_ns);
             } else {
                 // Batch, don't drop (overload hardening 2026-07-07): every
                 // /global_map msg is ONE incremental scan that viewers
@@ -320,6 +329,7 @@ class MappingBase
                 // hole. Accumulate and flush on the interval below instead —
                 // fewer, larger messages for the same total content.
                 *pc_pending_ += *pc;
+                pc_pending_stamp_ns_ = last_t_end_ns;
             }
             n_published++;
         }
@@ -337,7 +347,7 @@ class MappingBase
             }
             if ((now_pub - last_batch_publish_).nanoseconds() >=
                 int64_t(publish_min_interval_ms_) * 1000000LL) {
-                publishMap(pc_pending_, pub_global_map);
+                publishMap(pc_pending_, pub_global_map, pc_pending_stamp_ns_);
                 pc_pending_->clear();
                 last_batch_publish_ = now_pub;
             }
@@ -374,7 +384,8 @@ class MappingBase
     }
 
     void publishMap(const typename pcl::PointCloud<PointType>::Ptr& pcs,
-                         const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher)
+                         const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher,
+                         int64_t stamp_ns)
     {
         if (!publishMap_logged_) {
             publishMap_logged_ = true;
@@ -389,9 +400,13 @@ class MappingBase
         // header stays 0), so without this every /global_map goes out with
         // stamp 0 → time-based TF lookups at the cloud stamp resolve at t=0
         // (no TF there) and consumers drop the cloud unless their fixed frame
-        // is exactly `map`. Stamp with the node clock (sim-time aware under
-        // use_sim_time, matching the rest of the node's data-time publishes).
-        msgs.header.stamp = node_handle_->now();
+        // is exactly `map`. DATA time (the newest contained scan's end), not
+        // node_handle_->now(): a publish-time stamp is AHEAD of every TF this
+        // pipeline broadcasts (both nodes stamp TF at lagged data time), so
+        // stamped lookups at the cloud stamp would fail with extrapolation-
+        // into-the-future — the mirror image of the stamp-0 bug. Matches
+        // pubOdom / publishCurrentScan's data-time convention.
+        msgs.header.stamp = rclcpp::Time(stamp_ns);
         publisher->publish(msgs);
     }
 
@@ -530,6 +545,12 @@ class MappingBase
     // Batch publish (map/publish_min_interval_ms, 0 = publish every scan).
     // Worker-thread only.
     int publish_min_interval_ms_ = 0;
+    // lidar_time_offset in ns (see ctor); callbacks stamp with
+    // `stamp_ns - time_offset`, matching RESPLE's callbacks.
+    int64_t time_offset = 0;
+    // Data time (ns) of the newest scan accumulated into pc_pending_, so the
+    // batch flush can stamp /global_map with data time (see publishMap).
+    int64_t pc_pending_stamp_ns_ = 0;
     rclcpp::Time last_batch_publish_{0, 0, RCL_ROS_TIME};
     typename pcl::PointCloud<PointType>::Ptr pc_pending_;
     // Last gate-held front t_end — dedupes pending_new across worker cycles.
@@ -576,8 +597,6 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
     {
         pc_subscription_ouster = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
             this->lidar.topic, lidar_qos, std::bind(&OusterBuff::ousterLidarCallback, this, std::placeholders::_1), sub_opt);
-        double lidar_time_offset = CommonUtils::readParam<double>(nh->get_node_parameters_interface(), "lidar_time_offset", 0.0);
-        time_offset = 1e9*lidar_time_offset;
     }
 
     void ousterLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr ouster_msg_in)
@@ -628,7 +647,6 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
 
   private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_ouster;
-    int64_t time_offset = 0;
 };
 
 // Generic PointCloud2 buffer: mirrors OusterBuff but uses runtime PointField
@@ -645,8 +663,6 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
             lidar_config.time_field, lidar_config.time_unit, lidar_config.intensity_field);
         pc_subscription_generic = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
             this->lidar.topic, lidar_qos, std::bind(&GenericPC2Buff::genericLidarCallback, this, std::placeholders::_1), sub_opt);
-        double lidar_time_offset = CommonUtils::readParam<double>(nh->get_node_parameters_interface(), "lidar_time_offset", 0.0);
-        time_offset = 1e9*lidar_time_offset;
     }
 
     void genericLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg_in)
@@ -693,7 +709,6 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
   private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_subscription_generic;
     resple::pc2::AdapterConfig adapter_cfg_;
-    int64_t time_offset = 0;
 };
 
 class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
@@ -710,6 +725,11 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
     void livoxLidarCallback(const livox_ros_driver::msg::CustomMsg::SharedPtr livox_msg_in)
     {
         this->guardedCallback([&] {
+        // Guard against negative timestamps (sim-time messages), then shift
+        // onto the offset-corrected time base RESPLE's spline uses.
+        const int64_t stamp_ns = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;
+
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -734,7 +754,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
             }
         }
         this->pc_last->header.frame_id = this->frame_id;
-        this->pc_last->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        this->pc_last->header.stamp = stamp_ns - time_offset;
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
@@ -746,7 +766,7 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
-        pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        pc_last_ds->header.stamp = stamp_ns - time_offset;
         this->pushScanCapped(*pc_last_ds);
         });
     }
@@ -769,6 +789,11 @@ public:
     void livoxLidarCallback(livox_ros_driver2::msg::CustomMsg::SharedPtr livox_msg_in)
     {
         this->guardedCallback([&] {
+        // Guard against negative timestamps (sim-time messages), then shift
+        // onto the offset-corrected time base RESPLE's spline uses.
+        const int64_t stamp_ns = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;
+
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -793,7 +818,7 @@ public:
             }
         }
         this->pc_last->header.frame_id = this->frame_id;
-        this->pc_last->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        this->pc_last->header.stamp = stamp_ns - time_offset;
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
@@ -805,7 +830,7 @@ public:
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
-        pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        pc_last_ds->header.stamp = stamp_ns - time_offset;
         this->pushScanCapped(*pc_last_ds);
         });
     }
@@ -828,6 +853,11 @@ public:
     void livoxLidarCallback(livox_interfaces::msg::CustomMsg::SharedPtr livox_msg_in)
     {
         this->guardedCallback([&] {
+        // Guard against negative timestamps (sim-time messages), then shift
+        // onto the offset-corrected time base RESPLE's spline uses.
+        const int64_t stamp_ns = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;
+
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
                 
@@ -852,7 +882,7 @@ public:
             }
         }
         this->pc_last->header.frame_id = this->frame_id;
-        this->pc_last->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        this->pc_last->header.stamp = stamp_ns - time_offset;
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
@@ -864,7 +894,7 @@ public:
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
-        pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        pc_last_ds->header.stamp = stamp_ns - time_offset;
         this->pushScanCapped(*pc_last_ds);
         });
     }
@@ -887,6 +917,13 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
     void hesaiLidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr hesai_msg_in)
     {
         this->guardedCallback([&] {
+        // Guard against negative timestamps (sim-time messages), then shift
+        // onto the offset-corrected time base RESPLE's spline uses. Per-point
+        // deltas below stay relative to the RAW header stamp, so the shift
+        // moves the whole scan uniformly.
+        const int64_t stamp_ns = rclcpp::Time(hesai_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;
+
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(hesai_msg_in->header.frame_id)) return;
                 
@@ -914,7 +951,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
             }
         }
         this->pc_last->header.frame_id = this->frame_id;
-        this->pc_last->header.stamp = rclcpp::Time(hesai_msg_in->header.stamp).nanoseconds();
+        this->pc_last->header.stamp = stamp_ns - time_offset;
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
@@ -926,7 +963,7 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
-        pc_last_ds->header.stamp = rclcpp::Time(hesai_msg_in->header.stamp).nanoseconds();
+        pc_last_ds->header.stamp = stamp_ns - time_offset;
         this->pushScanCapped(*pc_last_ds);
         });
     }
@@ -949,6 +986,13 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
     void mid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
     {
         this->guardedCallback([&] {
+        // Guard against negative timestamps (sim-time messages), then shift
+        // onto the offset-corrected time base RESPLE's spline uses. Per-point
+        // deltas below stay relative to the RAW header stamp, so the shift
+        // moves the whole scan uniformly.
+        const int64_t stamp_ns = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        if (stamp_ns < time_offset) return;
+
         // Lookup LiDAR transform if not yet initialized
         if(!updateTransform(livox_msg_in->header.frame_id)) return;
         
@@ -974,7 +1018,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
             }
         }
         this->pc_last->header.frame_id = this->frame_id;
-        this->pc_last->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        this->pc_last->header.stamp = stamp_ns - time_offset;
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*this->pc_last, *this->pc_last, indices);
         if (this->pc_last->points.empty()) return;
@@ -986,7 +1030,7 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
         this->pc_last_ds->clear();
         ds_filter_each_scan.filter(*this->pc_last_ds);
         pc_last_ds->header.frame_id = this->frame_id;
-        pc_last_ds->header.stamp = rclcpp::Time(livox_msg_in->header.stamp).nanoseconds();
+        pc_last_ds->header.stamp = stamp_ns - time_offset;
         this->pushScanCapped(*pc_last_ds);
         });
     }
@@ -1198,21 +1242,35 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     {
         RCLCPP_INFO(this->get_logger(), "Cleaning up Mapping...");
         
-        // Reset publishers
-        pub_path.reset();
-        pub_knots.reset();
-        pub_odom.reset();
-        br.reset();
-        static_br_.reset();
+        // Reset publishers, broadcasters and the TF listener/buffer — but ONLY
+        // when the worker actually exited. joinProcessingThreadBounded DETACHES
+        // a wedged worker (>2 s, e.g. blocked inside tf_buffer->canTransform
+        // under a frozen sim clock — the exact wedge on_shutdown's comment
+        // names); a detached worker still dereferences pub_odom / br /
+        // tf_buffer in pubOdom, so destroying them here would be a UAF into a
+        // live thread (2026-07-14 review). Deliberately fall back to the old
+        // leak-but-alive behaviour in that pathological case.
+        if (processing_thread_exited_.load(std::memory_order_acquire)) {
+            pub_path.reset();
+            pub_knots.reset();
+            pub_odom.reset();
+            br.reset();
+            static_br_.reset();
 
-        // Reset TF listener/buffer (created fresh in on_configure). The
-        // listener holds the buffer by reference, so drop the LISTENER FIRST —
-        // otherwise the next on_configure reassigns tf_buffer while the old
-        // listener still points at the just-freed buffer (UAF if a /tf callback
-        // fires mid-reconfigure). Omitting this also leaks a listener thread
-        // per re-configure. Mirrors RESPLE::on_cleanup.
-        tf_listener.reset();
-        tf_buffer.reset();
+            // Reset TF listener/buffer (created fresh in on_configure). The
+            // listener holds the buffer by reference, so drop the LISTENER
+            // FIRST — otherwise the next on_configure reassigns tf_buffer
+            // while the old listener still points at the just-freed buffer
+            // (UAF if a /tf callback fires mid-reconfigure). Omitting this
+            // also leaks a listener thread per re-configure. Mirrors
+            // RESPLE::on_cleanup.
+            tf_listener.reset();
+            tf_buffer.reset();
+        } else {
+            RCLCPP_ERROR(this->get_logger(),
+                "[Mapping] worker thread was detached (wedged); leaking "
+                "publishers/TF buffer to keep the zombie thread memory-safe");
+        }
 
         // Clear data
         opt_old_path.poses.clear();
