@@ -165,9 +165,18 @@ public:
         RCLCPP_INFO(this->get_logger(), "Using %d threads for parallel processing", num_threads_);
         RCLCPP_INFO(this->get_logger(), "Using %d nearest neighbor points for matching", num_match_points_);
         
-        // Setup diagnostics
-        diagnostics_.setHardwareID("RESPLE");
-        diagnostics_.add("System Health", this, &RESPLE::updateDiagnostics);
+        // Setup diagnostics. Register ONCE: diagnostic_updater::Updater::add
+        // appends unconditionally, so registering here on every on_configure
+        // stacks a duplicate "System Health" task each configure→cleanup→
+        // configure cycle (all invoked per update). The one-shot guard keeps
+        // the single registration across re-cycles; the callback reads only
+        // atomics/caches, so it is safe in any lifecycle state. (Mapping
+        // sidesteps this by registering in its constructor.)
+        if (!diag_registered_) {
+            diagnostics_.setHardwareID("RESPLE");
+            diagnostics_.add("System Health", this, &RESPLE::updateDiagnostics);
+            diag_registered_ = true;
+        }
         
         // Initialize diagnostic metrics
         last_process_ns_.store(this->now().nanoseconds(), std::memory_order_relaxed);
@@ -181,7 +190,13 @@ public:
         sensor_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         
         // Create publishers (inactive until activated)
-        pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
+        // Depth sized to the Mapping subscriber's application queue (2000):
+        // RELIABLE bounds loss only up to the WRITER's history depth, so a
+        // shallow KEEP_LAST(50) here (~0.5 s at knot_hz) meant a brief Mapping
+        // stall dropped est_windows at the writer that the replica cannot
+        // recover, skewing its knot time axis. est_window is the Mapping
+        // node's sole input and is loss-sensitive.
+        pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(2000).reliable());
         // HARDENING Phase 4: consolidated, typed estimator diagnostics for
         // plotting (Foxglove / PlotJuggler). Relative topic so the production
         // namespace yields /localization/resple/resple_diagnostics; the
@@ -437,9 +452,25 @@ public:
         // when no async map update was ever launched).
         waitForMapUpdateBounded(std::chrono::seconds(2));
 
-        // Clear buffers and data structures
-        lidars.clear();
-        lidars_data.clear();
+        // A map-update future abandoned in waitForMapUpdateBounded (>2s stall)
+        // leaves map_update_future_ moved-from (invalid) and the pending flag
+        // stuck true (the wedged lambda never cleared it). Without resetting
+        // them, the next activation's worker sees pending==true and calls
+        // wait_for on the invalid future every cycle (std::future_error, caught
+        // and retried) → map updates never resume while odom keeps publishing.
+        map_update_pending_.store(false, std::memory_order_release);
+        map_update_future_ = std::future<void>{};
+
+        // Clear buffers and data structures. `lidars` is iterated by
+        // lasermapFovSegment inside the async map-update lambda under mtx_map_;
+        // if that lambda was abandoned above and is still running, destroying
+        // the container here would invalidate its iterator (UAF). Clear under
+        // mtx_map_ so the two serialize (the worker itself is already joined).
+        {
+            std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
+            lidars.clear();
+            lidars_data.clear();
+        }
         imu_buff.clear();
         imu_meas.clear();
         pt_meas.clear();
@@ -468,7 +499,14 @@ public:
         init_attitude_wait_.reset();
         init_attitude_delta_deg_.store(-1.0, std::memory_order_relaxed);
         imu_frame_id_.clear();
-        
+        // The IMU extrinsic is re-looked-up per activation only while
+        // have_imu_transform_ is false, but that latch is a node member that
+        // survives cleanup — while on_configure resets imu_to_baselink_ to a
+        // zero-quaternion default. Without clearing the latch here, a
+        // deactivate→cleanup→configure→activate re-cycle skips the re-lookup
+        // and fuses the IMU (and gravity init) through that bogus extrinsic.
+        have_imu_transform_ = false;
+
         // Reset publishers
         pub_est.reset();
         pub_diag_.reset();
@@ -1201,7 +1239,8 @@ public:
                     // responsive to shutdown signals at minimum. 5 seconds is well
                     // above the worst-case observed lambda duration (~150 ms at -O3
                     // on a well-loaded sim) but still bounded.
-                    if (map_update_pending_.load(std::memory_order_acquire)) {
+                    if (map_update_pending_.load(std::memory_order_acquire)
+                        && map_update_future_.valid()) {
                         // Poll the future in 100ms slices instead of one 5s wait so
                         // the worker checks rclcpp::ok() and processing_active_
                         // between slices. Without this, a SIGINT delivered while
@@ -1589,6 +1628,13 @@ private:
     // Latched base->sensor extrinsic frames in YAML-extrinsic mode
     // (publish_extrinsic_tf; see latchExtrinsicTf). Null unless enabled.
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_br_;
+    // Serializes static_br_->sendTransform: the LiDAR latch runs on the sensor
+    // callback group, the IMU latch on the worker (initialization()), and
+    // StaticTransformBroadcaster mutates its transform vector without a lock.
+    std::mutex static_br_mutex_;
+    // One-shot guard so diagnostics_.add runs exactly once across lifecycle
+    // re-cycles (see on_configure).
+    bool diag_registered_ = false;
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     bool have_imu_transform_ = false;
@@ -2883,7 +2929,15 @@ private:
         ts.transform.rotation.x = lidar.q_bl.x();
         ts.transform.rotation.y = lidar.q_bl.y();
         ts.transform.rotation.z = lidar.q_bl.z();
-        static_br_->sendTransform(ts);
+        {
+            // static_br_ (tf2_ros::StaticTransformBroadcaster) mutates a shared
+            // std::vector with no internal lock. This latch runs on the sensor
+            // callback group; latchImuExtrinsicTf runs on the WORKER during
+            // initialization() — a concurrent sendTransform on the same
+            // broadcaster races the vector. Serialize with a leaf mutex.
+            std::lock_guard<std::mutex> lk(static_br_mutex_);
+            static_br_->sendTransform(ts);
+        }
         RCLCPP_INFO(this->get_logger(),
             "[RESPLE] latched static extrinsic TF %s -> %s from YAML q_lb/t_lb "
             "(t=[%.3f %.3f %.3f])",
@@ -2916,7 +2970,13 @@ private:
         ts.header.stamp = this->now();
         ts.header.frame_id = this->frame_id;
         ts.child_frame_id = source_frame_id;
-        static_br_->sendTransform(ts);
+        {
+            // See latchExtrinsicTf: this runs on the worker (initialization()),
+            // the LiDAR latch on the sensor callback group — same lock-free
+            // static_br_ vector. Serialize with the leaf mutex.
+            std::lock_guard<std::mutex> lk(static_br_mutex_);
+            static_br_->sendTransform(ts);
+        }
         RCLCPP_INFO(this->get_logger(),
             "[RESPLE] latched static IMU extrinsic TF %s -> %s from YAML q_ib/t_ib",
             this->frame_id.c_str(), source_frame_id.c_str());

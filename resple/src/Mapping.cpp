@@ -385,6 +385,13 @@ class MappingBase
         sensor_msgs::msg::PointCloud2 msgs;
         pcl::toROSMsg(*pcs, msgs);
         msgs.header.frame_id = map_id;
+        // transformCloud fills only points (the reused member cloud's PCL
+        // header stays 0), so without this every /global_map goes out with
+        // stamp 0 → time-based TF lookups at the cloud stamp resolve at t=0
+        // (no TF there) and consumers drop the cloud unless their fixed frame
+        // is exactly `map`. Stamp with the node clock (sim-time aware under
+        // use_sim_time, matching the rest of the node's data-time publishes).
+        msgs.header.stamp = node_handle_->now();
         publisher->publish(msgs);
     }
 
@@ -1197,6 +1204,15 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         pub_odom.reset();
         br.reset();
         static_br_.reset();
+
+        // Reset TF listener/buffer (created fresh in on_configure). The
+        // listener holds the buffer by reference, so drop the LISTENER FIRST —
+        // otherwise the next on_configure reassigns tf_buffer while the old
+        // listener still points at the just-freed buffer (UAF if a /tf callback
+        // fires mid-reconfigure). Omitting this also leaks a listener thread
+        // per re-configure. Mirrors RESPLE::on_cleanup.
+        tf_listener.reset();
+        tf_buffer.reset();
 
         // Clear data
         opt_old_path.poses.clear();
