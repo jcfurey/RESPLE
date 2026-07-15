@@ -25,6 +25,10 @@
     # full dual-mode recipe is in config_ouster.yaml's frame block and
     # doc/PARAMETERS.md "TF ownership". The runtime guard below catches a
     # wrong flag either way.
+    # Standalone (no EKF at all): the True flags below are REQUIRED (nobody
+    # else will publish the pairs), and frame_id must not already have a TF
+    # parent from a URDF — details in config_ouster.yaml's frame block. Note
+    # the nis_recovery_mode: "hold" below assumes an EKF; revisit it too.
     odom/frame_id: odom
     map/frame_id: map
     frame_id: base_link
@@ -36,11 +40,19 @@
 
     cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
     cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    # RESPLE's /odom covariance (IEKF posterior) is a RELATIVE confidence
+    # signal — overconfident in absolute terms; see config_ouster.yaml.
+    # In this profile it matters double: the wheel-odom EKF weighting
+    # depends on it, and the along-axis variance is the honest-reporting
+    # channel for the degenerate direction.
 
     # Extrinsics from TF (production convention). Publish the real
     # base_link->sensor TF for your rig, or run tf_extrinsics: false and put
     # the calibration in q_lb/t_lb instead (never both non-identity — they
     # compose; the node warns if you do).
+    # Bounded lookup: after tf_wait_timeout the node falls back to YAML
+    # q_lb/t_lb alone — no static TF + identity YAML + rotated mount =
+    # silently wrong fusion.
     tf_extrinsics: true
     tf_wait_timeout: 10.0
 
@@ -104,6 +116,8 @@
 
     imu_init_num_samples: 50
     imu_init_max_variance: 5.0
+    # Gravity init BLOCKS until the IMU sees a stationary window — no
+    # odometry until the platform first holds still (see config_ouster.yaml).
 
     # ------------------------------------------------------------------
     # Close-range measurement weighting
@@ -171,6 +185,9 @@
     # downstream EKF coasts on wheel odom. Do NOT use "reset" here: repeated
     # covariance reinflation in a constraint-starved bore causes the
     # overshoot/oscillation loop observed in the field.
+    # This ASSUMES that EKF exists. Running SOLO (no EKF), hold means NO
+    # pose at all through the divergence — use "off" instead and have
+    # downstream read the DIVERGED flag from resple_diagnostics.
     nis_recovery_mode: "hold"
     nis_reset_cov: 1.0
     map_prune_radius: 0.0

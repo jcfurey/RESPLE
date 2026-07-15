@@ -9,6 +9,9 @@
     # matching publish_tf flag False and let the external owner publish — the
     # runtime guard below catches a wrong flag. Recipe: doc/PARAMETERS.md
     # "TF ownership".
+    # Standalone (no EKF at all): the True flags below are REQUIRED (nobody
+    # else will publish the pairs), and frame_id must not already have a TF
+    # parent from a URDF — details in config_ouster.yaml's frame block.
     odom/frame_id: odom              # Odom (odometry frame_id) frame
     map/frame_id: map                # Map frame (Mapping node publications)
     frame_id: base_link              # Robot (odometry child_frame_id) frame
@@ -20,6 +23,8 @@
 
     cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
     cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
+    # RESPLE's /odom covariance (IEKF posterior) is a RELATIVE confidence
+    # signal — overconfident in absolute terms; see config_ouster.yaml.
 
     topic_imu: /imu/data
     acc_ratio: true
@@ -67,6 +72,8 @@
 
     imu_init_num_samples: 50     # IMU samples averaged during stationary init
     imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+    # Gravity init BLOCKS until the IMU sees a stationary window — no
+    # odometry until the rig first holds still (see config_ouster.yaml).
 
     # ------------------------------------------------------------------
     # Robustness & diagnostics (see doc/PARAMETERS.md and HARDENING.md).
@@ -89,7 +96,11 @@
     nis_diverged_ratio: 4.0        # DIVERGED threshold
     nis_breach_limit: 3            # consecutive breaches before DIVERGED
     nis_recovery_mode: "off"       # "off" = log+diagnostics only
-                                   # "hold" = suspend odom/TF while DIVERGED
+                                   # "hold" = suspend odom/TF while DIVERGED —
+                                   #   for stacks where a downstream EKF
+                                   #   coasts on other sources; running SOLO
+                                   #   it freezes ALL output during the hold
+                                   #   (prefer off/reset standalone)
                                    # "reset" = reinflate filter covariance
                                    # (keep quotes: bare off is YAML false)
     nis_reset_cov: 1.0             # 'reset' reinflation variance (m^2/rad^2); recovery

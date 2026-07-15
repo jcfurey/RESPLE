@@ -25,6 +25,9 @@
     # full dual-mode recipe is in config_ouster.yaml's frame block and
     # doc/PARAMETERS.md "TF ownership". The runtime guard below catches a
     # wrong flag either way.
+    # Standalone (no EKF at all): the True flags below are REQUIRED (nobody
+    # else will publish the pairs), and frame_id must not already have a TF
+    # parent from a URDF — details in config_ouster.yaml's frame block.
     odom/frame_id: odom              # Odom (odometry frame_id) frame
     map/frame_id: map                # Map frame (Mapping node publications)
     frame_id: base_link              # Robot (odometry child_frame_id) frame
@@ -36,12 +39,17 @@
 
     cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
     cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
+    # RESPLE's /odom covariance (IEKF posterior) is a RELATIVE confidence
+    # signal — overconfident in absolute terms; see config_ouster.yaml.
 
     topic_imu: /sensor/lidar/lidar0/imu
     acc_ratio: false
     # Extrinsic convention: the base_link<-sensor TF carries the mounting
     # extrinsic; q_lb/t_lb below is an EXTRA offset (identity here). Never
     # make both non-identity — they compose. See doc/PARAMETERS.md.
+    # Bounded lookup: after tf_wait_timeout (10 s) the node falls back to
+    # YAML q_lb/t_lb alone — no static TF + identity YAML + rotated mount
+    # = silently wrong fusion.
     tf_extrinsics: true
     lidars: ["Ouster"]
     Ouster:
@@ -84,6 +92,8 @@
 
     imu_init_num_samples: 50     # IMU samples averaged during stationary init
     imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+    # Gravity init BLOCKS until the IMU sees a stationary window — no
+    # odometry until the platform first holds still (see config_ouster.yaml).
 
     spline_prune_keep_knots: 600   # knots kept in memory (~6 s @ knot_hz 100)
     nn_max_sq_dist: 5.0            # k-th-neighbor max squared distance (m^2)
@@ -93,7 +103,10 @@
     nis_warn_ratio: 2.0            # WARN when NIS mean > ratio x dof
     nis_diverged_ratio: 4.0        # DIVERGED threshold
     nis_breach_limit: 3            # consecutive breaches before DIVERGED
-    nis_recovery_mode: "off"       # keep quotes: bare off is YAML false
+    nis_recovery_mode: "off"       # keep quotes: bare off is YAML false.
+                                   # "hold" gates odom/TF while DIVERGED —
+                                   # only safe with a downstream EKF coasting
+                                   # on other sources; solo it freezes output
     nis_reset_cov: 1.0             # 'reset' reinflation variance (m^2/rad^2)
     map_prune_radius: 0.0          # 0 = cube-only (cube_len)
 

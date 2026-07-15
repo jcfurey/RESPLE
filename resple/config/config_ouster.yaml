@@ -12,7 +12,19 @@
     #
     # STANDALONE (this file's defaults): RESPLE owns odom->base_link, the
     # optional Mapping node owns map->odom. Nothing else may publish
-    # either pair.
+    # either pair. Two things to get right when there is NO EKF in the
+    # stack:
+    #   * publish_tf True is REQUIRED — nothing else will publish
+    #     odom->base_link. Left False, the node keeps estimating but only
+    #     WARNs once (tf_absent_warn_sec) while every TF consumer
+    #     downstream starves silently.
+    #   * frame_id must have no other TF parent. If a URDF already
+    #     publishes base_footprint->base_link, claiming odom->base_link
+    #     gives base_link TWO parents — a broken tree tf2 never errors on.
+    #     Use the URDF root (base_footprint) as frame_id instead. Same trap
+    #     on bag replay: check the bag's /tf_static for pre-existing
+    #     map/odom/base_link frames before reusing these names (see
+    #     config_07052026.yaml's resple_-prefixed frames).
     #
     # INTEGRATED STACK — wheel-odom/IMU-fed EKF (e.g. robot_localization's
     # odom EKF) plus mapping consumers (elevation_mapping, ...):
@@ -47,12 +59,21 @@
 
     cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
     cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
+    # RESPLE's own /odom covariance (the IEKF posterior) is a RELATIVE
+    # confidence signal: correct direction, overconfident magnitude — it
+    # covers the recent knot window, not accumulated global drift
+    # (verified 2026-06-12). Consumers reading it directly, with no EKF in
+    # between, must not treat it as a calibrated 1-sigma.
 
     topic_imu: /sensor/lidar/lidar0/imu
     acc_ratio: false
     # Extrinsic convention: the base_link<-sensor TF carries the mounting
     # extrinsic; q_lb/t_lb below is an EXTRA offset (identity here). Never
     # make both non-identity — they compose. See doc/PARAMETERS.md.
+    # The TF lookup is bounded: after tf_wait_timeout (default 10 s) the
+    # node FALLS BACK to YAML q_lb/t_lb alone — a bare launch (no
+    # robot_state_publisher / static TF) with identity YAML and a rotated
+    # mount fuses silently wrong. Publish the mounting TF or set it here.
     tf_extrinsics: true
     lidars: ["Ouster"]
     Ouster:
@@ -94,6 +115,13 @@
 
     imu_init_num_samples: 50     # IMU samples averaged during stationary init
     imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+    # Initial attitude: the default (init_attitude_source: gravity) BLOCKS
+    # until the IMU sees a stationary window — a launch while already
+    # moving publishes nothing until the platform first holds still.
+    # init_attitude_source: tf inits in motion from a gravity-aligned TF
+    # frame (init_attitude_frame), but don't point it at a frame an
+    # external EKF publishes if that EKF may be absent: the lookup waits
+    # tf_wait_timeout, then falls back to gravity/identity anyway.
 
     # ------------------------------------------------------------------
     # Robustness & diagnostics (see doc/PARAMETERS.md and HARDENING.md).
@@ -116,7 +144,11 @@
     nis_diverged_ratio: 4.0        # DIVERGED threshold
     nis_breach_limit: 3            # consecutive breaches before DIVERGED
     nis_recovery_mode: "off"       # "off" = log+diagnostics only
-                                   # "hold" = suspend odom/TF while DIVERGED
+                                   # "hold" = suspend odom/TF while DIVERGED —
+                                   #   for stacks where a downstream EKF
+                                   #   coasts on other sources; running SOLO
+                                   #   it freezes ALL output during the hold
+                                   #   (prefer off/reset standalone)
                                    # "reset" = reinflate filter covariance
                                    # (keep quotes: bare off is YAML false)
     nis_reset_cov: 1.0             # 'reset' reinflation variance (m^2/rad^2); recovery

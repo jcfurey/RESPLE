@@ -20,6 +20,12 @@
     # full dual-mode recipe is in config_ouster.yaml's frame block and
     # doc/PARAMETERS.md "TF ownership". The runtime guard below catches a
     # wrong flag either way.
+    # Standalone (no EKF at all): the True flags below are REQUIRED —
+    # nobody else will publish the pairs (left False the node only WARNs
+    # once while downstream TF consumers starve). And frame_id must not
+    # already have a TF parent: a URDF's base_footprint->base_link plus
+    # our odom->base_link gives base_link two parents (broken tree, no
+    # error) — use the URDF root as frame_id instead.
     odom/frame_id: odom              # Odom (odometry frame_id) frame
     map/frame_id: map                # Map frame
     frame_id: base_link              # Robot (odometry child_frame_id) frame
@@ -31,12 +37,20 @@
 
     cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg pose covariance diagonal; RESPLE /odom uses the IEKF posterior
     cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]      # Mapping-node odometry-msg twist covariance diagonal
+    # RESPLE's own /odom covariance (the IEKF posterior) is a RELATIVE
+    # confidence signal: correct direction, overconfident magnitude
+    # (recent-knot-window scope, not global drift) — consumers reading it
+    # directly must not treat it as a calibrated 1-sigma.
 
     topic_imu: /imu/data
     acc_ratio: false
     # Extrinsic convention: the base_link<-sensor TF carries the mounting
     # extrinsic; q_lb/t_lb below is an EXTRA offset (identity here). Never
     # make both non-identity — they compose. See doc/PARAMETERS.md.
+    # The TF lookup is bounded: after tf_wait_timeout (default 10 s) the
+    # node FALLS BACK to YAML q_lb/t_lb alone — a bare launch (no static
+    # TF publisher) with identity YAML and a rotated mount fuses silently
+    # wrong. Publish the mounting TF or set the calibration below.
     tf_extrinsics: true
     lidars: ["Generic"]
     Generic:
@@ -84,6 +98,10 @@
 
     imu_init_num_samples: 50     # IMU samples averaged during stationary init
     imu_init_max_variance: 5.0   # reject init if accel variance exceeds this (m/s²)²
+    # Initial attitude: the default (init_attitude_source: gravity) BLOCKS
+    # until the IMU sees a stationary window — a launch while already
+    # moving publishes nothing until the platform first holds still
+    # (init_attitude_source: tf inits in motion; see config_ouster.yaml).
 
     # ------------------------------------------------------------------
     # Robustness & diagnostics (see doc/PARAMETERS.md and HARDENING.md).
@@ -106,7 +124,11 @@
     nis_diverged_ratio: 4.0        # DIVERGED threshold
     nis_breach_limit: 3            # consecutive breaches before DIVERGED
     nis_recovery_mode: "off"       # "off" = log+diagnostics only
-                                   # "hold" = suspend odom/TF while DIVERGED
+                                   # "hold" = suspend odom/TF while DIVERGED —
+                                   #   for stacks where a downstream EKF
+                                   #   coasts on other sources; running SOLO
+                                   #   it freezes ALL output during the hold
+                                   #   (prefer off/reset standalone)
                                    # "reset" = reinflate filter covariance
                                    # (keep quotes: bare off is YAML false)
     nis_reset_cov: 1.0             # 'reset' reinflation variance (m^2/rad^2); recovery
