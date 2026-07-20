@@ -616,7 +616,12 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
         if (plsize == 0) return;
         this->pc_last->reserve(plsize);
         pcl::PointXYZINormal pt;
-        for (uint i = 1; i < plsize; i++) {
+        // Start at 0: this loop has no duplicate-point / pt_pre filter, and
+        // RESPLE's own Ouster ingest (RESPLE.cpp ousterLidarCallback) starts
+        // at 0 too — starting at 1 here silently dropped the first point of
+        // every scan. Mirrors the same i=0 fix already applied to the Livox
+        // and Hesai/Mid360 buffs below.
+        for (uint i = 0; i < plsize; i++) {
             pt.x = pc_last_ouster->points[i].x;
             pt.y = pc_last_ouster->points[i].y;
             pt.z = pc_last_ouster->points[i].z;
@@ -1266,15 +1271,24 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             // RESPLE::on_cleanup.
             tf_listener.reset();
             tf_buffer.reset();
+
+            // Same gate rationale as the resets above (hazard 88 sibling):
+            // opt_old_path (a std::vector) and path_t_ns_ are non-atomic and
+            // are read/written by the worker in process()/publishPath. A
+            // DETACHED wedged worker is still alive and will touch them when it
+            // unwedges, so clearing them here would be a data race. Skip in the
+            // leak-but-alive path — the next activate()'s path_reset_ handling
+            // in process() re-clears them on the worker thread anyway.
+            opt_old_path.poses.clear();
+            path_t_ns_ = 0;
         } else {
             RCLCPP_ERROR(this->get_logger(),
                 "[Mapping] worker thread was detached (wedged); leaking "
                 "publishers/TF buffer to keep the zombie thread memory-safe");
         }
 
-        // Clear data
-        opt_old_path.poses.clear();
-        path_t_ns_ = 0;
+        // if_init_succeed / static_map_odom_sent_ are std::atomic, so resetting
+        // them unconditionally is race-free even against a detached worker.
         if_init_succeed = false;
         // Allow re-activation to re-latch the identity map→odom TF.
         static_map_odom_sent_.store(false);
