@@ -23,6 +23,8 @@
   <depend>visualization_msgs</depend>
   <depend>std_srvs</depend>
   <depend>pcl_conversions</depend>
+  <depend>boost</depend>
+  <depend>libomp-dev</depend>
   <!-- message_runtime is not required for ROS2 packages; removed to match modern ros2 package conventions -->
   <depend>livox_ros_driver</depend>  
   <depend>livox_ros_driver2</depend>

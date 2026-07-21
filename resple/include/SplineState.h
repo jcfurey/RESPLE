@@ -241,6 +241,8 @@ class SplineState
                         // applied window begins at a nonzero absolute index.
                         std::cerr << "[SplineState] updateKnots: first window begins at absolute idx "
                                   << target << " (startup origin; expected after (re)start)\n";
+                        start_t_ns += (target - num_knot) * dt_ns;
+                        num_knots_pruned_ += (target - num_knot);
                     } else {
                         if ((update_gap_events_ & (update_gap_events_ - 1)) == 0) {
                             // Mid-run gap = real est_window loss (the Mapping

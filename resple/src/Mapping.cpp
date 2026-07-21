@@ -524,6 +524,8 @@ class MappingBase
             }
         }
         pc_out->points.resize(write_idx);
+        pc_out->width = write_idx;
+        pc_out->height = 1;
     }
 
   protected:
