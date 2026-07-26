@@ -8,6 +8,7 @@
 #include "Association.h"
 #include "utils/geometry_core.h"
 #include "utils/overload_control.h"
+#include "utils/lidar_gate.h"
 #include "utils/range_weighting.h"
 
 template<int XSIZE>
@@ -149,6 +150,25 @@ class Estimator
     // Set once at configure (params gap_extrap_decay / gap_extrap_free_knots,
     // pattern of corresp_cfg); worker-thread reads only.
     resple::overload::GapExtrapDamping gap_extrap;
+
+    // Adaptive (Mahalanobis) LiDAR outlier gate. sigma == 0 (default) is a
+    // bit-identical no-op: the legacy accept test decides every row on its own.
+    // Set once at configure (params lidar_gate_sigma /
+    // lidar_gate_max_reject_frac, pattern of corresp_cfg); worker reads only.
+    // See utils/lidar_gate.h for why an ABSOLUTE residual threshold cannot do
+    // this job, and how the disarm escape prevents a gating latch-up.
+    resple::gate::MahalanobisGate lidar_gate;
+
+    // Cumulative rows dropped by the gate; updates where it disarmed (the
+    // rejected fraction exceeded the limit, so everything was admitted); and
+    // rows admitted ONLY by the `lid_cov < var_pt·coeff_cov` disjunct while the
+    // nn_thresh test said no. The last one is pure instrumentation and is
+    // counted whether or not the gate is enabled — it measures how often the
+    // shipped accept test short-circuits, which is the whole reason this gate
+    // exists. Atomic: the diagnostics path reads them off the executor thread.
+    uint64_t mahalRejected() const { return mahal_rejected_.load(std::memory_order_relaxed); }
+    uint64_t mahalDisarms() const { return mahal_disarms_.load(std::memory_order_relaxed); }
+    uint64_t covEscapeAdmits() const { return cov_escape_admits_.load(std::memory_order_relaxed); }
 
     // Cumulative knots extrapolated beyond the free window (i.e. genuine gap
     // fast-forwards, counted whether or not damping is active). Atomic because
@@ -801,6 +821,14 @@ class Estimator
     // Spline edge (maxTimeNs) most recently charged one cov_sys increment by a
     // zero-time propRCP. See propRCP for why this is per-edge and not per-call.
     int64_t cov_sys_edge_ns_ = std::numeric_limits<int64_t>::min();
+
+    // Row indices the adaptive gate flagged in the current assembly pass. A
+    // member (not a local) so the allocation is reused across updates —
+    // clear() keeps the capacity. Worker thread only.
+    std::vector<int> mahal_reject_;
+    std::atomic<uint64_t> mahal_rejected_{0};
+    std::atomic<uint64_t> mahal_disarms_{0};
+    std::atomic<uint64_t> cov_escape_admits_{0};
     // See gapExtrapKnots(): knots propRCP added beyond the free window.
     std::atomic<uint64_t> gap_extrap_knots_{0};
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
@@ -844,6 +872,43 @@ class Estimator
             loc_gate_persist_ctr_ = 0;
             loc_gate_cov_infl_ *= loc_gate_cov_decay;    // relax when observable
         }
+    }
+
+    // Finish the adaptive LiDAR outlier gate for one assembled measurement
+    // block (utils/lidar_gate.h). The assemblers fill every row that passes the
+    // legacy accept test and record which of them the gate flagged; this decides
+    // whether the gate holds and, if so, zeroes the flagged rows.
+    //
+    // Zeroing IS rejection in this assembler: update() sums HᵗR⁻¹H and HᵗR⁻¹ν,
+    // so an all-zero H row with a zero innovation contributes nothing to either,
+    // and update()'s dof counter already excludes such rows from the NIS
+    // statistic (see its comment). The row's cov_inv_buf_ entry is left as-is
+    // for the same reason it is for legacy-rejected rows: it multiplies zeros.
+    //
+    // When the gate disarms (too large a rejected fraction — evidence against
+    // the prior rather than the data) the flagged rows' loc-gate contributions
+    // are folded back in, so the degeneracy verdict sees exactly the row set the
+    // filter used. Nothing here runs when the gate is disabled.
+    void applyMahalanobisGate(int accepted_rows,
+                              const Eigen::Matrix3d& mahal_Ett, double mahal_w, int mahal_n,
+                              Eigen::Matrix3d& gate_Ett, double& gate_w, int& gate_n)
+    {
+        if (mahal_reject_.empty()) return;
+        if (!lidar_gate.staysArmed(static_cast<int>(mahal_reject_.size()), accepted_rows)) {
+            gate_Ett.noalias() += mahal_Ett;
+            gate_w += mahal_w;
+            gate_n += mahal_n;
+            mahal_disarms_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        for (int row : mahal_reject_) {
+            H_buf_.row(row).setZero();
+            innv_buf_(row) = 0.0;
+            if (loc_gate_trans_min_eig > 0.0 && row < loc_gate_mask_.size()) {
+                loc_gate_mask_(row) = 0.0;
+            }
+        }
+        mahal_rejected_.fetch_add(mahal_reject_.size(), std::memory_order_relaxed);
     }
 
     // Decide whether this update's LiDAR constraint set is degenerate and
@@ -1018,6 +1083,15 @@ class Estimator
         if (loc_gate_trans_min_eig > 0.0) {
             loc_gate_mask_ = Eigen::ArrayXd::Ones(num_valid);  // LO: all rows LiDAR
         }
+        // Adaptive outlier gate (utils/lidar_gate.h). Rows are assembled
+        // optimistically and the flagged ones are zeroed after the pass, IF the
+        // gate holds — so the escape hatch costs nothing and the disabled case
+        // (default) never touches any of this.
+        mahal_reject_.clear();
+        Eigen::Matrix3d mahal_Ett = Eigen::Matrix3d::Zero();
+        double mahal_w = 0.0;
+        int mahal_n = 0;
+        int accepted_rows = 0;
         for(size_t i = 0; i < num_pt; i++) {
             const PointData& pt_data = pt_meas[i];
             if (pt_data.if_valid) {
@@ -1026,9 +1100,21 @@ class Estimator
                 double lid_cov = Hi*cov_rcp*Hi.transpose() + pt_data.var_pt;
                 const double noise_scale =
                     resple::range::rangeNoiseWeight(rn_cfg, pt_data.range_sensor, rn_norm);
-                if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
+                const bool within_thresh = abs(pt_data.zp) < pt_thresh;
+                if (within_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
                     innv_buf_(idx_offset) = - pt_data.zp;
                     H_buf_.row(idx_offset) = Hi;
+                    ++accepted_rows;
+                    // Instrumentation for the inert-gate finding: rows the
+                    // nn_thresh test would have rejected, admitted only by the
+                    // cov_thresh disjunct. Counted at admit time, i.e. this
+                    // measures the LEGACY exposure regardless of what the
+                    // Mahalanobis gate does with the row below.
+                    if (!within_thresh) {
+                        cov_escape_admits_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    const bool reject = lidar_gate.rejects(pt_data.zp, lid_cov);
+                    if (reject) { mahal_reject_.push_back(idx_offset); }
                     if (loc_gate_trans_min_eig > 0.0) {
                         // Weight E_tt by the row's RELATIVE information weight
                         // (1/noise_scale): with the close-range down-weighting
@@ -1038,9 +1124,20 @@ class Estimator
                         // -tunnel case the gate exists for. Far points
                         // (weight 1) reproduce the old accumulation exactly.
                         const double w = 1.0 / noise_scale;
-                        gate_Ett.noalias() += w * (pt_data.normvec * pt_data.normvec.transpose());
-                        gate_w += w;
-                        gate_n++;
+                        const Eigen::Matrix3d nnt =
+                            pt_data.normvec * pt_data.normvec.transpose();
+                        // Gate-flagged rows accumulate separately and are added
+                        // back only if the gate disarms — so the armed case never
+                        // pays a subtractive cancellation.
+                        if (reject) {
+                            mahal_Ett.noalias() += w * nnt;
+                            mahal_w += w;
+                            mahal_n++;
+                        } else {
+                            gate_Ett.noalias() += w * nnt;
+                            gate_w += w;
+                            gate_n++;
+                        }
                     }
                 }
                 cov_inv_buf_(idx_offset) =
@@ -1048,6 +1145,8 @@ class Estimator
                 idx_offset++;
             }
         }
+        applyMahalanobisGate(accepted_rows, mahal_Ett, mahal_w, mahal_n,
+                             gate_Ett, gate_w, gate_n);
         armLocGate(gate_Ett, gate_w, gate_n);
         return update(innv_buf_, cov_inv_buf_, H_buf_, x_prop, P_prop);
     }
@@ -1088,6 +1187,13 @@ class Estimator
         if (loc_gate_trans_min_eig > 0.0) {
             loc_gate_mask_ = Eigen::ArrayXd::Zero(dim_meas);
         }
+        // Adaptive outlier gate — see updateLiDAR for the mechanism. IMU rows are
+        // never gated (they carry their own residual clamp below).
+        mahal_reject_.clear();
+        Eigen::Matrix3d mahal_Ett = Eigen::Matrix3d::Zero();
+        double mahal_w = 0.0;
+        int mahal_n = 0;
+        int accepted_rows = 0;
         for (size_t j = 0; j < imu_meas.size() + pt_meas.size(); j++) {
             if ((id_pt < pt_meas.size() && id_imu < imu_meas.size() && pt_meas[id_pt].time_ns < imu_meas[id_imu].time_ns) ||
                 (id_pt < pt_meas.size() && id_imu >= imu_meas.size())) {
@@ -1097,16 +1203,31 @@ class Estimator
                         double lid_cov = pt_data.H*cov*pt_data.H.transpose() + pt_data.var_pt;
                         const double noise_scale =
                             resple::range::rangeNoiseWeight(rn_cfg, pt_data.range_sensor, rn_norm);
-                        if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
+                        const bool within_thresh = abs(pt_data.zp) < pt_thresh;
+                        if (within_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
                             innv_buf_(idx_offset) = - pt_data.zp;
                             H_buf_.block(idx_offset, 0, 1, 24) = pt_data.H;
+                            ++accepted_rows;
+                            if (!within_thresh) {
+                                cov_escape_admits_.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            const bool reject = lidar_gate.rejects(pt_data.zp, lid_cov);
+                            if (reject) { mahal_reject_.push_back(idx_offset); }
                             if (loc_gate_trans_min_eig > 0.0) {
                                 loc_gate_mask_(idx_offset) = 1.0;
                                 // Relative information weight — see updateLiDAR.
                                 const double w = 1.0 / noise_scale;
-                                gate_Ett.noalias() += w * (pt_data.normvec * pt_data.normvec.transpose());
-                                gate_w += w;
-                                gate_n++;
+                                const Eigen::Matrix3d nnt =
+                                    pt_data.normvec * pt_data.normvec.transpose();
+                                if (reject) {
+                                    mahal_Ett.noalias() += w * nnt;
+                                    mahal_w += w;
+                                    mahal_n++;
+                                } else {
+                                    gate_Ett.noalias() += w * nnt;
+                                    gate_w += w;
+                                    gate_n++;
+                                }
                             }
                         }
                         cov_inv_buf_(idx_offset) =
@@ -1145,6 +1266,8 @@ class Estimator
                     id_imu++;
             }
         }
+        applyMahalanobisGate(accepted_rows, mahal_Ett, mahal_w, mahal_n,
+                             gate_Ett, gate_w, gate_n);
         armLocGate(gate_Ett, gate_w, gate_n);
         return update(innv_buf_, cov_inv_buf_, H_buf_, x_prop, P_prop);
     }

@@ -84,3 +84,28 @@ uint64 tf_foreign_same_pair
 uint64 tf_foreign_other_parent
 bool tf_conflict_active
 bool tf_yielding
+
+# --- LiDAR row gating (2026-07-26 accuracy pass) ---
+# cov_escape_admits: cumulative rows admitted into an IEKF update by the
+# `lid_cov < var_pt*coeff_cov` disjunct of the accept test while |zp| was NOT
+# below nn_thresh -- i.e. rows the residual threshold would have rejected.
+# Because lid_cov >= var_pt always, that disjunct holds for any converged
+# covariance when coeff_cov > 1 (production ships 3.0), so a large and steadily
+# growing value is EXPECTED and means nn_thresh is not binding. This is the
+# measurement that tells you whether the adaptive gate below is worth enabling;
+# it is counted whether or not that gate is on.
+uint64 cov_escape_admits
+# lidar_gate_rejected: cumulative rows dropped by the adaptive (Mahalanobis)
+# gate, i.e. |zp| beyond lidar_gate_sigma standard deviations of the predicted
+# innovation. Always 0 with lidar_gate_sigma = 0 (the default).
+uint64 lidar_gate_rejected
+# lidar_gate_disarms: updates where the gate stood down because more than
+# lidar_gate_max_reject_frac of the candidate rows would have been rejected --
+# read as evidence against the PRIOR rather than the data. A steady stream of
+# these means the filter is over-confident (cross-check `nis`), not that the
+# scan is bad.
+uint64 lidar_gate_disarms
+# cov_sanitized: publish batches whose pose/twist covariance failed the
+# on-the-wire sanity check (non-finite entry, or non-positive diagonal). MUST
+# stay 0; any other value is a bug report, not a tuning signal.
+uint64 cov_sanitized

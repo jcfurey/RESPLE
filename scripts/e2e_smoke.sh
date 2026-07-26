@@ -92,8 +92,19 @@ child_status() {
 }
 
 echo "==> run RESPLE + injector, checker collects for ${SECS}s"
+# Optional extra node params, for exercising a default-off feature against the
+# known-ground-truth scene without editing the params file:
+#   RESPLE_EXTRA_ARGS="-p lidar_gate_sigma:=5.0" ./scripts/e2e_smoke.sh
+# Empty by default — the pass criteria below are calibrated for the shipped
+# defaults, so a run with overrides proves "this path still works", not "this
+# path is better".
+read -r -a EXTRA_ARGS <<< "${RESPLE_EXTRA_ARGS:-}"
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  echo "==> extra params: ${EXTRA_ARGS[*]}"
+fi
 ./install/resple/lib/resple/RESPLE --ros-args \
-  --params-file "${TOOLS}/inject_pointcloud2.yaml" > "${LOGDIR}/resple.log" 2>&1 &
+  --params-file "${TOOLS}/inject_pointcloud2.yaml" \
+  "${EXTRA_ARGS[@]}" > "${LOGDIR}/resple.log" 2>&1 &
 RP=$!
 sleep 2
 # Fail fast on a startup abort (bad params, missing plugin, SIGILL from a

@@ -152,6 +152,25 @@
     robust_kernel_delta: 0.1
 
     # ------------------------------------------------------------------
+    # Adaptive residual gate — mis-associations at range
+    # ------------------------------------------------------------------
+    # [NARROW] ON (production: 0 = off). The Huber kernel above SOFTENS an
+    # outlier's weight but never removes it, and the shipped accept test never
+    # rejects one in steady state: `|zp| < nn_thresh || lid_cov <
+    # var_pt*coeff_cov` short-circuits on the second disjunct for any converged
+    # covariance whenever coeff_cov > 1. The coeff_cov: 1.0 set above makes that
+    # disjunct unsatisfiable and so activates nn_thresh; this gate goes further
+    # and normalizes by the PREDICTED innovation variance, so it relaxes on its
+    # own during init and after a gap instead of needing a second threshold.
+    # 5 sigma lands at ~0.5 m once converged (the nn_thresh value) and widens
+    # while the covariance is large. It disarms itself if it would reject more
+    # than half the rows — that pattern means the prior is wrong, not the scan.
+    # Watch cov_escape_admits / lidar_gate_rejected / lidar_gate_disarms in the
+    # Diagnostics msg. See utils/lidar_gate.h and doc/PARAMETERS.md.
+    lidar_gate_sigma: 5.0
+    lidar_gate_max_reject_frac: 0.5
+
+    # ------------------------------------------------------------------
     # Plane-fit gating — small curved patches
     # ------------------------------------------------------------------
     # [NARROW] With 0.075 m voxels an 8-neighbor patch spans ~0.3 m; on a

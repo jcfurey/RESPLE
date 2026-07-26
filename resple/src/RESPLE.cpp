@@ -1556,6 +1556,14 @@ public:
                             this->now().nanoseconds(), tf_conflict_quiet_ns_)
                         || tf_own_monitor_.foreignStaticSeen();
                     dmsg.tf_yielding = tf_yield_active_.load(std::memory_order_relaxed);
+                    // LiDAR row gating (2026-07-26 accuracy pass).
+                    dmsg.cov_escape_admits = if_lidar_only
+                        ? estimator_lo.covEscapeAdmits() : estimator_lio.covEscapeAdmits();
+                    dmsg.lidar_gate_rejected = if_lidar_only
+                        ? estimator_lo.mahalRejected() : estimator_lio.mahalRejected();
+                    dmsg.lidar_gate_disarms = if_lidar_only
+                        ? estimator_lo.mahalDisarms() : estimator_lio.mahalDisarms();
+                    dmsg.cov_sanitized = cov_sanitized_.load(std::memory_order_relaxed);
                     pub_diag_->publish(dmsg);
                 }
 
@@ -2504,6 +2512,48 @@ private:
             }
         }
 
+        // Adaptive (Mahalanobis) LiDAR outlier gate — utils/lidar_gate.h.
+        //
+        // Motivation: the shipped accept test is `|zp| < nn_thresh ||
+        // lid_cov < var_pt*coeff_cov`, and with coeff_cov=3.0 the second
+        // disjunct holds for ANY converged covariance, so it short-circuits and
+        // nn_thresh never binds. findCorresp's `|pd2| < sqrt(range)/9` is then
+        // the only outlier rejection that fires, and it admits 0.35 m of
+        // off-plane error at 10 m / 0.79 m at 50 m at FULL weight (the robust
+        // kernel is off by default). This gate normalizes the residual by the
+        // predicted innovation variance instead, so it relaxes while the filter
+        // is uncertain (init, post-gap) and tightens once converged — and it
+        // disarms itself when it would reject too much, which is the signature
+        // of a wrong prior rather than bad data.
+        //
+        // Default sigma 0 = off, per the HARDENING category-8 rule (outlier
+        // rejection changes wait on bag A/B). The cov_escape_admits counter
+        // below ships regardless, so the exposure is measurable BEFORE flipping
+        // this on: it counts rows admitted only by the cov_thresh disjunct.
+        {
+            const double gsigma = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "lidar_gate_sigma", 0.0);
+            double gfrac = CommonUtils::readParam<double>(
+                this->get_node_parameters_interface(), "lidar_gate_max_reject_frac", 0.5);
+            if (gfrac < 0.0 || gfrac > 1.0) {
+                RCLCPP_WARN(this->get_logger(),
+                    "lidar_gate_max_reject_frac=%.3f outside [0,1]; using 0.5", gfrac);
+                gfrac = 0.5;
+            }
+            estimator_lo.lidar_gate.sigma = gsigma;
+            estimator_lio.lidar_gate.sigma = gsigma;
+            estimator_lo.lidar_gate.max_reject_frac = gfrac;
+            estimator_lio.lidar_gate.max_reject_frac = gfrac;
+            if (gsigma > 0.0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] lidar_gate_sigma=%.2f (disarm above %.0f%% rejected): "
+                    "point-to-plane rows beyond %.2f sigma of the predicted "
+                    "innovation are dropped. With var_pt=0.01 that is ~%.2f m "
+                    "once converged, widening while the covariance is large.",
+                    gsigma, gfrac * 100.0, gsigma, gsigma * 0.1);
+            }
+        }
+
         // Overload hardening (2026-07-07): damped propRCP gap extrapolation.
         // decay 1.0 (default) is a bit-identical no-op — propRCP takes the
         // literal legacy constant-velocity expression. decay < 1 geometrically
@@ -3387,6 +3437,27 @@ private:
             last_corresp_used_         = used;
         }
 
+        // LiDAR row gating (2026-07-26 accuracy pass). "Admitted Past nn_thresh"
+        // counts rows the residual threshold rejected but the
+        // `lid_cov < var_pt*coeff_cov` disjunct let in — with coeff_cov=3.0 that
+        // disjunct always holds once converged, so a big number here is the
+        // expected reading and quantifies what an outlier gate would have to
+        // work on. The other two are 0 unless lidar_gate_sigma is set.
+        stat.add("Admitted Past nn_thresh (cumulative)",
+                 static_cast<int>(if_lidar_only ? estimator_lo.covEscapeAdmits()
+                                                : estimator_lio.covEscapeAdmits()));
+        stat.add("LiDAR Gate Rejected (cumulative)",
+                 static_cast<int>(if_lidar_only ? estimator_lo.mahalRejected()
+                                                : estimator_lio.mahalRejected()));
+        stat.add("LiDAR Gate Disarms (cumulative)",
+                 static_cast<int>(if_lidar_only ? estimator_lo.mahalDisarms()
+                                                : estimator_lio.mahalDisarms()));
+        // Must be 0. Non-zero means a non-finite / non-positive-diagonal
+        // covariance was caught on its way out (hazard 96) — a bug, not tuning.
+        const uint64_t cov_bad = cov_sanitized_.load(std::memory_order_relaxed);
+        stat.add("Covariance Sanitized (cumulative, MUST be 0)",
+                 static_cast<int>(cov_bad));
+
         // HARDENING §3.4: how many radius-prune deletions have run (0 when
         // map_prune_radius is disabled or the pose hasn't moved enough).
         stat.add("Map Radius Prunes (cumulative)",
@@ -3535,6 +3606,16 @@ private:
             level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
             msg = (fh_state == 1) ? "Filter consistency warning (windowed NIS)"
                                   : "IMU input faults detected";
+        }
+
+        // A covariance that had to be sanitized on its way out is an internal
+        // inconsistency, not a degraded-input condition — escalate to ERROR
+        // unconditionally (it outranks the NIS verdict: a NaN posterior would
+        // also make NIS non-finite, and this names the actual problem).
+        if (cov_bad > 0) {
+            level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+            msg = "Published covariance had to be sanitized (non-finite or "
+                  "non-positive diagonal) — internal bug";
         }
 
         stat.summary(level, msg);

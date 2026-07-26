@@ -48,6 +48,7 @@ set(RESPLE_TEST_SOURCES
   test_spline_state.cpp
   test_est_window_anchor.cpp
   test_range_weighting.cpp
+  test_lidar_gate.cpp
 )
 
 foreach(src ${RESPLE_TEST_SOURCES})

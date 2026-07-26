@@ -416,6 +416,7 @@ reference (status as of latest pass):
 | 94 | **IMU samples were fused more than once.** `pt_meas` is cleared after every frame; `imu_meas` never was, and the pre-update trim only drops samples older than `maxTimeNs − dt`, so every staged sample still inside the newest knot interval was re-fused on the following pass. The spline advances only when `pt_min_time > maxTimeNs` (`collectMeasurements`), so a knot interval holding more than `num_points_upd`=300 points takes several batches against the SAME edge — and each batch re-fused the same 6 IMU rows, with a residual the first fusion had already absorbed. The state barely moves; the posterior tightens as if a second independent sample had arrived. Effect: the IMU carries up to ~2× its configured information on dense scans, i.e. a systematically **over-confident** covariance on exactly the directions the IMU observes — published straight into the consumer EKF, which weights by inverse covariance. Also self-inflicted: a batch that drained 0 points but retained IMU ran an IEKF that broke out with `num_tot_eff==0`, feeding the §3.3 NIS detector a NaN breach for a frame that had nothing wrong with it | **fixed** (consume-once: clear `imu_meas` after a fusion that actually ran, gated on the new `Estimator::lastUpdatePerformed()` so a zero-correspondence frame keeps its unfused samples for the next pass; the trim stays as the out-of-window guard) | 2026-07-26 |
 | 95 | **Process noise was injected per IEKF call, not per unit time.** `propRCP(t)`'s no-advance branch (`maxTimeNs() >= t`, i.e. the state window is UNCHANGED — a zero-time propagation) did `cov_rcp += cov_sys` unconditionally. Combined with hazard 94's multi-batch case, the process noise charged per knot interval scaled with the number of batches that happened to land in it — and that count is set by `num_points_upd` versus the scan's point density, hence by scene geometry and CPU load. Two batches per interval doubled the injected noise, so the same bag ran with a different prior/measurement balance at a different point density: a silent, load-dependent retune of the filter, in the direction of under-trusting the prior exactly when the scene is dense | **fixed** (inject at most once per distinct spline edge; bit-identical in the steady one-batch-per-knot case because the growth `propRCP` in `collectMeasurements` advances the edge first, and extra batches inside one interval now fold in sequentially with no artificial inflation between them — the correct treatment of independent measurements against one state window. `maxTimeNs()` is monotonic, so no ABA) | 2026-07-26 |
 | 96 | No sanity check on the pose/twist covariance leaving the node. Every producer path is guarded (LLT failure → update skipped, NIS → divergence detector, non-finite points dropped at ingest), so a bad matrix means a bug — but `robot_localization` INVERTS the block it fuses, so one non-finite entry turns the consumer's entire state NaN permanently, with no diagnostic pointing back at RESPLE; a zero or negative diagonal (roundoff-negative variance, or an exactly-zero one at t=0) makes that inversion singular | **fixed** (`resple::health::sanitizeCovariance` in the unit-tested `utils/filter_health.h`, applied to `/odom` + `/pose_cov` and to `Estimate.pose_covariance`: any non-finite entry replaces the WHOLE matrix with an uninformative diagonal — a partially patched covariance is not a valid one — and non-positive diagonals are floored. Counted, and ERROR/WARN-throttled) | 2026-07-26 |
+| 97 | **No outlier rejection fires at the update stage in steady state.** The accept test is `\|zp\| < nn_thresh` **\|\|** `lid_cov < var_pt·coeff_cov`; the second disjunct holds for any converged `P` when `coeff_cov > 1` (production 3.0), so `nn_thresh` never binds — and `robust_kernel` is `none` by default, so nothing down-weights either. `findCorresp`'s `\|pd2\| < sqrt(range)/9` is the only filter, and it admits 0.35 m of off-plane error at 10 m / 0.79 m at 50 m **at full weight**, on the rows with the longest lever arm on rotation | **capability landed, default off** (`lidar_gate_sigma`: reject when `zp² > sigma²·lid_cov`, i.e. normalized by the PREDICTED innovation instead of an absolute distance, so one setting covers both the loose post-init/post-gap regime and the converged one; `lidar_gate_max_reject_frac` (0.5) disarms the gate when it would reject more than that fraction — the standard defence against a normalized gate latching in a divergence, and the reason it cannot starve the filter. Decision logic in the unit-tested `utils/lidar_gate.h`. The `cov_escape_admits` counter ships REGARDLESS of the gate, so the exposure is measurable before anyone flips it on) | 2026-07-26 |
 
 **2026-07-26 accuracy pass (hazards 94–96):** driven by "anything that produces
 accuracy should be prioritized", a pass over the measurement-weighting path
@@ -426,6 +427,21 @@ measurement batch (dense scan vs. `num_points_upd`) — a regime no unit test
 reaches and no single-frame reading exposes. They pull in opposite directions
 (94 over-tightens the posterior, 95 over-loosens the prior) and are therefore
 landed together, not separately: fixing one alone shifts the tuning.
+
+Hazard 97's gate was validated on the running node (`scripts/e2e_smoke.sh`,
+which now takes `RESPLE_EXTRA_ARGS` for exactly this), not just in unit tests:
+
+- default (`lidar_gate_sigma: 0`) and armed (`5.0`) runs both pass the
+  stationary-scene criteria with the same 1.3–1.4 mm final drift, and with the
+  gate armed on clean data it rejects **nothing** (174/174 correspondences used)
+  — no false positives to pay for.
+- `cov_escape_admits` is a real discriminator, not a constant: 0 on the clean
+  synthetic scene (where `nn_thresh` genuinely binds), **2 516 303** in the same
+  run with `nn_thresh: 0.001` forcing every row through the escape disjunct.
+- the non-starvation property holds on the real filter, not only in the unit
+  test: with an absurd `lidar_gate_sigma: 0.0005` the gate flagged most rows on
+  **10 468 consecutive updates and disarmed on every one** — `rejected` stayed
+  exactly 0, NIS stayed healthy (0.81×dof), the node never diverged.
 
 Deliberately NOT changed, with the reasoning recorded so it is not re-litigated:
 
@@ -612,6 +628,8 @@ Canonical values in `src/settings/params/localization/resple.yaml`:
 | `nn_max_sq_dist` | §3.2 k-th-neighbor squared-distance gate (m²); search radius = sqrt of this | `5.0` |
 | `plane_fit_thresh` | §3.2 esti_plane residual threshold (m) | `0.1` |
 | `plane_min_cond_ratio` | §3.2 plane-fit degeneracy guard (QR pivot ratio; 0 = off, pending bag benchmark) | `0.0` |
+| `lidar_gate_sigma` | hazard 97 adaptive outlier gate: drop a point-to-plane row when `zp² > sigma²·lid_cov` (standard deviations of the PREDICTED innovation, not metres — so it relaxes while `P` is large and tightens once converged). ~`sigma`×0.1 m at the shipped `var_pt`. 0 = off | `0.0` |
+| `lidar_gate_max_reject_frac` | gate escape hatch: disarm (admit everything) when more than this fraction of the update's candidate rows would be rejected — a wrong PRIOR looks like this, and disarming is what stops a normalized gate from locking in a divergence | `0.5` |
 | `map_prune_radius` | §3.4 keep only map points within this distance (m) of the pose; floored at 2×det_range; 0 = off (cube-only) | `0.0` |
 | `nis_recovery_mode` | §3.3 divergence recovery: `off` (detect-only) / `hold` (gate odom+TF while DIVERGED) / `reset` (reinflate IEKF covariance to `nis_reset_cov`) | `off` |
 | `max_scan_buffer` | §2.3 per-LiDAR raw-scan cap (scans, drop-oldest; 0 = unbounded) | `0` |
