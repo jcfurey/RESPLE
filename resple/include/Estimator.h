@@ -128,8 +128,12 @@ class Estimator
         return resple::range::rangeNoiseScale(rangeNoiseConfig(), range_sensor);
     }
 
-    // Largest range among the returns this update will actually use. Rejected
-    // rows carry no information, so they must not set the reference.
+    // Largest range among the returns fed to this update. NOTE: this filters on
+    // `if_valid` (findCorresp accepted the correspondence) — it does NOT know
+    // about the later per-row accept gate in updateLiDAR*, so a row that ends
+    // up all-zero can still set the reference. Deliberate: if_valid is what is
+    // known at this point, and a slightly larger reference only makes the
+    // relative down-weighting more conservative.
     static float maxValidRange(const Eigen::aligned_deque<PointData>& pt_meas)
     {
         float r_max = 0.f;
@@ -165,6 +169,13 @@ class Estimator
     // read on the worker thread only (not atomic by design).
     double lastNis() const { return last_nis_; }
     int lastNisDof() const { return last_nis_dof_; }
+
+    // IEKF iterations the last updateIEKF* call actually ran. The diagnostics
+    // used to accumulate the `n_iter` PARAMETER (a constant 1 in the shipped
+    // config) instead, so "avg IEKF iterations" under-reported by ~2x: with
+    // n_iter=1 the loop's exit needs t>1, i.e. two associations and two
+    // update() calls on the normal path. Worker-thread only, like corresp_stats.
+    int lastIterations() const { return last_iterations_; }
 
     // HARDENING SS3.3 'reset' recovery (bug A2): reinflate the IEKF covariance
     // to a genuine recovery covariance while keeping the state (spline +
@@ -257,6 +268,7 @@ class Estimator
         bool updated = false;
         for (int i = 0; i < max_iter; i++) {
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
+            last_iterations_ = i + 1;
             if (converged) {
                 num_tot_eff = 0;
                 Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, corresp_cfg, &corresp_stats, num_threads, num_match_points);
@@ -331,6 +343,7 @@ class Estimator
         bool updated = false;
         for (int i = 0; i < max_iter; i++) {
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
+            last_iterations_ = i + 1;
             if (converged) {
                 num_tot_eff = 0;
                 Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, corresp_cfg, &corresp_stats, num_threads, num_match_points);
@@ -402,6 +415,7 @@ class Estimator
         bool updated = false;
         for (int i = 0; i < max_iter; i++) {
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
+            last_iterations_ = i + 1;
             if (converged) {
                 num_tot_eff = 0;
                 Association::findCorresp(num_tot_eff, &spl, cuda_map, pt_meas, pt_neighbors, corresp_cfg, &corresp_stats, num_threads, num_match_points);
@@ -476,6 +490,7 @@ class Estimator
         bool updated = false;
         for (int i = 0; i < max_iter; i++) {
             Eigen::Matrix<double, XSIZE, 1> rcpi = getState();
+            last_iterations_ = i + 1;
             if (converged) {
                 num_tot_eff = 0;
                 Association::findCorresp(num_tot_eff, &spl, ikdtree, pt_meas, pt_neighbors, corresp_cfg, &corresp_stats, num_threads, num_match_points);
@@ -733,6 +748,8 @@ class Estimator
     // update(); NaN if that update failed. Written by update() only.
     double last_nis_ = std::numeric_limits<double>::quiet_NaN();
     int last_nis_dof_ = 0;
+    // See lastIterations(): actual iteration count of the latest update.
+    int last_iterations_ = 0;
     // See gapExtrapKnots(): knots propRCP added beyond the free window.
     std::atomic<uint64_t> gap_extrap_knots_{0};
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;
@@ -866,8 +883,15 @@ class Estimator
                 Hi.block(3, j*6 + 3, 3, 3) = J_gyro.d_val_d_knot[i];                
             }
         }       
-        Hi.block(0, BA_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();
-        Hi.block(3, BG_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();            
+        // Bias columns exist only in the LIO state (XSIZE==30). Guarded because
+        // BA_OFFSET/BG_OFFSET are 24/27: on an Estimator<24> these blocks run
+        // off the end of the 6xXSIZE matrix. Unreachable today (only the LIO
+        // estimator takes the inertial path) but the guard costs nothing and
+        // the failure mode under -DNDEBUG is a silent out-of-range write.
+        if constexpr (XSIZE == 30) {
+            Hi.block(0, BA_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();
+            Hi.block(3, BG_OFFSET, 3, 3) = Eigen::Matrix3d::Identity();
+        }
         imu_data.imu_itp.head<3>() = RT * a_w + ba;
         imu_data.imu_itp.tail<3>() = rot_vel + bg;
         imu_data.H = Hi.template leftCols<24>();

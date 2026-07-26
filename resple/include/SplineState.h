@@ -635,6 +635,11 @@ class SplineState
                         << " out of range; returning identity quaternion");
                     if (q_out) *q_out = Eigen::Quaterniond::Identity();
                     if (J_q) { J_q->d_val_d_knot.clear(); J_q->start_idx = 0; }
+                    // Clear J_p too: prepLiDAR/prepIMU walk J_pos and index
+                    // J_ortdel in LOCKSTEP, so leaving the position Jacobian
+                    // sized while the orientation one is empty is a vector OOB
+                    // read. Both empty => the point contributes a zero H row.
+                    if (J_p) { J_p->d_val_d_knot.clear(); J_p->start_idx = 0; }
                     return;
                 }
                 cp0 = q_knots[cp0_idx];
@@ -648,6 +653,8 @@ class SplineState
                 RESPLE_LOG_INVARIANT_ONCE("itpPose idx_r=" << idx_r << " out of range; returning identity quaternion");
                 if (q_out) *q_out = Eigen::Quaterniond::Identity();
                 if (J_q) { J_q->d_val_d_knot.clear(); J_q->start_idx = 0; }
+                // See above: J_p must be cleared in lockstep with J_q.
+                if (J_p) { J_p->d_val_d_knot.clear(); J_p->start_idx = 0; }
                 return;
             }
 

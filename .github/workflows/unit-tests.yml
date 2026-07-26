@@ -42,6 +42,15 @@ jobs:
         # silently dropped the ikd-Tree concurrency regression (Phase 2.4/2.5)
         # and reported a smaller suite as green. Verified locally: the PCL-gated
         # target contributes 2 ctest cases that are otherwise absent.
+        #
+        # Runtime note (measured on a 4-CPU box, i.e. runner-equivalent):
+        # IkdTreeConcurrency.RebuildVsMutatorRace takes ~135 s natively — NOT
+        # the "~9 s" claimed in test_ikdtree_concurrency.cpp, which must have
+        # been measured on a much wider machine. It is the dominant cost of this
+        # job and it runs against the 300 s TIMEOUT the test sets, so ~2x
+        # headroom. If this job starts flaking on that one case, raise that
+        # TIMEOUT rather than dropping the test — the case is also covered by
+        # ikdtree-tsan below, which has its own 45-minute budget.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \

@@ -411,6 +411,43 @@ reference (status as of latest pass):
 | 91 | `/odom` + `/pose_cov` reported the pose ORIENTATION covariance in the BODY frame while `geometry_msgs/PoseWithCovariance` specifies a **fixed-axis** representation (axes of `header.frame_id`, i.e. `odom`). `getLastPoseCovariance`'s `G` was `2·rows1..3 of Qleft(q⁻¹)` — the right/local perturbation `δφ_b = 2·imag(q⁻¹⊗δq)` — while the message contract wants `δφ_w = 2·imag(δq⊗q⁻¹)`. `robot_localization` rotates an incoming pose covariance only from the message frame into its world frame, which is IDENTITY here (frame_id is already `odom`), so it consumed the body-frame block verbatim as world roll/pitch/yaw: any anisotropy landed on the wrong axes (over-trusting the least-observable one) and the position↔rotation cross blocks mixed frames. The position 3×3 was, and remains, correct (world). Impact is nil at identity attitude and grows with the yaw/tilt of the platform | **fixed** (`resple::geom::quatPerturbToWorld`, the `Qright(q⁻¹)` form, in the unit-tested `utils/geometry_core.h`; `P_world = R·P_body·Rᵗ`, so using the world map fixes the rotation block AND the cross blocks in one step). Regression: `test_geometry_core.cpp` `PoseCovMaps.*` pins `G_world = R·G_body`, that each map recovers the perturbation applied on its own side, and that the frame choice is observable in an anisotropic variance | 2026-07-26 |
 | 92 | `estimate_msgs/Estimate.pose_covariance` is documented in the `.msg` as "6x6 IEKF posterior covariance for the last knot" but was assigned **nowhere** in the repo — it shipped 36 zeros, i.e. *perfect certainty*, to any subscriber that trusted it (a fusing consumer computes gain ≈ 1 and collapses its own covariance). `Estimate.header` likewise shipped stamp 0. In-repo harmless (Mapping never reads either), so the exposure is external subscribers | **fixed** (populated from the same posterior `/odom` publishes, under `spline_mutex_`; header stamped with the spline-edge DATA time, consistent with `/odom` and `/current_scan`). Note the est_window copy deliberately carries the RAW filter posterior — it omits the loc-gate advisory inflation `/odom` adds | 2026-07-26 |
 
+| 93 | Estimator/robustness tail from the 2026-07-26 math re-review (core math verified CORRECT — 22/22 finite-difference checks against the real `prepLiDAR`/`prepIMU`/`update`): `prepIMU` wrote the bias columns (`BA_OFFSET`=24/`BG_OFFSET`=27) with no `if constexpr (XSIZE==30)` guard, out of range on an `Estimator<24>` (unreachable today — only the LIO estimator takes the inertial path — but a silent out-of-range write under `-DNDEBUG`); `itpPose`'s defensive early-returns cleared `J_q` while leaving `J_p` sized, and `prepLiDAR`/`prepIMU` walk the two in LOCKSTEP → `std::vector` OOB read; the "avg IEKF iterations" diagnostic accumulated the `n_iter` PARAMETER (constant 1) instead of the actual count, under-reporting ~2× (with `n_iter=1` the loop exit needs `t>1`, i.e. two associations and two `update()` calls); a missing/mistyped per-lidar `w_pt` fell back to `1e-9` = σ 31 µm ⇒ `R_inv` 1e9, i.e. effectively infinite LiDAR trust from a config typo | **fixed** (`if constexpr` guard; `J_p` cleared in lockstep on both `itpPose` return paths so a degenerate query yields a zero H row; `Estimator::lastIterations()` accessor wired into the diagnostic; `w_pt` fallback 0.01 — the value every shipped config uses) | 2026-07-26 |
+
+**2026-07-26 estimator math re-review (hazard 93):** a full fresh-eyes pass over
+the estimation math, verified by a probe compiled against the REAL estimator
+(`#define private public`, not a transcription) — 22/22 FD checks pass. Explicit
+clean bills: the Gauss-Newton step (`deltax = KH·δ + K·ν − δ` expands exactly to
+the FAST-LIO iterated form, legitimate here because the RCP state is Euclidean);
+`prepLiDAR` H to ≤4e-9 and `prepIMU` H to ≤1e-8 relative across the whole 4-knot
+window including the partial-window truncation; the slot↔knot mapping
+(`idx_window ≡ 4−size_J`, so `j<4` can never trip); `Quater::exp(v)` representing
+a rotation of **2|v|** with every consumer honoring it (the ×2 in `w_itps` is the
+`2·vec(A⁻¹Ȧ)` factor); blending matrices bit-identical to the standard cubic
+B-spline and its cumulative sum; the interleave loop consuming every measurement
+EXACTLY once (verified exhaustively, including unsorted multi-LiDAR stamps);
+`propRCP`'s `2·p₂−p₀` being the exact constant-velocity extrapolation that
+`a_mat` encodes; `range > 81·pd2²` ≡ FAST-LIO's `s>0.9`; `fitPlane`'s `d=+1/|n|`
+sign and no measurable normal bias vs a PCA fit; PCL's `VoxelGrid`
+`downsample_all_data_` defaulting TRUE so the per-point time in `.intensity`
+survives downsampling as the voxel mean (deskew is NOT silently disabled);
+`drot`/`drotInv` being MISNAMED but both call sites picking the right one.
+
+Two accuracy findings left UNFIXED pending bag A/B (behaviour-affecting):
+- **`nn_thresh` is inert in steady state.** The accept test is
+  `|zp| < pt_thresh **||** lid_cov < var_pt·cov_thresh`; the second clause fires
+  iff `H·P·Hᵗ < var_pt·(coeff_cov−1)` = 0.02 m² at production `coeff_cov: 3.0`,
+  and measured `H·P·Hᵗ` is 8.9e-6 (1 m) … 7.6e-3 (30 m) — always below it. So
+  `nn_thresh` does nothing under ~40 m and the only residual gate left is
+  `findCorresp`'s `range > 81·pd2²` at the PRE-update pose, admitting
+  mis-associations 0.35–0.79 m off-plane at full weight (`robust_kernel` is off
+  by default). The clause is also backwards from intent: it disables outlier
+  rejection precisely when the filter is CONFIDENT. `config_narrow_tunnel.yaml`
+  already neutralizes it with `coeff_cov: 1.0`; production should likely follow.
+- **IMU re-fusion.** `imu_meas` is trimmed only to `>= maxTimeNs − dt` and never
+  cleared per cycle, so ~1–2 samples are fused twice against an
+  already-tightened covariance — double-counted information, i.e. genuine
+  over-confidence on IMU-observed directions.
+
 **2026-07-26 covariance audit (hazards 91–92):** an end-to-end audit of the
 uncertainty chain (`cov_rcp` → Joseph posterior → `getLastPose/TwistCovariance`
 → the published messages) prompted by "make sure odometry covariances are

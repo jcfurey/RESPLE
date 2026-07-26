@@ -378,7 +378,13 @@ struct PointData {
         // Guard against w_pt == 0: var_pt feeds 1/(var_pt*scale) in the IEKF,
         // so a zero weight yields +inf measurement information and a degenerate
         // update. Floor it to a tiny positive value.
-        var_pt = (w_pt > 0.0) ? w_pt : 1e-9;
+        // A missing/mistyped per-lidar `w_pt` leaves LidarConfig's 0.0 default.
+        // The old fallback of 1e-9 avoided the +inf from 1/(0*scale) but
+        // substituted something worse: sigma = 31 um, i.e. R_inv = 1e9 and
+        // effectively infinite LiDAR information, silently. Fall back to the
+        // value every shipped config uses instead, so a config typo degrades
+        // to "nominal weight" rather than "trust this point absolutely".
+        var_pt = (w_pt > 0.0) ? w_pt : 0.01;
         normvec = Eigen::Vector3d::Zero();
         range_sensor = static_cast<float>((pt_b - sensor_origin_body).norm());
     }

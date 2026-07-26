@@ -958,7 +958,7 @@ public:
                         {
                             estimator_lo.updateIEKFLiDAR(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
                         }
-                        total_iekf_iterations_.fetch_add(estimator_lo.n_iter, std::memory_order_relaxed);
+                        total_iekf_iterations_.fetch_add(estimator_lo.lastIterations(), std::memory_order_relaxed);
                     } else {
                         if (!imu_meas.empty()) {
                             max_time_ns = std::max(imu_meas.back().time_ns, max_time_ns);
@@ -975,7 +975,7 @@ public:
                         {
                             estimator_lio.updateIEKFLiDARInertial(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
                         }
-                        total_iekf_iterations_.fetch_add(estimator_lio.n_iter, std::memory_order_relaxed);
+                        total_iekf_iterations_.fetch_add(estimator_lio.lastIterations(), std::memory_order_relaxed);
                     }
                 }
                 const auto iekf_end = std::chrono::high_resolution_clock::now();
