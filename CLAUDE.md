@@ -413,6 +413,41 @@ reference (status as of latest pass):
 
 | 93 | Estimator/robustness tail from the 2026-07-26 math re-review (core math verified CORRECT — 22/22 finite-difference checks against the real `prepLiDAR`/`prepIMU`/`update`): `prepIMU` wrote the bias columns (`BA_OFFSET`=24/`BG_OFFSET`=27) with no `if constexpr (XSIZE==30)` guard, out of range on an `Estimator<24>` (unreachable today — only the LIO estimator takes the inertial path — but a silent out-of-range write under `-DNDEBUG`); `itpPose`'s defensive early-returns cleared `J_q` while leaving `J_p` sized, and `prepLiDAR`/`prepIMU` walk the two in LOCKSTEP → `std::vector` OOB read; the "avg IEKF iterations" diagnostic accumulated the `n_iter` PARAMETER (constant 1) instead of the actual count, under-reporting ~2× (with `n_iter=1` the loop exit needs `t>1`, i.e. two associations and two `update()` calls); a missing/mistyped per-lidar `w_pt` fell back to `1e-9` = σ 31 µm ⇒ `R_inv` 1e9, i.e. effectively infinite LiDAR trust from a config typo | **fixed** (`if constexpr` guard; `J_p` cleared in lockstep on both `itpPose` return paths so a degenerate query yields a zero H row; `Estimator::lastIterations()` accessor wired into the diagnostic; `w_pt` fallback 0.01 — the value every shipped config uses) | 2026-07-26 |
 
+| 94 | **IMU samples were fused more than once.** `pt_meas` is cleared after every frame; `imu_meas` never was, and the pre-update trim only drops samples older than `maxTimeNs − dt`, so every staged sample still inside the newest knot interval was re-fused on the following pass. The spline advances only when `pt_min_time > maxTimeNs` (`collectMeasurements`), so a knot interval holding more than `num_points_upd`=300 points takes several batches against the SAME edge — and each batch re-fused the same 6 IMU rows, with a residual the first fusion had already absorbed. The state barely moves; the posterior tightens as if a second independent sample had arrived. Effect: the IMU carries up to ~2× its configured information on dense scans, i.e. a systematically **over-confident** covariance on exactly the directions the IMU observes — published straight into the consumer EKF, which weights by inverse covariance. Also self-inflicted: a batch that drained 0 points but retained IMU ran an IEKF that broke out with `num_tot_eff==0`, feeding the §3.3 NIS detector a NaN breach for a frame that had nothing wrong with it | **fixed** (consume-once: clear `imu_meas` after a fusion that actually ran, gated on the new `Estimator::lastUpdatePerformed()` so a zero-correspondence frame keeps its unfused samples for the next pass; the trim stays as the out-of-window guard) | 2026-07-26 |
+| 95 | **Process noise was injected per IEKF call, not per unit time.** `propRCP(t)`'s no-advance branch (`maxTimeNs() >= t`, i.e. the state window is UNCHANGED — a zero-time propagation) did `cov_rcp += cov_sys` unconditionally. Combined with hazard 94's multi-batch case, the process noise charged per knot interval scaled with the number of batches that happened to land in it — and that count is set by `num_points_upd` versus the scan's point density, hence by scene geometry and CPU load. Two batches per interval doubled the injected noise, so the same bag ran with a different prior/measurement balance at a different point density: a silent, load-dependent retune of the filter, in the direction of under-trusting the prior exactly when the scene is dense | **fixed** (inject at most once per distinct spline edge; bit-identical in the steady one-batch-per-knot case because the growth `propRCP` in `collectMeasurements` advances the edge first, and extra batches inside one interval now fold in sequentially with no artificial inflation between them — the correct treatment of independent measurements against one state window. `maxTimeNs()` is monotonic, so no ABA) | 2026-07-26 |
+| 96 | No sanity check on the pose/twist covariance leaving the node. Every producer path is guarded (LLT failure → update skipped, NIS → divergence detector, non-finite points dropped at ingest), so a bad matrix means a bug — but `robot_localization` INVERTS the block it fuses, so one non-finite entry turns the consumer's entire state NaN permanently, with no diagnostic pointing back at RESPLE; a zero or negative diagonal (roundoff-negative variance, or an exactly-zero one at t=0) makes that inversion singular | **fixed** (`resple::health::sanitizeCovariance` in the unit-tested `utils/filter_health.h`, applied to `/odom` + `/pose_cov` and to `Estimate.pose_covariance`: any non-finite entry replaces the WHOLE matrix with an uninformative diagonal — a partially patched covariance is not a valid one — and non-positive diagonals are floored. Counted, and ERROR/WARN-throttled) | 2026-07-26 |
+
+**2026-07-26 accuracy pass (hazards 94–96):** driven by "anything that produces
+accuracy should be prioritized", a pass over the measurement-weighting path
+rather than the crash/lifecycle surface. The two behaviour-affecting fixes both
+concern **information accounting**, and both were invisible to the earlier
+audits because they only bite when a knot interval needs more than one
+measurement batch (dense scan vs. `num_points_upd`) — a regime no unit test
+reaches and no single-frame reading exposes. They pull in opposite directions
+(94 over-tightens the posterior, 95 over-loosens the prior) and are therefore
+landed together, not separately: fixing one alone shifts the tuning.
+
+Deliberately NOT changed, with the reasoning recorded so it is not re-litigated:
+
+- **The update-stage LiDAR gate is inert in steady state.** `updateLiDAR*`
+  accepts a row when `|zp| < nn_thresh` **||** `lid_cov < var_pt·coeff_cov`.
+  With `var_pt`=0.01 and `coeff_cov`=3.0, `lid_cov = H·P·Hᵗ + var_pt ≥ 0.01`
+  is below 0.03 for any converged `P`, so the second disjunct short-circuits
+  and `nn_thresh` never binds. `coeff_cov: 1.0` makes the second disjunct
+  unsatisfiable (it would need `H·P·Hᵗ < 0`) and thereby *activates*
+  `nn_thresh` — which is exactly what `config_narrow_tunnel.yaml` does. The
+  disjunct's direction reads backwards for outlier rejection (it admits a
+  large residual precisely when the prior is CONFIDENT, which is the
+  definition of an outlier), but it is upstream behaviour and flipping the
+  comparison is a large, un-bagged behaviour change. Addressed additively
+  instead — see hazard 97.
+- **`findCorresp` is the only outlier gate that actually fires today**, and its
+  test is `|pd2| < sqrt(range)/9`: 0.079 m at 0.5 m, 0.111 m at 1 m, 0.351 m
+  at 10 m, 0.497 m at 20 m, 0.786 m at 50 m. So close range is already tightly
+  gated and `nn_thresh: 0.5` would only ever bind beyond ~20 m even if it were
+  reachable. The exposure is the mid/far field — where a bad correspondence
+  also has the longest lever arm on rotation.
+
 **2026-07-26 estimator math re-review (hazard 93):** a full fresh-eyes pass over
 the estimation math, verified by a probe compiled against the REAL estimator
 (`#define private public`, not a transcription) — 22/22 FD checks pass. Explicit

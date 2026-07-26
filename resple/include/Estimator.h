@@ -177,6 +177,15 @@ class Estimator
     // update() calls on the normal path. Worker-thread only, like corresp_stats.
     int lastIterations() const { return last_iterations_; }
 
+    // True when the last updateIEKF* call actually folded a measurement batch
+    // into the state (at least one successful update()). False when the frame
+    // found zero correspondences or bailed on a numerical failure, i.e. when
+    // the measurements it was handed were NOT consumed. The worker uses this to
+    // decide whether the IMU staging deque may be cleared (consume-once): a
+    // frame that never ran an update must keep its samples for the next pass.
+    // Worker-thread only, like lastNis()/lastIterations().
+    bool lastUpdatePerformed() const { return last_update_performed_; }
+
     // HARDENING SS3.3 'reset' recovery (bug A2): reinflate the IEKF covariance
     // to a genuine recovery covariance while keeping the state (spline +
     // biases). NIS divergence signals an OVER-confident (too-small) covariance,
@@ -204,6 +213,9 @@ class Estimator
         }        
         cov_sys = Q;
         cov_rcp = P;
+        // Fresh filter: no edge has been charged process noise yet, so the first
+        // zero-time propRCP after init injects (see propRCP).
+        cov_sys_edge_ns_ = std::numeric_limits<int64_t>::min();
         a_mat = Eigen::Matrix<double, XSIZE, XSIZE>::Zero();
         Eigen::Matrix<double, 6, 6> matblock = Eigen::Matrix<double, 6, 6>::Zero();
         matblock.topLeftCorner<3, 3>().setIdentity();
@@ -260,6 +272,7 @@ class Estimator
         // calls update() feeds the detector a breach (its non-finite path).
         last_nis_ = std::numeric_limits<double>::quiet_NaN();
         last_nis_dof_ = 0;
+        last_update_performed_ = false;
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -291,6 +304,7 @@ class Estimator
                 break;
             }
             updated = true;
+            last_update_performed_ = true;
             converged = true;
             Eigen::Matrix<double, XSIZE, 1> state_af = getState();
             if ((state_af - rcpi).norm() > eps) {
@@ -335,6 +349,7 @@ class Estimator
         // calls update() feeds the detector a breach (its non-finite path).
         last_nis_ = std::numeric_limits<double>::quiet_NaN();
         last_nis_dof_ = 0;
+        last_update_performed_ = false;
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -366,6 +381,7 @@ class Estimator
                 break;
             }
             updated = true;
+            last_update_performed_ = true;
             converged = true;
             Eigen::Matrix<double, XSIZE, 1> state_af = getState();
             if ((state_af - rcpi).norm() > eps) {
@@ -407,6 +423,7 @@ class Estimator
         // calls update() feeds the detector a breach (its non-finite path).
         last_nis_ = std::numeric_limits<double>::quiet_NaN();
         last_nis_dof_ = 0;
+        last_update_performed_ = false;
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -440,6 +457,7 @@ class Estimator
                 break;
             }
             updated = true;
+            last_update_performed_ = true;
             converged = true;
             Eigen::Matrix<double, XSIZE, 1> state_af = getState();
             if ((state_af - rcpi).norm() > eps) {
@@ -482,6 +500,7 @@ class Estimator
         // calls update() feeds the detector a breach (its non-finite path).
         last_nis_ = std::numeric_limits<double>::quiet_NaN();
         last_nis_dof_ = 0;
+        last_update_performed_ = false;
         const Eigen::Matrix<double, XSIZE, XSIZE> cov_prop = cov_rcp;
         Eigen::Matrix<double, XSIZE, 1> rcp_prop = getState();
         bool converged = true;
@@ -515,6 +534,7 @@ class Estimator
                 break;
             }
             updated = true;
+            last_update_performed_ = true;
             converged = true;
             Eigen::Matrix<double, XSIZE, 1> state_af = getState();
             if ((state_af - rcpi).norm() > eps) {
@@ -545,7 +565,30 @@ class Estimator
     void propRCP(int64_t t)
     {
         if (spl.maxTimeNs() >= t) {
-            cov_rcp += cov_sys;
+            // No knot added: the estimated state window is UNCHANGED, so this is
+            // a zero-time propagation. Upstream injected cov_sys on every such
+            // call, which made the prior's looseness a function of how many
+            // measurement batches happened to land inside one knot interval —
+            // and that count is set by num_points_upd versus the scan's point
+            // density (so, indirectly, by scene geometry and CPU load). Two
+            // batches per interval doubled the injected process noise, i.e. the
+            // same bag ran with a different prior/measurement balance at a
+            // different point density: a silent, load-dependent retune.
+            //
+            // Inject at most once per distinct spline edge. In the steady
+            // one-batch-per-knot case this is bit-identical to the old code (the
+            // growth propRCP in collectMeasurements advances the edge first, so
+            // the following batch call always sees a new edge and injects);
+            // additional batches inside the SAME interval now fold in
+            // sequentially with no artificial inflation between them, which is
+            // the correct treatment of independent measurements updating one
+            // state window. maxTimeNs() is monotonic (pruning moves start_t_ns,
+            // never the edge), so this cannot be fooled by an ABA edge.
+            const int64_t edge = spl.maxTimeNs();
+            if (edge != cov_sys_edge_ns_) {
+                cov_rcp += cov_sys;
+                cov_sys_edge_ns_ = edge;
+            }
         } else {
             // k counts knots added by THIS call: steady state adds <= ~2 per
             // call, while a shed/dropped-scan gap is fast-forwarded in one
@@ -750,6 +793,14 @@ class Estimator
     int last_nis_dof_ = 0;
     // See lastIterations(): actual iteration count of the latest update.
     int last_iterations_ = 0;
+
+    // See lastUpdatePerformed(): did the last updateIEKF* call consume its
+    // measurement batch?
+    bool last_update_performed_ = false;
+
+    // Spline edge (maxTimeNs) most recently charged one cov_sys increment by a
+    // zero-time propRCP. See propRCP for why this is per-edge and not per-call.
+    int64_t cov_sys_edge_ns_ = std::numeric_limits<int64_t>::min();
     // See gapExtrapKnots(): knots propRCP added beyond the free window.
     std::atomic<uint64_t> gap_extrap_knots_{0};
     Eigen::Matrix<double, Eigen::Dynamic, XSIZE> H_buf_;

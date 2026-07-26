@@ -9,6 +9,7 @@
 
 #include <eigen3/Eigen/Dense>
 #include <cmath>
+#include <limits>
 #include <random>
 
 using namespace resple::health;
@@ -202,4 +203,56 @@ TEST(ImuHealth, FaultClearsAfterCleanWindow) {
     mon.feed(t, noise.vec(0.002), g + noise.vec(0.05));
   }
   EXPECT_TRUE(mon.report().ok()) << "faults=" << mon.report().faults;
+}
+
+// ------------------------- covariance sanity (wire guard) -------------------
+
+TEST(CovSanity, CleanMatrixUntouched) {
+  Eigen::Matrix<double, 6, 6> P = Eigen::Matrix<double, 6, 6>::Identity() * 0.04;
+  P(0, 1) = P(1, 0) = 0.01;
+  const Eigen::Matrix<double, 6, 6> before = P;
+  const auto r = resple::health::sanitizeCovariance(P);
+  EXPECT_FALSE(r.modified());
+  EXPECT_FALSE(r.replaced);
+  EXPECT_EQ(0, r.floored);
+  EXPECT_TRUE(P.isApprox(before));
+}
+
+TEST(CovSanity, NonFiniteReplacesWholeMatrix) {
+  for (double bad : {std::numeric_limits<double>::quiet_NaN(),
+                     std::numeric_limits<double>::infinity(),
+                     -std::numeric_limits<double>::infinity()}) {
+    Eigen::Matrix<double, 6, 6> P = Eigen::Matrix<double, 6, 6>::Identity() * 0.04;
+    P(4, 2) = bad;  // a single off-diagonal entry is enough
+    const auto r = resple::health::sanitizeCovariance(P, 1.0e4);
+    EXPECT_TRUE(r.replaced);
+    EXPECT_TRUE(P.allFinite());
+    // Wholesale replacement: the clean entries are gone too, deliberately —
+    // a partially patched matrix is not a valid covariance.
+    EXPECT_TRUE(P.isApprox(Eigen::Matrix<double, 6, 6>::Identity() * 1.0e4));
+  }
+}
+
+TEST(CovSanity, NonPositiveDiagonalFlooredOffDiagonalKept) {
+  Eigen::Matrix<double, 6, 6> P = Eigen::Matrix<double, 6, 6>::Identity() * 0.04;
+  P(2, 2) = 0.0;
+  P(5, 5) = -1e-18;  // roundoff-negative variance
+  P(0, 3) = P(3, 0) = 0.002;
+  const auto r = resple::health::sanitizeCovariance(P, 1.0e4, 1.0e-12);
+  EXPECT_FALSE(r.replaced);
+  EXPECT_EQ(2, r.floored);
+  EXPECT_TRUE(r.modified());
+  EXPECT_DOUBLE_EQ(1.0e-12, P(2, 2));
+  EXPECT_DOUBLE_EQ(1.0e-12, P(5, 5));
+  EXPECT_DOUBLE_EQ(0.002, P(0, 3));
+  EXPECT_DOUBLE_EQ(0.04, P(1, 1));
+  // Every diagonal is now strictly positive: robot_localization can invert it.
+  for (int i = 0; i < 6; ++i) EXPECT_GT(P(i, i), 0.0);
+}
+
+TEST(CovSanity, WorksOnOtherSizes) {
+  Eigen::Matrix<double, 3, 3> P = Eigen::Matrix<double, 3, 3>::Zero();
+  const auto r = resple::health::sanitizeCovariance(P, 1.0, 1.0e-9);
+  EXPECT_EQ(3, r.floored);
+  EXPECT_FALSE(r.replaced);
 }

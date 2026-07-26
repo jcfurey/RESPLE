@@ -333,5 +333,54 @@ class ImuHealthMonitor {
   Eigen::Vector3d m2_accel_ = Eigen::Vector3d::Zero();
 };
 
+// --------------------------- covariance sanity -------------------------------
+//
+// Publish-side guard for the 6x6 pose/twist covariances this package ships to
+// consumers (nav_msgs/Odometry, PoseWithCovarianceStamped, estimate_msgs/
+// Estimate).  robot_localization INVERTS the sub-block it fuses, so a single
+// non-finite entry propagates NaN into every subsequent EKF state (and never
+// recovers), while a zero or negative diagonal makes that inversion singular or
+// the resulting gain negative.  The Joseph-form posterior is PSD up to
+// roundoff and every producer path is checked, so this should never fire —
+// which is precisely why it is worth asserting on the wire instead of assuming.
+//
+// Policy:
+//   * ANY non-finite entry -> the whole matrix is replaced by fallback_var*I.
+//     Patching individual entries would leave a matrix that is internally
+//     inconsistent (and possibly indefinite); "I know nothing" is the only
+//     honest statement available at that point.
+//   * diagonal <= 0 -> floored at min_var, off-diagonals left alone (the
+//     Joseph form keeps them consistent; an exactly-zero variance is normal
+//     at t=0 before any process noise has been injected).
+//
+// fallback_var should be large enough that a consumer effectively ignores the
+// measurement (metres / radians squared), not so large that it overflows when
+// squared downstream.
+struct CovSanity {
+  bool replaced = false;  // non-finite entry found; matrix replaced wholesale
+  int floored = 0;        // diagonal entries raised to min_var
+  bool modified() const { return replaced || floored > 0; }
+};
+
+template <int N>
+inline CovSanity sanitizeCovariance(Eigen::Matrix<double, N, N>& P,
+                                    double fallback_var = 1.0e4,
+                                    double min_var = 1.0e-12) {
+  CovSanity out;
+  if (!P.allFinite()) {
+    P.setIdentity();
+    P *= fallback_var;
+    out.replaced = true;
+    return out;
+  }
+  for (int i = 0; i < N; ++i) {
+    if (!(P(i, i) > 0.0)) {
+      P(i, i) = min_var;
+      ++out.floored;
+    }
+  }
+  return out;
+}
+
 }  // namespace health
 }  // namespace resple

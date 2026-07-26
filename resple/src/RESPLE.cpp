@@ -976,6 +976,28 @@ public:
                             estimator_lio.updateIEKFLiDARInertial(pt_meas, pt_neighbors_, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
                         }
                         total_iekf_iterations_.fetch_add(estimator_lio.lastIterations(), std::memory_order_relaxed);
+                        // Consume-once. pt_meas is cleared after every frame
+                        // (below, after deskew); imu_meas was not, and the trim
+                        // above only drops samples older than one knot interval
+                        // — so every sample still inside that window was fused
+                        // AGAIN on the next pass. That happens whenever a knot
+                        // interval needs more than one batch, i.e. whenever the
+                        // interval holds more than num_points_upd points: the
+                        // same 6 IMU rows enter the information sum twice, with
+                        // a residual that the first fusion already absorbed. The
+                        // state barely moves, but the posterior tightens as
+                        // though a second, independent sample had arrived —
+                        // double-counted information, i.e. an over-confident
+                        // covariance on exactly the directions the IMU
+                        // observes, published straight into the odom EKF.
+                        //
+                        // Clear only when the batch was actually folded in: a
+                        // frame that found zero correspondences never called
+                        // update(), so its samples are still unfused and must
+                        // survive to the next pass (subject to the trim).
+                        if (estimator_lio.lastUpdatePerformed()) {
+                            imu_meas.clear();
+                        }
                     }
                 }
                 const auto iekf_end = std::chrono::high_resolution_clock::now();
@@ -1233,6 +1255,11 @@ public:
                         est_stamp_ns = spline->maxTimeNs();
                         P_last = if_lidar_only ? estimator_lo.getLastPoseCovariance()
                                                : estimator_lio.getLastPoseCovariance();
+                    }
+                    // Same on-the-wire guard as /odom: a non-finite posterior
+                    // must not leave the node in ANY message.
+                    if (resple::health::sanitizeCovariance(P_last).modified()) {
+                        cov_sanitized_.fetch_add(1, std::memory_order_relaxed);
                     }
                     estimate_msgs::msg::Estimate est_msg;
                     // DATA time (spline edge), consistent with /odom and
@@ -1601,6 +1628,11 @@ private:
     std::atomic<size_t> frame_count_{0};
     std::atomic<uint64_t> total_computation_time_us_{0};
     std::atomic<size_t> total_iekf_iterations_{0};
+    // Publish batches whose pose/twist covariance failed the on-the-wire sanity
+    // check (non-finite entry, or a non-positive diagonal). Should stay 0; any
+    // non-zero value is a bug report. Written by the worker, read by
+    // updateDiagnostics on the executor thread.
+    std::atomic<uint64_t> cov_sanitized_{0};
     // Phase-0 hardening instrumentation: cached under spline_mutex_ by the
     // worker at the end of each IEKF cycle, read lock-free by updateDiagnostics
     // (which may run on the ROS executor thread via the Updater's internal
@@ -4063,9 +4095,34 @@ private:
         P_pose.topLeftCorner<3, 3>() += if_lidar_only
             ? estimator_lo.locGateCovInfl()
             : estimator_lio.locGateCovInfl();
-        const Eigen::Matrix<double, 6, 6> P_twist =
+        Eigen::Matrix<double, 6, 6> P_twist =
             if_lidar_only ? estimator_lo.getLastTwistCovariance()
                           : estimator_lio.getLastTwistCovariance();
+
+        // Last line of defence on the wire. Everything upstream is checked (LLT
+        // failure -> update skipped, NIS -> divergence detector, non-finite
+        // points dropped at ingest), so a bad matrix here means a bug — but
+        // robot_localization inverts what we hand it, so one NaN would turn the
+        // consumer's whole state NaN permanently, with no diagnostic pointing
+        // back here. Assert it instead. See utils/filter_health.h.
+        const auto pose_sanity = resple::health::sanitizeCovariance(P_pose);
+        const auto twist_sanity = resple::health::sanitizeCovariance(P_twist);
+        if (pose_sanity.modified() || twist_sanity.modified()) {
+            cov_sanitized_.fetch_add(1, std::memory_order_relaxed);
+            if (pose_sanity.replaced || twist_sanity.replaced) {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "[RESPLE] non-finite %s%s covariance replaced with an "
+                    "uninformative diagonal before publish — this is a bug; "
+                    "check the IEKF posterior",
+                    pose_sanity.replaced ? "pose" : "",
+                    twist_sanity.replaced ? (pose_sanity.replaced ? "+twist" : "twist") : "");
+            } else {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[RESPLE] floored %d pose / %d twist covariance diagonal "
+                    "entries to a positive minimum before publish",
+                    pose_sanity.floored, twist_sanity.floored);
+            }
+        }
 
         for (int64_t t_ns = resple::densepub::firstDenseSampleNs(
                  last_pose_pub_time_ns_, pose_time_ns, dense_pub_interval_ns_,
