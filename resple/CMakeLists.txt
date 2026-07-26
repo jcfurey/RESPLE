@@ -340,6 +340,15 @@ if(BUILD_TESTING)
       if(BLAS_FOUND)
         target_link_libraries(${_test_name} ${BLAS_LIBRARIES})
       endif()
+    else()
+      # WHY: the EXISTS guard above was silent, so a renamed/moved test source
+      # dropped out of the colcon suite with no signal — build green, fewer
+      # tests run, nothing distinguishing "passing" from "gone". WARNING keeps
+      # the documented bisectability while making the loss visible.
+      message(WARNING
+        "resple BUILD_TESTING: listed test source '${_test_src}' is MISSING at "
+        "${CMAKE_CURRENT_SOURCE_DIR}/${_test_src} — not built, not run. Fix the "
+        "path or drop it from RESPLE_UNIT_TESTS.")
     endif()
   endforeach()
 
@@ -364,6 +373,12 @@ if(BUILD_TESTING)
       if(BLAS_FOUND)
         target_link_libraries(${spline_test} ${BLAS_LIBRARIES})
       endif()
+    else()
+      # Same silent-drop hazard as the loop above.
+      message(WARNING
+        "resple BUILD_TESTING: '${spline_test}.cpp' is MISSING at "
+        "${CMAKE_CURRENT_SOURCE_DIR}/test/ — the SplineState pruning / "
+        "est_window anchor regression is NOT built.")
     endif()
   endforeach()
 
@@ -387,6 +402,12 @@ if(BUILD_TESTING)
     if(BLAS_FOUND)
       target_link_libraries(test_ikdtree_concurrency ${BLAS_LIBRARIES})
     endif()
+  else()
+    # Same silent-drop hazard; this one also underpins the ikdtree-tsan CI gate.
+    message(WARNING
+      "resple BUILD_TESTING: 'test/test_ikdtree_concurrency.cpp' is MISSING — "
+      "the ikd-Tree concurrency regression (HARDENING Phase 2.4/2.5) is NOT "
+      "built here, and the TSan CI gate depends on the same source.")
   endif()
 
   # Full PCL + ROS 2 pipeline tests. These link the heavy stack and are NOT run
@@ -418,6 +439,13 @@ if(BUILD_TESTING)
         if(BLAS_FOUND)
           target_link_libraries(${_it_name} ${BLAS_LIBRARIES})
         endif()
+      else()
+        # Same silent-drop hazard. Only reachable with
+        # -DRESPLE_BUILD_INTEGRATION_TESTS=ON, i.e. when someone explicitly
+        # asked for these — so a missing source is definitely worth a warning.
+        message(WARNING
+          "resple BUILD_TESTING: integration test source '${_it_src}' is MISSING "
+          "at ${CMAKE_CURRENT_SOURCE_DIR}/${_it_src} — not built, not run.")
       endif()
     endforeach()
     # The launch_testing pipeline test is registered via add_launch_test so it

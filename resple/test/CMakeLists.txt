@@ -53,6 +53,13 @@ set(RESPLE_TEST_SOURCES
 foreach(src ${RESPLE_TEST_SOURCES})
   get_filename_component(name ${src} NAME_WE)
   # Skip sources that do not exist yet so the series stays bisectable.
+  # WHY the else(): the EXISTS guard was SILENT, so renaming or moving a test
+  # source removed it from the suite with no signal anywhere — the build stayed
+  # green, ctest reported fewer tests, and nobody could tell the difference
+  # between "test passes" and "test no longer exists". WARNING (not SEND_ERROR)
+  # preserves the bisectability the guard exists for, but it is now visible in
+  # every configure log; if you see it and did not intend it, the list above is
+  # stale.
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${src})
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE
@@ -64,6 +71,11 @@ foreach(src ${RESPLE_TEST_SOURCES})
     target_link_libraries(${name} PRIVATE GTest::gtest GTest::gtest_main)
     target_compile_options(${name} PRIVATE -Wall -Wextra)
     gtest_discover_tests(${name})
+  else()
+    message(WARNING
+      "resple tests: listed source '${src}' is MISSING at "
+      "${CMAKE_CURRENT_SOURCE_DIR}/${src} — target '${name}' NOT built and its "
+      "cases are NOT run. Fix the path or drop it from RESPLE_TEST_SOURCES.")
   endif()
 endforeach()
 
@@ -89,7 +101,18 @@ endforeach()
 #     ctest --test-dir build/test --output-on-failure -R IkdTreeConcurrency
 find_package(PCL QUIET COMPONENTS common)
 find_package(Threads REQUIRED)
-if(PCL_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_ikdtree_concurrency.cpp)
+# WHY the conditions are split: the old single `if(PCL_FOUND AND EXISTS ...)`
+# collapsed two very different situations into one STATUS line that blamed PCL.
+# "PCL not installed" is an expected, documented degradation (the cores still
+# build); "the source file is gone" is a defect. Report them separately.
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_ikdtree_concurrency.cpp)
+  message(WARNING
+    "resple tests: test_ikdtree_concurrency.cpp is MISSING at "
+    "${CMAKE_CURRENT_SOURCE_DIR} — the ikd-Tree concurrency regression "
+    "(HARDENING Phase 2.4/2.5) is NOT built. The TSan CI gate depends on it.")
+elseif(NOT PCL_FOUND)
+  message(STATUS "PCL not found; skipping test_ikdtree_concurrency (ikd-Tree stress).")
+else()
   add_executable(test_ikdtree_concurrency
     test_ikdtree_concurrency.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/ikd-Tree/ikd_Tree.cpp)
@@ -105,6 +128,4 @@ if(PCL_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_ikdtree_concurrency.cpp
     GTest::gtest GTest::gtest_main Threads::Threads)
   target_compile_options(test_ikdtree_concurrency PRIVATE -Wall -Wextra)
   gtest_discover_tests(test_ikdtree_concurrency PROPERTIES TIMEOUT 300)
-else()
-  message(STATUS "PCL not found; skipping test_ikdtree_concurrency (ikd-Tree stress).")
 endif()

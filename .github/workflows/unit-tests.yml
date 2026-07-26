@@ -23,37 +23,67 @@ on:
     branches: ["**"]
   pull_request:
 
+# Cancel superseded runs: these jobs are pure gates on a snapshot of the tree,
+# so a second push to the same branch/PR makes the first run's verdict
+# irrelevant — and the e2e-smoke job holds a runner for up to 40 min.
+concurrency:
+  group: unit-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   estimator-core:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
+        # libpcl-dev is REQUIRED, not optional: resple/test/CMakeLists.txt gates
+        # test_ikdtree_concurrency on find_package(PCL), so without it this job
+        # silently dropped the ikd-Tree concurrency regression (Phase 2.4/2.5)
+        # and reported a smaller suite as green. Verified locally: the PCL-gated
+        # target contributes 2 ctest cases that are otherwise absent.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake g++ libeigen3-dev libgtest-dev libboost-math-dev
+            cmake g++ libeigen3-dev libgtest-dev libboost-math-dev libpcl-dev
       - name: Build and run unit tests
         run: ./scripts/run_unit_tests.sh
 
   estimator-core-asan:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
+        # libpcl-dev: same silent-drop as estimator-core above, and it matters
+        # MOST here — resple/test/CMakeLists.txt documents this very job
+        # ("Surfaced here by the Phase 5 ASan CI job on test_ikdtree_concurrency")
+        # as the guard for the Eigen aligned-allocator ABI regression, which is
+        # exactly a PCL-headers-vs-plain-Eigen mismatch. Without PCL the target
+        # never built, so the guard was watching nothing.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake g++ libeigen3-dev libgtest-dev libboost-math-dev
+            cmake g++ libeigen3-dev libgtest-dev libboost-math-dev libpcl-dev
       - name: Build (ASan + UBSan)
         run: |
           cmake -S resple/test -B build/asan \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -g -O1 -fno-omit-frame-pointer"
           cmake --build build/asan -j"$(nproc)"
       - name: Run under ASan + UBSan
+        # -E RebuildVsMutatorRace: that one case is a deliberately unthrottled
+        # 4-reader spin stress and is documented in test_ikdtree_concurrency.cpp
+        # (~line 258) as exceeding the ctest timeout under ASan — measured here:
+        # still running after 560 s vs the 300 s TIMEOUT the test sets, i.e. it
+        # would turn this job red for a reason unrelated to memory safety. Its
+        # sibling ParallelSearchPushDownRace still runs, which is what exercises
+        # the PCL point types through Eigen's aligned allocator (the ABI guard
+        # above). The excluded case is covered by the ikdtree-tsan job, whose
+        # 45-minute budget is sized for it.
         run: |
           ASAN_OPTIONS="detect_leaks=1" UBSAN_OPTIONS="print_stacktrace=1" \
-            ctest --test-dir build/asan --output-on-failure
+            ctest --test-dir build/asan --output-on-failure --no-tests=error \
+              -E "RebuildVsMutatorRace"
 
   ikdtree-tsan:
     runs-on: ubuntu-24.04

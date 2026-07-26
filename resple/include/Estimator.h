@@ -6,6 +6,7 @@
 #include <limits>
 #include "SplineState.h"
 #include "Association.h"
+#include "utils/geometry_core.h"
 #include "utils/overload_control.h"
 #include "utils/range_weighting.h"
 
@@ -605,14 +606,22 @@ class Estimator
         Eigen::Quaterniond q_out;
         spl.itpQuaternion(t, &q_out, nullptr, &J_q);
 
-        // G (3×4): maps 4D δq [w,x,y,z] → 3D body-frame rotation vector.
-        // Derived from 2·imag(q_out⁻¹ ⊗ δq) = 2·[rows 1,2,3 of Qleft(q_out⁻¹)] · δq.
-        const double qw = q_out.w(), qx = q_out.x(), qy = q_out.y(), qz = q_out.z();
-        Eigen::Matrix<double, 3, 4> G;
-        G << -qx,  qw,  qz, -qy,
-             -qy, -qz,  qw,  qx,
-             -qz,  qy, -qx,  qw;
-        G *= 2.0;
+        // G (3×4): maps 4D δq [w,x,y,z] → a 3-vector of small rotations about the
+        // FIXED (header.frame_id == odom) axes: 2·imag(δq ⊗ q_out⁻¹)
+        // = 2·[rows 1,2,3 of Qright(q_out⁻¹)] · δq.
+        //
+        // This used to use the Qleft form, i.e. the BODY (right/local)
+        // perturbation, while claiming to match PoseWithCovarianceStamped. That
+        // message specifies a FIXED-AXIS representation, and robot_localization
+        // rotates an incoming pose covariance only from the message frame into
+        // its world frame — identity here, since frame_id is already odom — so
+        // the body-frame block was consumed verbatim as world roll/pitch/yaw.
+        // Anisotropy then landed on the wrong axes (over-trusting the least
+        // observable one) and the position↔rotation cross blocks mixed frames.
+        // Using the world map fixes the rotation block AND the cross blocks in
+        // one step, since P_world = R·P_body·Rᵗ (see utils/geometry_core.h).
+        // The position block was, and remains, world-frame.
+        const Eigen::Matrix<double, 3, 4> G = resple::geom::quatPerturbToWorld(q_out);
 
         // ── Assemble 6×24 Jacobian ─────────────────────────────────────────
         Eigen::Matrix<double, 6, 24> J = Eigen::Matrix<double, 6, 24>::Zero();

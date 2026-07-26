@@ -408,6 +408,31 @@ reference (status as of latest pass):
 
 | 90 | `getSplineMsg` shipped the sender's OWN idle slots (absolute knots `pruned-3..pruned-1`) as the est_window anchor, but a fresh receiver rebuilds its idle slots from them and then chains EVERY knot quaternion off `q_idle[2]` (`addOneStateKnot`: `q_knots[0] = q_idle[2]·exp(ort_delta[0])`) — so `q_idle[2]` must be the absolute orientation of knot `start_idx-1`. Those coincide only while `start_idx == num_knots_pruned_`; at startup RESPLE is unpruned (pruned=0) while `start_idx` has walked up to the handshake cost T (the receiver rejects every window until `if_init_succeed`, and the `last_start_idx_+1` throttle advances `start_idx` one knot per publish meanwhile). The replica was therefore short the rotation accumulated over the skipped knots 0..T-1. Because a window carries absolute POSITIONS but only orientation DELTAS, the position error decays after two knot intervals while the orientation error is **permanent** — every later knot chains from the mis-anchored knot 0, so `/global_map`, `traj_path` and Mapping's odom stay rotated for the whole session. Measured end-to-end through the real `getSplineMsg`: **28.6° persistent** yaw error and 0.41 m transient position error for a 0.5 s handshake at 0.57°/knot and 1 m/s. Gated on the platform MOVING during the handshake, so the default `init_attitude_source: gravity` (blocks until stationary) is safe; `tf`/`tf_gravity_check` (documented "inits while moving") and a RESPLE respawn mid-motion reach it | **fixed** (ship the three knots immediately PRECEDING `start_idx` as the anchor, with `start_q` = absolute quaternion of knot `start_idx-3`; falls back to the idle slots when `start_idx < pruned+3`, where they ARE the correct anchor — no wire-format change, and identical to the old content whenever `start_idx == pruned`). Regression: `test/test_est_window_anchor.cpp` drives the real `getSplineMsg` and reconstructs the receiver exactly as `getEstCallback` does; the two moving cases fail pre-fix (28.6°/0.41 m) and pass after, the stationary case passes both | 2026-07-26 |
 
+| 91 | `/odom` + `/pose_cov` reported the pose ORIENTATION covariance in the BODY frame while `geometry_msgs/PoseWithCovariance` specifies a **fixed-axis** representation (axes of `header.frame_id`, i.e. `odom`). `getLastPoseCovariance`'s `G` was `2·rows1..3 of Qleft(q⁻¹)` — the right/local perturbation `δφ_b = 2·imag(q⁻¹⊗δq)` — while the message contract wants `δφ_w = 2·imag(δq⊗q⁻¹)`. `robot_localization` rotates an incoming pose covariance only from the message frame into its world frame, which is IDENTITY here (frame_id is already `odom`), so it consumed the body-frame block verbatim as world roll/pitch/yaw: any anisotropy landed on the wrong axes (over-trusting the least-observable one) and the position↔rotation cross blocks mixed frames. The position 3×3 was, and remains, correct (world). Impact is nil at identity attitude and grows with the yaw/tilt of the platform | **fixed** (`resple::geom::quatPerturbToWorld`, the `Qright(q⁻¹)` form, in the unit-tested `utils/geometry_core.h`; `P_world = R·P_body·Rᵗ`, so using the world map fixes the rotation block AND the cross blocks in one step). Regression: `test_geometry_core.cpp` `PoseCovMaps.*` pins `G_world = R·G_body`, that each map recovers the perturbation applied on its own side, and that the frame choice is observable in an anisotropic variance | 2026-07-26 |
+| 92 | `estimate_msgs/Estimate.pose_covariance` is documented in the `.msg` as "6x6 IEKF posterior covariance for the last knot" but was assigned **nowhere** in the repo — it shipped 36 zeros, i.e. *perfect certainty*, to any subscriber that trusted it (a fusing consumer computes gain ≈ 1 and collapses its own covariance). `Estimate.header` likewise shipped stamp 0. In-repo harmless (Mapping never reads either), so the exposure is external subscribers | **fixed** (populated from the same posterior `/odom` publishes, under `spline_mutex_`; header stamped with the spline-edge DATA time, consistent with `/odom` and `/current_scan`). Note the est_window copy deliberately carries the RAW filter posterior — it omits the loc-gate advisory inflation `/odom` adds | 2026-07-26 |
+
+**2026-07-26 covariance audit (hazards 91–92):** an end-to-end audit of the
+uncertainty chain (`cov_rcp` → Joseph posterior → `getLastPose/TwistCovariance`
+→ the published messages) prompted by "make sure odometry covariances are
+properly updated". The chain came back largely CORRECT — no staleness (the
+covariance is recomputed in the same worker iteration as the pose it
+accompanies), correct row-major `[r*6+c]` packing and `[x,y,z,rx,ry,rz]`
+ordering at all four publish sites, twist genuinely body-frame matching
+`child_frame_id` (REP-105), the loc-gate inflation truly advisory (never added
+to `cov_rcp`) and applied to the correct world-translation block, NIS `hold`
+gating every pose/odom/TF publisher, and a numerical-failure cycle correctly
+pairing an un-updated state with the un-updated (larger) prior. Hazards 91–92
+are the two real defects. Known-latent, left UNFIXED and deliberately
+documented rather than changed: `propRCP` injects `cov_sys` **per IEKF call**
+rather than per elapsed time (in steady state the worker's `propRCP` always
+takes the no-knot `+= cov_sys` branch, so the published magnitude scales with
+cycles-per-knot — i.e. with `num_points_upd` chunking and CPU load — in the
+conservative/over-report direction); `odom/dense_pub_hz` back-fills up to 1000
+samples that are exact resamplings of ONE posterior, all stamped with the edge
+covariance, which a consumer fuses as independent; no `allFinite()` guard on
+the OUTGOING covariance; and the Diagnostics `cov_trace`/`cov_lambda_min`
+fields describe the pre-inflation posterior, not what `/odom` carries.
+
 **2026-07-26 bug hunt (hazard 90):** the est_window replica protocol was
 re-examined after `fdef897` ("replica time-base") fixed the *time* half of the
 startup-skip problem by modelling the skipped knots as front-pruned. That

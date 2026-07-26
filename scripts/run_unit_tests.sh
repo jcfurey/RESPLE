@@ -24,4 +24,10 @@ BUILD_DIR="${1:-${ROOT}/build/unit-tests}"
 
 cmake -S "${ROOT}/resple/test" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build "${BUILD_DIR}" -j"$(nproc)"
-ctest --test-dir "${BUILD_DIR}" --output-on-failure
+# WHY --no-tests=error: plain `ctest` exits 0 when it finds ZERO tests, so this
+# gate passed vacuously if test discovery silently produced nothing — a renamed
+# test source (see the EXISTS guards in resple/test/CMakeLists.txt), a
+# gtest_discover_tests POST_BUILD step that did not run, or a wrong BUILD_DIR.
+# ctest >= 3.20 supports the flag; verified non-zero (exit 8) on an empty
+# project with this ctest 3.28.
+ctest --test-dir "${BUILD_DIR}" --output-on-failure --no-tests=error

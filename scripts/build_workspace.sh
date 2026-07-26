@@ -87,8 +87,21 @@ colcon build --packages-up-to resple \
 
 if [ "${RUN_TESTS}" -eq 1 ]; then
   echo "==> colcon test --packages-select resple"
-  colcon test --packages-select resple
-  colcon test-result --test-result-base build/resple --all || true
+  # WHY the flag and the missing `|| true`: `colcon test` on its own exits 0
+  # even when tests FAIL — its status reflects only build/infrastructure errors,
+  # not test verdicts — and the old `colcon test-result ... || true` then threw
+  # away the one status that did carry the verdict. Net effect: `--test` ALWAYS
+  # exited 0, so no caller (CI, a wrapper script, a human `&&` chain) could ever
+  # notice a red test. Capture both statuses so the per-test summary (which names
+  # the failing test) still prints, then propagate.
+  TEST_RC=0
+  colcon test --packages-select resple --return-code-on-test-failure || TEST_RC=$?
+  RESULT_RC=0
+  colcon test-result --test-result-base build/resple --all || RESULT_RC=$?
+  if [ "${TEST_RC}" -ne 0 ] || [ "${RESULT_RC}" -ne 0 ]; then
+    echo "ERROR: resple tests FAILED (colcon test=${TEST_RC}, test-result=${RESULT_RC})." >&2
+    exit 1
+  fi
 fi
 
 echo "==> Done. Source the overlay with:  source ${WS}/install/setup.bash"

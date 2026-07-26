@@ -92,17 +92,47 @@ EOF
   local cp=$!
   ros2 bag play "${BAG}" --clock --rate "${RATE}" > "${OUT}/bag_${leg}.log" 2>&1 &
   local bp=$!
-  wait "${cp}" || true
+  # WHY not `wait "${cp}" || true`: that discarded the collector's status, so a
+  # collector that never started (rclpy ABI mismatch — see the PYEXE note above)
+  # or died mid-leg looked exactly like a completed leg. Combined with the
+  # `cat ... || echo "(no summary)"` at the bottom, a leg that measured NOTHING
+  # printed a friendly note and the script still exited 0 — the A/B verdict was
+  # unfalsifiable.
+  local crc=0
+  wait "${cp}" || crc=$?
   kill -INT "${bp}" "${lp}" 2>/dev/null || true
   sleep 4
   kill -KILL "${bp}" "${lp}" 2>/dev/null || true
   wait 2>/dev/null || true
   sleep 2   # DDS teardown between legs
+
+  # A leg is only usable if the collector exited cleanly AND actually recorded
+  # diagnostics samples. The collector always writes its summary file (even an
+  # all-zeros one), so file existence alone proves nothing — count CSV data rows
+  # beyond the header instead. Zero rows means the node never published
+  # resple_diagnostics: it failed to launch/activate, or taskset/the config was
+  # wrong. Nothing was measured, so the leg cannot support any conclusion.
+  local rows=0
+  if [ -f "${OUT}/diag_${leg}.csv" ]; then
+    rows="$(( $(wc -l < "${OUT}/diag_${leg}.csv") - 1 ))"
+    [ "${rows}" -ge 0 ] || rows=0
+  fi
+  if [ "${crc}" -ne 0 ] || [ ! -s "${OUT}/summary_${leg}.txt" ] || [ "${rows}" -le 0 ]; then
+    echo "ERROR: leg ${leg} produced NO usable data" \
+         "(collector exit ${crc}, diag samples ${rows}," \
+         "summary $([ -s "${OUT}/summary_${leg}.txt" ] && echo present || echo missing))." >&2
+    echo "       Check ${OUT}/resple_${leg}.log and ${OUT}/bag_${leg}.log." >&2
+    return 1
+  fi
 }
 
 IFS=',' read -ra LEG_ARR <<< "${LEGS}"
+FAILED_LEGS=""
 for leg in "${LEG_ARR[@]}"; do
-  run_leg "${leg}"
+  # Record instead of aborting: the remaining legs still run and the comparison
+  # table below still prints (that is the whole point of the script), but the
+  # exit status at the end tells the truth.
+  run_leg "${leg}" || FAILED_LEGS="${FAILED_LEGS} ${leg}"
 done
 
 echo
@@ -112,3 +142,10 @@ for leg in "${LEG_ARR[@]}"; do
   cat "${OUT}/summary_${leg}.txt" 2>/dev/null || echo "  (no summary — check ${OUT}/resple_${leg}.log)"
 done
 echo "CSVs + logs: ${OUT}"
+
+if [ -n "${FAILED_LEGS}" ]; then
+  echo >&2
+  echo "ERROR: rehearsal INCOMPLETE — leg(s) with no usable data:${FAILED_LEGS}" >&2
+  echo "       The A/B/C comparison above is not valid. Logs: ${OUT}" >&2
+  exit 1
+fi

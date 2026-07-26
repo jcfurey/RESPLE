@@ -66,18 +66,74 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# WHY a liveness helper at all: every criterion the checker evaluates is of the
+# form "enough messages were banked / the pose never left the ball", which a
+# node that CRASHED late in the collection window still satisfies from the data
+# it published while it was healthy. Process liveness is a PRECONDITION for the
+# verdict, not a detail — without it a segfault at t=25s of a 30s run passes.
+#
+# kill -0 is the probe; the /proc State check is the necessary companion. bash
+# normally reaps an exited background child asynchronously (so its PID is gone
+# and kill -0 fails, as intended), but in the window before that reap the child
+# is a ZOMBIE which still has a /proc entry and on which kill -0 SUCCEEDS —
+# reporting a dead node as healthy, the exact bug this gate is closing.
+alive() {
+  local pid="${1:-}"
+  [ -n "${pid}" ] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+  ! grep -q '^State:[[:space:]]*Z' "/proc/${pid}/status" 2>/dev/null
+}
+
+# Exit status of an already-exited child (bash keeps it until waited on).
+child_status() {
+  local rc=0
+  wait "${1}" 2>/dev/null || rc=$?
+  echo "${rc}"
+}
+
 echo "==> run RESPLE + injector, checker collects for ${SECS}s"
 ./install/resple/lib/resple/RESPLE --ros-args \
   --params-file "${TOOLS}/inject_pointcloud2.yaml" > "${LOGDIR}/resple.log" 2>&1 &
 RP=$!
 sleep 2
+# Fail fast on a startup abort (bad params, missing plugin, SIGILL from a
+# -march mismatch) instead of spending the whole window collecting nothing.
+if ! alive "${RP}"; then
+  echo "==> FAILED: RESPLE exited during startup with status $(child_status "${RP}")" >&2
+  tail -30 "${LOGDIR}/resple.log" >&2 || true
+  exit 1
+fi
 ./install/data_injector/lib/data_injector/injector > "${LOGDIR}/injector.log" 2>&1 &
 INJ=$!
 
-# The checker exits non-zero on any failed criterion.
-if ! "${PYEXE}" "${ROOT}/scripts/e2e_smoke_check.py" --duration "${SECS}"; then
-  echo "==> FAILED — last RESPLE log lines:"
+# The checker exits non-zero on any failed criterion. Capture rather than
+# short-circuit, so the liveness gate below is evaluated FIRST — a crash is a
+# more specific and more actionable diagnosis than "criterion X not met".
+CHECK_RC=0
+"${PYEXE}" "${ROOT}/scripts/e2e_smoke_check.py" --duration "${SECS}" || CHECK_RC=$?
+
+DIED=0
+if ! alive "${RP}"; then
+  echo "==> FAILED: RESPLE died during the ${SECS}s run — exit status $(child_status "${RP}")" >&2
+  echo "    (139/SIGSEGV=11, 134/SIGABRT=6; last RESPLE log lines:)" >&2
+  tail -30 "${LOGDIR}/resple.log" >&2 || true
+  DIED=1
+fi
+if ! alive "${INJ}"; then
+  echo "==> FAILED: data_injector died during the ${SECS}s run — exit status $(child_status "${INJ}")" >&2
+  echo "    (the scene stopped being published, so any criterion it fed is void)" >&2
+  tail -30 "${LOGDIR}/injector.log" >&2 || true
+  DIED=1
+fi
+if [ "${DIED}" -ne 0 ]; then
+  echo "==> e2e smoke FAILED (process exited early; checker verdict was ${CHECK_RC})" >&2
+  echo "    logs: ${LOGDIR}" >&2
+  exit 1
+fi
+
+if [ "${CHECK_RC}" -ne 0 ]; then
+  echo "==> FAILED (checker exit ${CHECK_RC}) — last RESPLE log lines:"
   tail -30 "${LOGDIR}/resple.log" || true
   exit 1
 fi
-echo "==> e2e smoke PASSED"
+echo "==> e2e smoke PASSED (RESPLE + injector both still alive at the end)"

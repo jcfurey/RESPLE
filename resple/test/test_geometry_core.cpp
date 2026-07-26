@@ -333,3 +333,75 @@ TEST(Attitude, MountingTiltShowsAsCrossCheckDelta) {
   const double delta = std::sqrt(dpitch * dpitch + droll * droll);
   EXPECT_GT(delta, 5.0) << "12deg mount tilt should be visible in the delta";
 }
+
+// --- Pose-covariance perturbation maps (2026-07-26) -------------------------
+// getLastPoseCovariance reports the rotation block as P = (G J_q) cov (G J_q)^T.
+// `nav_msgs/Odometry` -> `geometry_msgs/PoseWithCovariance` specifies a
+// FIXED-AXIS orientation representation (axes of header.frame_id), so a pose
+// published in `odom` must use the WORLD map. The estimator previously used the
+// BODY (right/local) map, which robot_localization consumes verbatim (its
+// message-frame -> world rotation is identity when frame_id is already odom),
+// putting any anisotropy on the wrong axes.
+
+namespace {
+// Reference: apply a small rotation on the given side and read back the
+// 3-vector the corresponding map predicts.
+Eigen::Quaterniond smallRot(const Vec3& axis_angle) {
+  const double a = axis_angle.norm();
+  if (a < 1e-15) return Eigen::Quaterniond::Identity();
+  return Eigen::Quaterniond(Eigen::AngleAxisd(a, axis_angle / a));
+}
+}  // namespace
+
+TEST(PoseCovMaps, WorldIsBodyRotatedByR) {
+  // The whole fix rests on dphi_world = R * dphi_body, hence P_w = R P_b R^T.
+  for (const Vec3& ypr : {Vec3(0, 0, 0), Vec3(90, 0, 0), Vec3(-35, 12, 8),
+                          Vec3(170, -80, 45)}) {
+    const Eigen::Quaterniond q(ypr2r(ypr));
+    const Eigen::Matrix3d R = q.toRotationMatrix();
+    const Eigen::Matrix<double, 3, 4> Gb = resple::geom::quatPerturbToBody(q);
+    const Eigen::Matrix<double, 3, 4> Gw = resple::geom::quatPerturbToWorld(q);
+    EXPECT_LT((Gw - R * Gb).norm(), 1e-12) << "ypr=" << ypr.transpose();
+    // ...and they genuinely differ unless the attitude is identity.
+    if (ypr.norm() > 1e-9) {
+      EXPECT_GT((Gw - Gb).norm(), 1e-3) << "ypr=" << ypr.transpose();
+    }
+  }
+}
+
+TEST(PoseCovMaps, MapsRecoverTheAppliedPerturbation) {
+  // Apply a known small rotation on each side and confirm the matching map
+  // recovers it (to first order), which is what pins body vs world.
+  const Eigen::Quaterniond q(ypr2r(Vec3(-35.0, 12.0, 8.0)));
+  const Vec3 phi(1e-4, -2e-4, 3e-4);  // small rotation vector, radians
+  const Eigen::Quaterniond dq = smallRot(phi);
+
+  // Right/local: q_meas = q (x) dq  ->  body map must return phi.
+  const Eigen::Quaterniond q_right = q * dq;
+  Eigen::Vector4d dq_right;
+  dq_right << q_right.w() - q.w(), q_right.x() - q.x(),
+              q_right.y() - q.y(), q_right.z() - q.z();
+  EXPECT_LT((resple::geom::quatPerturbToBody(q) * dq_right - phi).norm(), 1e-8);
+
+  // Left/fixed: q_meas = dq (x) q  ->  world map must return phi.
+  const Eigen::Quaterniond q_left = dq * q;
+  Eigen::Vector4d dq_left;
+  dq_left << q_left.w() - q.w(), q_left.x() - q.x(),
+             q_left.y() - q.y(), q_left.z() - q.z();
+  EXPECT_LT((resple::geom::quatPerturbToWorld(q) * dq_left - phi).norm(), 1e-8);
+}
+
+TEST(PoseCovMaps, FrameChoiceMovesAnisotropicVariance) {
+  // Why it matters: a corridor-like covariance (yaw loose, roll/pitch tight)
+  // reported in the wrong frame lands the loose axis somewhere else entirely.
+  const Eigen::Quaterniond q(ypr2r(Vec3(90.0, 0.0, 0.0)));  // yawed 90 deg
+  const Eigen::Matrix3d R = q.toRotationMatrix();
+  const Eigen::Matrix3d P_body =
+      Vec3(1e-6, 4e-4, 1e-6).asDiagonal();  // loose about BODY y
+  const Eigen::Matrix3d P_world = R * P_body * R.transpose();
+  // A 90 deg yaw swaps which world axis carries the loose variance.
+  EXPECT_NEAR(P_world(0, 0), 4e-4, 1e-9);
+  EXPECT_NEAR(P_world(1, 1), 1e-6, 1e-9);
+  EXPECT_GT(std::abs(P_world(0, 0) - P_body(0, 0)), 1e-5)
+      << "frame choice must be observable in the reported variance";
+}

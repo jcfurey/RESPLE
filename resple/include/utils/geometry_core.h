@@ -222,6 +222,51 @@ inline Eigen::Matrix3d g2r(const Eigen::Vector3d& g) {
 }
 
 // ---------------------------------------------------------------------------
+// Quaternion-perturbation -> 3-vector maps for pose covariance reporting.
+//
+// A 4D quaternion covariance is turned into the 3x3 rotation block ROS wants by
+// P_rot = (G J_q) P (G J_q)^T, where G maps a quaternion perturbation dq to a
+// 3-vector of small rotations. WHICH 3-vector depends on the side the
+// perturbation is applied:
+//
+//   BODY  (right/local) : dphi_b = 2*imag(q^-1 (x) dq) = 2*rows1..3 Qleft(q^-1)
+//   WORLD (fixed-axis)  : dphi_w = 2*imag(dq (x) q^-1) = 2*rows1..3 Qright(q^-1)
+//
+// and the two are related by dphi_w = R(q) * dphi_b, so
+// P_world = R P_body R^T.
+//
+// `geometry_msgs/PoseWithCovariance` specifies "the orientation parameters use a
+// fixed-axis representation", i.e. rotations about the axes of the message's
+// header.frame_id -- so a pose published in `odom` must report the WORLD form.
+// robot_localization rotates an incoming pose covariance only from the message
+// frame into its world frame; with frame_id == odom that rotation is identity,
+// so a body-frame block is consumed verbatim as world roll/pitch/yaw and any
+// anisotropy lands on the wrong axes (it over-trusts the least-observable one).
+//
+// Both forms are provided: the world one is what publishers must use, and the
+// body one exists so the relation above stays unit-testable.
+// ---------------------------------------------------------------------------
+inline Eigen::Matrix<double, 3, 4> quatPerturbToBody(const Eigen::Quaterniond& q)
+{
+  const double qw = q.w(), qx = q.x(), qy = q.y(), qz = q.z();
+  Eigen::Matrix<double, 3, 4> G;
+  G << -qx,  qw,  qz, -qy,
+       -qy, -qz,  qw,  qx,
+       -qz,  qy, -qx,  qw;
+  return 2.0 * G;
+}
+
+inline Eigen::Matrix<double, 3, 4> quatPerturbToWorld(const Eigen::Quaterniond& q)
+{
+  const double qw = q.w(), qx = q.x(), qy = q.y(), qz = q.z();
+  Eigen::Matrix<double, 3, 4> G;
+  G << -qx,  qw, -qz,  qy,
+       -qy,  qz,  qw, -qx,
+       -qz, -qy,  qx,  qw;
+  return 2.0 * G;
+}
+
+// ---------------------------------------------------------------------------
 // Axis-aligned box subtraction (HARDENING §3.4 radius map pruning).
 //
 // Carves `outer \ inner` into at most 6 axis-aligned slabs. The returned

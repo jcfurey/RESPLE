@@ -1217,15 +1217,36 @@ public:
                 // Mapping's sole input and it starves silently without it.
                 if (publish_est_window_ && spline->totalKnots() > max_spl_knots) {
                     estimate_msgs::msg::Spline spline_msg;
+                    // Estimate.pose_covariance is DOCUMENTED in the .msg as the
+                    // 6x6 IEKF posterior for the last knot, but was never
+                    // populated — it shipped 36 zeros, i.e. PERFECT CERTAINTY,
+                    // to any consumer that trusted the field. Fill it (and the
+                    // header, which shipped stamp 0) from the same posterior
+                    // /odom publishes. Computed under spline_mutex_ because
+                    // getLastPoseCovariance interpolates the spline.
+                    Eigen::Matrix<double, 6, 6> P_last;
+                    int64_t est_stamp_ns = 0;
                     {
                         std::lock_guard<std::mutex> spline_lock(spline_mutex_);
                         spline->getSplineMsg(spline_msg, std::max<int64_t>(max_spl_knots - 1, 0));
                         max_spl_knots = spline->totalKnots();
+                        est_stamp_ns = spline->maxTimeNs();
+                        P_last = if_lidar_only ? estimator_lo.getLastPoseCovariance()
+                                               : estimator_lio.getLastPoseCovariance();
                     }
                     estimate_msgs::msg::Estimate est_msg;
+                    // DATA time (spline edge), consistent with /odom and
+                    // /current_scan — not the publish wall time.
+                    est_msg.header.stamp = rclcpp::Time(est_stamp_ns);
+                    est_msg.header.frame_id = odom_id;
                     est_msg.spline = spline_msg;
                     est_msg.if_full_window.data = (max_spl_knots >= 4);
                     est_msg.runtime.data = 0;
+                    for (int r = 0; r < 6; ++r) {
+                        for (int c = 0; c < 6; ++c) {
+                            est_msg.pose_covariance[r * 6 + c] = P_last(r, c);
+                        }
+                    }
                     pub_est->publish(est_msg);
                     if (!est_window_first_logged_.exchange(true)) {
                         RCLCPP_INFO(this->get_logger(),

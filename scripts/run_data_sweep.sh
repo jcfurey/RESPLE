@@ -90,9 +90,32 @@ wait 2>/dev/null || true
 
 echo "==> steady state:"; grep -iE "Gravity alignment successful|initialization complete|heartbeat" /tmp/resple_sweep.log | tail -3 || true
 echo "==> sanitizer reports (${LOGBASE}.*):"
+# WHY this is not a bare `grep ... | sort | uniq -c` any more: under
+# `set -euo pipefail` that form INVERTED the verdict of the whole sweep. grep
+# exits 1 when it matches nothing, pipefail promotes that to the pipeline, and
+# `set -e` then killed the script — so a CLEAN sweep exited NON-ZERO, while a
+# sweep that DID find races left the successful `echo` as the last command and
+# exited 0. Collect the matches into a variable (grep's status neutralised at
+# that single point only), then decide the exit status explicitly.
+SAN_HITS=""
+SAN_LOGS_EXIST=0
 if ls "${LOGBASE}".* >/dev/null 2>&1; then
-  grep -h "WARNING: ThreadSanitizer\|ERROR: AddressSanitizer\|runtime error:" "${LOGBASE}".* | sort | uniq -c
+  SAN_LOGS_EXIST=1
+  SAN_HITS="$(grep -h -e "WARNING: ThreadSanitizer" -e "ERROR: AddressSanitizer" \
+                       -e "ERROR: LeakSanitizer" -e "runtime error:" \
+                       "${LOGBASE}".* || true)"
+fi
+if [ -n "${SAN_HITS}" ]; then
+  printf '%s\n' "${SAN_HITS}" | sort | uniq -c
+  echo "    (full reports in ${LOGBASE}.<pid>)"
+  echo "==> FAILED: ${MODE} reported findings above — every one is a real bug" \
+       "until proven otherwise (see the OpenMP note at the top of this file)." >&2
+  exit 1
+fi
+if [ "${SAN_LOGS_EXIST}" -eq 1 ]; then
+  echo "    no findings in the ${MODE} logs."
   echo "    (full reports in ${LOGBASE}.<pid>)"
 else
   echo "    none — clean."
 fi
+echo "==> ${MODE} data sweep CLEAN (${SECS}s)."
