@@ -749,20 +749,75 @@ class SplineState
             knot_msg.orientation_del.z = ort_delta[i].z();
             spline_msg.knots.push_back(knot_msg);
         }
+        // The ANCHOR the receiver needs is the three knots immediately PRECEDING
+        // start_idx (absolute start_idx-3 .. start_idx-1), not our own idle
+        // slots. A fresh receiver rebuilds its idle slots from these and then
+        // chains every knot quaternion off q_idle[2]
+        // (addOneStateKnot: q_knots[0] = q_idle[2] * exp(ort_delta[0])), so
+        // q_idle[2] must be the absolute orientation of knot start_idx-1.
+        //
+        // Our own idle slots describe knots (num_knots_pruned_-3 ..
+        // num_knots_pruned_-1). Those coincide with the anchor only while
+        // start_idx == num_knots_pruned_. At STARTUP we are unpruned (pruned=0)
+        // while start_idx has walked up to the handshake cost T — every window
+        // published before the receiver's start_time handshake completes is
+        // rejected by it, and the last_start_idx_+1 throttle above advances
+        // start_idx one knot per publish meanwhile. Shipping the origin as the
+        // anchor then left the replica short of the rotation accumulated over
+        // the skipped knots 0..T-1: because a window carries absolute POSITIONS
+        // but only orientation DELTAS, the position error decays after two knot
+        // intervals while the orientation error is PERMANENT (every later knot
+        // chains from the mis-anchored knot 0) — the whole replica map/path/odom
+        // stayed rotated. Measured 28.6 deg for a 0.5 s handshake at 0.57
+        // deg/knot; see test/test_est_window_anchor.cpp (2026-07-26 bug hunt).
+        //
+        // Absolute index -> source, PER SLOT. Slot i must describe absolute knot
+        // anchor_first+i; that is a retained knot when it is >= num_knots_pruned_
+        // and one of our own idle slots otherwise. Our idle slot j describes
+        // absolute knot (num_knots_pruned_-3+j), so the mapping is
+        // j = (absolute - num_knots_pruned_) + 3.
+        //
+        // Do NOT collapse this to an all-or-nothing choice: falling back to
+        // idle slot i wholesale is correct only when start_idx == pruned
+        // exactly. For start_idx == pruned+1 or pruned+2 (the common SHORT
+        // handshake blackout — Mapping's uninitialized spin is one 100 ms
+        // worker iteration while RESPLE publishes ~30-40 windows/s, so
+        // start_idx lands at 1..2) it is off by 1-2 knots, which is a
+        // permanent 0.57 deg / 1.15 deg replica attitude offset at
+        // 0.573 deg/knot. The clamp above guarantees start_idx >=
+        // num_knots_pruned_, so j is always within [0,2] on the idle branch and
+        // the deque index is always within [0,num_knot) on the knot branch.
+        const int64_t anchor_first = start_idx - 3;  // absolute
+        const auto anchorPos = [&](int64_t abs_idx) -> const Eigen::Vector3d& {
+            const int64_t deq = abs_idx - num_knots_pruned_;
+            return (deq >= 0) ? t_knots[deq] : t_idle[deq + 3];
+        };
+        const auto anchorDel = [&](int64_t abs_idx) -> const Eigen::Vector3d& {
+            const int64_t deq = abs_idx - num_knots_pruned_;
+            return (deq >= 0) ? ort_delta[deq] : ort_delta_idle[deq + 3];
+        };
         for (int i = 0; i < 3; i++) {
             estimate_msgs::msg::Knot idle_msg;
-            idle_msg.position.x = t_idle[i].x();
-            idle_msg.position.y = t_idle[i].y();
-            idle_msg.position.z = t_idle[i].z();
-            idle_msg.orientation_del.x = ort_delta_idle[i].x();
-            idle_msg.orientation_del.y = ort_delta_idle[i].y();
-            idle_msg.orientation_del.z = ort_delta_idle[i].z();
+            const Eigen::Vector3d& pos = anchorPos(anchor_first + i);
+            const Eigen::Vector3d& del = anchorDel(anchor_first + i);
+            idle_msg.position.x = pos.x();
+            idle_msg.position.y = pos.y();
+            idle_msg.position.z = pos.z();
+            idle_msg.orientation_del.x = del.x();
+            idle_msg.orientation_del.y = del.y();
+            idle_msg.orientation_del.z = del.z();
             spline_msg.idles.push_back(idle_msg);
         }
-        spline_msg.start_q.w = q_idle[0].w();
-        spline_msg.start_q.x = q_idle[0].x();
-        spline_msg.start_q.y = q_idle[0].y();
-        spline_msg.start_q.z = q_idle[0].z();        
+        // start_q anchors slot 0 directly (setIdles(0) ignores its delta), so it
+        // must be the ABSOLUTE orientation of knot anchor_first; slots 1 and 2
+        // then chain forward through their own deltas to reach knot start_idx-1.
+        const int64_t q_deq = anchor_first - num_knots_pruned_;
+        const Eigen::Quaterniond& q_anchor =
+            (q_deq >= 0) ? q_knots[q_deq] : q_idle[q_deq + 3];
+        spline_msg.start_q.w = q_anchor.w();
+        spline_msg.start_q.x = q_anchor.x();
+        spline_msg.start_q.y = q_anchor.y();
+        spline_msg.start_q.z = q_anchor.z();
         if (total < 5) {
             spline_msg.start_idx = 0;
 

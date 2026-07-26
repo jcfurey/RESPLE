@@ -322,7 +322,8 @@ if(BUILD_TESTING)
     test/test_overload_control.cpp
     test/test_tf_ownership.cpp
     test/test_sim_time_wait.cpp
-    test/test_dense_pub.cpp)
+    test/test_dense_pub.cpp
+    test/test_range_weighting.cpp)
   foreach(_test_src ${RESPLE_UNIT_TESTS})
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${_test_src})
       get_filename_component(_test_name ${_test_src} NAME_WE)
@@ -342,26 +343,29 @@ if(BUILD_TESTING)
     endif()
   endforeach()
 
-  # SplineState knot-pruning unit test (HARDENING Phase 3.1). Unlike the cores
-  # above it includes SplineState.h, which pulls the estimate_msgs message
-  # headers — real generated ones here (the standalone resple/test build uses
-  # the ROS-free stubs under test/stubs/ instead).
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/test_spline_state.cpp)
-    ament_add_gtest(test_spline_state test/test_spline_state.cpp)
-    target_include_directories(test_spline_state PRIVATE include)
-    # ament_target_dependencies() was removed in ament_cmake 2.8 (ROS
-    # 'lyrical'). Link the message package's exported typesupport targets
-    # directly — ${estimate_msgs_TARGETS} (populated by find_package via
-    # ament_auto_find_build_dependencies) carries include dirs + libs as
-    # modern-CMake usage requirements, the same thing the old macro added.
-    target_link_libraries(test_spline_state ${estimate_msgs_TARGETS})
-    if(TARGET Eigen3::Eigen)
-      target_link_libraries(test_spline_state Eigen3::Eigen)
+  # SplineState tests: knot pruning (HARDENING Phase 3.1) and the est_window
+  # replica anchor (2026-07-26 bug hunt). Unlike the cores above these include
+  # SplineState.h, which pulls the estimate_msgs message headers — real
+  # generated ones here (the standalone resple/test build uses the ROS-free
+  # stubs under test/stubs/ instead).
+  foreach(spline_test test_spline_state test_est_window_anchor)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/${spline_test}.cpp)
+      ament_add_gtest(${spline_test} test/${spline_test}.cpp)
+      target_include_directories(${spline_test} PRIVATE include)
+      # ament_target_dependencies() was removed in ament_cmake 2.8 (ROS
+      # 'lyrical'). Link the message package's exported typesupport targets
+      # directly — ${estimate_msgs_TARGETS} (populated by find_package via
+      # ament_auto_find_build_dependencies) carries include dirs + libs as
+      # modern-CMake usage requirements, the same thing the old macro added.
+      target_link_libraries(${spline_test} ${estimate_msgs_TARGETS})
+      if(TARGET Eigen3::Eigen)
+        target_link_libraries(${spline_test} Eigen3::Eigen)
+      endif()
+      if(BLAS_FOUND)
+        target_link_libraries(${spline_test} ${BLAS_LIBRARIES})
+      endif()
     endif()
-    if(BLAS_FOUND)
-      target_link_libraries(test_spline_state ${BLAS_LIBRARIES})
-    endif()
-  endif()
+  endforeach()
 
   # ikd-Tree concurrency regression (HARDENING Phase 2.4 Push_Down race). Unlike
   # the cores above this one needs PCL (pcl::PointXYZINormal) — a hard package

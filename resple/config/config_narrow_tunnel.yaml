@@ -122,12 +122,22 @@
     # ------------------------------------------------------------------
     # Close-range measurement weighting
     # ------------------------------------------------------------------
-    # [NARROW] OFF. The (range_ref/r)^2 variance inflation exists to stop one
-    # nearby surface from dominating an otherwise-open scene. In a narrow
-    # bore EVERY return is close — the "protection" just starves the whole
-    # update (9x at 1 m walls, 36x at 0.5 m) and the estimator coasts then
-    # snaps. There is no far geometry to protect against here.
-    range_ref: 0.0
+    # [NARROW] The (range_ref/r)^2 variance inflation exists to stop one nearby
+    # surface from dominating an otherwise-open scene. In a narrow bore EVERY
+    # return is close, so the ABSOLUTE form starves the whole update (9x at 1 m
+    # walls, 36x at 0.5 m) — uniform inflation re-balances nothing, it just
+    # scales the LiDAR information block down against the prior, and the
+    # estimator coasts then snaps.
+    #
+    # This profile used to set range_ref: 0.0 (mechanism off outright), which
+    # cures the starvation but also discards the anti-domination protection.
+    # range_noise_relative normalizes each scan by its OWN farthest valid
+    # return, which gives both: no starvation when everything is close, and
+    # identical behaviour to the absolute form in open scenes (the normalizer
+    # is 1 there). Keep range_ref at the production value and turn the relative
+    # mode on. See utils/range_weighting.h and doc/PARAMETERS.md.
+    range_ref: 3.0
+    range_noise_relative: true
     range_noise_scale_max: 900.0
 
     # ------------------------------------------------------------------

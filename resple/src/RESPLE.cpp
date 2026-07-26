@@ -2427,6 +2427,28 @@ private:
             estimator_lio.range_ref = rref;
             estimator_lo.range_noise_scale_max = rmax;
             estimator_lio.range_noise_scale_max = rmax;
+            // Relative (per-scan) close-range down-weighting. The absolute
+            // form is scene-blind: in a confined space (tunnel / culvert /
+            // truck bed) EVERY return is inside range_ref, so every row is
+            // inflated by the same 9-36x, which does not re-balance anything
+            // — it just scales the whole LiDAR information block down against
+            // the prior, so the filter coasts on the prior/IMU and then snaps
+            // when geometry returns. Relative mode normalizes by the scan's
+            // farthest valid return: unchanged in open scenes (the normalizer
+            // is 1 there, so anti-domination is preserved exactly), no
+            // starvation when everything is close. Default false = legacy,
+            // bit-identical. See utils/range_weighting.h.
+            const bool rrel = CommonUtils::readParam<bool>(
+                this->get_node_parameters_interface(), "range_noise_relative", false);
+            estimator_lo.range_noise_relative = rrel;
+            estimator_lio.range_noise_relative = rrel;
+            if (rrel && rref > 0.0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[RESPLE] range_noise_relative=true: close-range variance "
+                    "inflation (range_ref=%.2f m) normalized per scan by the "
+                    "farthest valid return — confined spaces keep full LiDAR "
+                    "authority.", rref);
+            }
         }
 
         // Overload hardening (2026-07-07): damped propRCP gap extrapolation.

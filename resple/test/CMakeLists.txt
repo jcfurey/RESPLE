@@ -46,6 +46,8 @@ set(RESPLE_TEST_SOURCES
   test_sim_time_wait.cpp
   test_dense_pub.cpp
   test_spline_state.cpp
+  test_est_window_anchor.cpp
+  test_range_weighting.cpp
 )
 
 foreach(src ${RESPLE_TEST_SOURCES})
@@ -65,14 +67,16 @@ foreach(src ${RESPLE_TEST_SOURCES})
   endif()
 endforeach()
 
-# test_spline_state includes SplineState.h, which pulls the estimate_msgs
-# message headers. The standalone (ROS-free) build satisfies those includes
-# with the field-compatible stubs under test/stubs/; the colcon BUILD_TESTING
-# path (resple/CMakeLists.txt) uses the real generated messages instead.
-if(TARGET test_spline_state)
-  target_include_directories(test_spline_state PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
-endif()
+# These include SplineState.h, which pulls the estimate_msgs message headers.
+# The standalone (ROS-free) build satisfies those includes with the
+# field-compatible stubs under test/stubs/; the colcon BUILD_TESTING path
+# (resple/CMakeLists.txt) uses the real generated messages instead.
+foreach(spline_test test_spline_state test_est_window_anchor)
+  if(TARGET ${spline_test})
+    target_include_directories(${spline_test} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
+  endif()
+endforeach()
 
 # ikd-Tree concurrency regression (HARDENING Phase 2.4). This one DOES need PCL
 # (pcl::PointXYZINormal) and compiles the kd-tree TU directly, so it is gated on

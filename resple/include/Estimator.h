@@ -7,6 +7,7 @@
 #include "SplineState.h"
 #include "Association.h"
 #include "utils/overload_control.h"
+#include "utils/range_weighting.h"
 
 template<int XSIZE>
 class Estimator
@@ -112,13 +113,29 @@ class Estimator
     // at configure (like corresp_cfg); worker-thread reads only.
     double range_ref = 3.0;
     double range_noise_scale_max = 900.0;
+    // false = absolute (legacy, bit-identical). true = per-scan RELATIVE: the
+    // inflation is normalized by the scan's farthest valid return, so a
+    // confined space (tunnel / culvert / truck bed, where EVERY return is
+    // close) is no longer uniformly starved of LiDAR information while the
+    // anti-domination behaviour in open scenes is preserved exactly. See
+    // utils/range_weighting.h for the derivation. Set once at configure.
+    bool range_noise_relative = false;
 
+    // Absolute inflation factor for one return (utils/range_weighting.h).
     double rangeNoiseScale(float range_sensor) const
     {
-        if (range_ref <= 0.0) return 1.0;
-        const double r = std::max(static_cast<double>(range_sensor), 0.1);
-        if (r >= range_ref) return 1.0;
-        return std::min((range_ref * range_ref) / (r * r), range_noise_scale_max);
+        return resple::range::rangeNoiseScale(rangeNoiseConfig(), range_sensor);
+    }
+
+    // Largest range among the returns this update will actually use. Rejected
+    // rows carry no information, so they must not set the reference.
+    static float maxValidRange(const Eigen::aligned_deque<PointData>& pt_meas)
+    {
+        float r_max = 0.f;
+        for (const auto& pt : pt_meas) {
+            if (pt.if_valid && pt.range_sensor > r_max) r_max = pt.range_sensor;
+        }
+        return r_max;
     }
 
     // Overload hardening (2026-07-07): damping schedule for propRCP's
@@ -672,6 +689,15 @@ class Estimator
     }
 
   private:
+    resple::range::RangeNoiseConfig rangeNoiseConfig() const
+    {
+        resple::range::RangeNoiseConfig cfg;
+        cfg.range_ref = range_ref;
+        cfg.scale_max = range_noise_scale_max;
+        cfg.relative = range_noise_relative;
+        return cfg;
+    }
+
     SplineState spl;
     // Zero-initialized explicitly: the default workspace build uses
     // RelWithDebInfo which disables Eigen's optional NaN-init (Debug-only
@@ -895,6 +921,13 @@ class Estimator
             prepLiDAR(pt_data);
         }
         int idx_offset = 0;
+        // Close-range down-weighting reference for THIS update. In relative
+        // mode this anchors the inflation to the scan's farthest valid return
+        // so a uniformly-close scene keeps full LiDAR authority; in absolute
+        // (default) mode it is 1.0 and the arithmetic is unchanged.
+        const resple::range::RangeNoiseConfig rn_cfg = rangeNoiseConfig();
+        const double rn_norm =
+            resple::range::rangeNoiseNormalizer(rn_cfg, maxValidRange(pt_meas));
         Eigen::Matrix3d gate_Ett = Eigen::Matrix3d::Zero();
         double gate_w = 0.0;
         int gate_n = 0;
@@ -907,7 +940,8 @@ class Estimator
                 Eigen::Matrix<double, 1, XSIZE> Hi = Eigen::Matrix<double, 1, XSIZE>::Zero();
                 Hi.template leftCols<24>() = pt_data.H;
                 double lid_cov = Hi*cov_rcp*Hi.transpose() + pt_data.var_pt;
-                const double noise_scale = rangeNoiseScale(pt_data.range_sensor);
+                const double noise_scale =
+                    resple::range::rangeNoiseWeight(rn_cfg, pt_data.range_sensor, rn_norm);
                 if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
                     innv_buf_(idx_offset) = - pt_data.zp;
                     H_buf_.row(idx_offset) = Hi;
@@ -957,6 +991,11 @@ class Estimator
         int idx_offset = 0;
         size_t id_imu = 0;
         size_t id_pt = 0;
+        // See updateLiDAR: per-update close-range reference (1.0 in the
+        // default absolute mode, so the arithmetic below is unchanged).
+        const resple::range::RangeNoiseConfig rn_cfg = rangeNoiseConfig();
+        const double rn_norm =
+            resple::range::rangeNoiseNormalizer(rn_cfg, maxValidRange(pt_meas));
         Eigen::Matrix3d gate_Ett = Eigen::Matrix3d::Zero();
         double gate_w = 0.0;
         int gate_n = 0;
@@ -972,7 +1011,8 @@ class Estimator
                     if (pt_data.if_valid) {
                         Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
                         double lid_cov = pt_data.H*cov*pt_data.H.transpose() + pt_data.var_pt;
-                        const double noise_scale = rangeNoiseScale(pt_data.range_sensor);
+                        const double noise_scale =
+                            resple::range::rangeNoiseWeight(rn_cfg, pt_data.range_sensor, rn_norm);
                         if (abs(pt_data.zp) < pt_thresh || lid_cov < pt_data.var_pt*cov_thresh) {
                             innv_buf_(idx_offset) = - pt_data.zp;
                             H_buf_.block(idx_offset, 0, 1, 24) = pt_data.H;
