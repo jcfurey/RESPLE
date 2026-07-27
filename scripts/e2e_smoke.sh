@@ -47,8 +47,15 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
   ln -sfn "${TOOLS}/data_injector" "${WS}/src/data_injector"
   cd "${WS}"
   echo "==> build resple (Release) + data_injector"
+  # ENABLE_TSAN/ASAN pinned OFF explicitly. CMake CACHES those options, so
+  # running this script after scripts/run_data_sweep.sh (or any manual
+  # sanitizer build) in the same workspace silently produced a SANITIZER build
+  # here — and the smoke test then failed on "odom messages >= 200" (measured
+  # 21 instead of ~3000, under TSan's ~30x slowdown), which reads exactly like
+  # an estimator regression. Pin them so the verdict means what it says.
   colcon build --packages-up-to resple data_injector \
-    --cmake-args -DENABLE_NATIVE_ARCH=OFF "-DPython3_EXECUTABLE=${PYEXE}"
+    --cmake-args -DENABLE_NATIVE_ARCH=OFF -DENABLE_TSAN=OFF -DENABLE_ASAN=OFF \
+                 "-DPython3_EXECUTABLE=${PYEXE}"
 else
   cd "${WS}"
 fi

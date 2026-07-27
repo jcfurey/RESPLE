@@ -83,6 +83,8 @@ colcon build --packages-up-to resple \
   --cmake-args \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DENABLE_NATIVE_ARCH=OFF \
+    -DENABLE_TSAN=OFF \
+    -DENABLE_ASAN=OFF \
     "-DPython3_EXECUTABLE=${PYEXE}"
 
 if [ "${RUN_TESTS}" -eq 1 ]; then

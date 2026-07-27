@@ -736,9 +736,21 @@ the source.
   `totalKnots()` space (see the est_window publish gate in both nodes). If you only need the
   current pose at `maxTimeNs()`, prefer `getPositionLiDAR(spline->maxTimeNs(), ...)`
   which is now pure-read (Phase 1.5 Pass 3).
-- When adding state to `Mapping.cpp`'s `process()` loop, hold all per-map
-  mutexes via `ScopedMappingsLock maps_lock(vis_maps);` — RAII, exception-safe.
-  The bare `lock_mappings()` / `unlock_mappings()` pair is gone.
+- When adding state to `Mapping.cpp`'s `process()` loop, work out which lock
+  actually covers it before reaching for one. `spline_active_` and everything
+  derived from it (`opt_old_path`, `path_t_ns_`, `est_window_queue_`) is
+  covered by `m_spline`, and every mutation of it is on the worker thread
+  (Option B). Per-map `MappingBase` state (`pc_L_buff` and the scratch members)
+  is covered by that map's own `mtx`; take all of them together via
+  `ScopedMappingsLock maps_lock(vis_maps);` — RAII, exception-safe. The bare
+  `lock_mappings()` / `unlock_mappings()` pair is gone.
+  **`ScopedMappingsLock` is currently unused** (2026-07-27): the publish block
+  and the est_window drain both held it without touching any per-map state — a
+  vestige of the pre-Option-B scheme where the per-map mutexes stood in for
+  `m_spline` on spline reads. It blocked all seven sensor callbacks for the
+  length of a Path publish (up to 10 000 poses) every 50 ms. The helper is kept
+  because it is the correct pattern the moment `process()` does touch per-map
+  state; do not re-add it "for symmetry".
 - Build commands (from `rovermax_ws/` inside the container):
   ```bash
   ./scripts/colcon/colcon_build_pkg.sh resple

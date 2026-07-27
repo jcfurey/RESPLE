@@ -1454,7 +1454,10 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             if (spline_pending_ready_.load()) {
                 std::lock_guard<std::mutex> lock(m_spline);
                 if (spline_pending_ready_.load()) {
-                    ScopedMappingsLock maps_lock(vis_maps);
+                    // Same removal as the publish block below: this branch
+                    // touches spline_active_ and est_window_queue_ only, both
+                    // covered by m_spline, and blocked all seven sensor
+                    // callbacks for the length of the drain for nothing.
                     while (!est_window_queue_.empty()) {
                         EstWindow& w = est_window_queue_.front();
                         spl_window_st_ns = w.window_st_ns;
@@ -1540,7 +1543,27 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
                 // lock-order inversion / potential deadlock with the swap branch
                 // (TSan, Phase 6.1). Acquire m_spline first, then the maps.
                 std::lock_guard<std::mutex> spline_lock(m_spline);
-                ScopedMappingsLock maps_lock(vis_maps);
+                // NO ScopedMappingsLock here any more. It was a vestige of the
+                // pre-Option-B scheme, where the per-map mutexes stood in for
+                // m_spline as the guard on spline_active_ reads (see the
+                // start_pending_ member comment). Option B moved every
+                // spline_active_ mutation onto this worker thread under
+                // m_spline, and m_spline is held above — so the maps lock had
+                // no remaining job in this branch.
+                //
+                // Verified before removing: publishPath / displayControlPoints
+                // / pubOdom touch spline_active_, opt_old_path, path_t_ns_ and
+                // the publishers — none of the MappingBase state `mtx` guards;
+                // processScan is called from exactly one site (below, on this
+                // thread) and takes `mtx` itself; no sensor callback reads
+                // spline_active_.
+                //
+                // What it cost: the block serializes and publishes a Path of up
+                // to 10 000 poses plus the odom message and the map->odom TF,
+                // every 50 ms, and every one of the seven sensor callbacks was
+                // blocked on `mtx` for that whole time. Taking fewer locks
+                // cannot create an ordering inversion, so the documented
+                // m_spline -> maps rule is trivially preserved.
                 publishPath();
                 displayControlPoints();
                 pubOdom();
@@ -2028,9 +2051,11 @@ private:
                         this->frame_id, this->odom_id, tip_time);
                     got_odom_transform = true;
                 // No wait here either (was 0.1 s). This whole function runs
-                // while the worker holds m_spline AND ScopedMappingsLock (every
-                // per-sensor buffer mutex), so a blocking TF wait stalls all
-                // seven sensor callbacks with it — and under a frozen sim clock
+                // while the worker holds m_spline, so a blocking TF wait stalls
+                // every consumer of the spline replica — and it used to stall
+                // all seven sensor callbacks too, because the block also held
+                // the per-sensor mutexes (that lock has since been removed as
+                // vestigial; see the publish block). Under a frozen sim clock
                 // tf2's timed canTransform busy-polls `now() < start + timeout`
                 // and never returns, wedging the worker into exactly the
                 // detach-on-teardown path hazard 88 exists for.
@@ -2092,7 +2117,8 @@ private:
         // Option B: stage the (re)start for the worker thread rather than
         // calling spline_active_.init() here. This keeps ALL spline_active_
         // mutation on the worker, eliminating the data race with process()'s
-        // publish reads (which hold ScopedMappingsLock, not m_spline). The
+        // publish reads (which at the time held ScopedMappingsLock rather than
+        // m_spline; the publish block now holds m_spline and no maps lock). The
         // worker performs init() under m_spline when it consumes start_pending_.
         // The release-stores below pair with the worker's acquire-loads so the
         // staged bag time is visible before the worker acts on the flags.
