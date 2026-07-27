@@ -32,6 +32,8 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/io/pcd_io.h>
+#include <algorithm>
+#include <cstdint>
 #include <mutex>
 
 class MapSaving : public rclcpp::Node
@@ -40,6 +42,9 @@ public:
     MapSaving() : Node("MapSaving")
     {
         pcd_save_path = this->declare_parameter<std::string>("pcd_save_path", "/tmp/global_map.pcd");
+        // Cap on the accumulator (0 = unbounded, the pre-2026-07-27 behaviour).
+        max_points_ = static_cast<size_t>(std::max<int64_t>(
+            0, this->declare_parameter<int64_t>("max_points", 60000000)));
 
         sub_global_map = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             "global_map", 200,
@@ -60,6 +65,11 @@ private:
     pcl::PointCloud<pcl::PointXYZI>::Ptr accumulated_map;
     std::mutex mtx_map;
     std::string pcd_save_path;
+    // 0 disables the cap. 60e6 XYZI points is ~960 MB in the accumulator plus
+    // the same again for savePCDCallback's copy — already generous for a
+    // visualization/export helper.
+    size_t max_points_ = 60000000;
+    bool cap_warned_ = false;
 
     void globalMapCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     {
@@ -67,6 +77,24 @@ private:
             pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>());
             pcl::fromROSMsg(*msg, *cloud);
             std::lock_guard<std::mutex> lock(mtx_map);
+            // Bounded. /global_map ships one incremental scan per message and
+            // this node keeps every one for the whole session, so RSS grew
+            // without limit on a long mission — and savePCDCallback then takes
+            // a full COPY under the lock, doubling peak usage at exactly the
+            // moment the map is largest. A cap with a loud warning is better
+            // than an OOM kill that loses the map entirely.
+            if (max_points_ > 0 &&
+                accumulated_map->points.size() + cloud->points.size() > max_points_) {
+                if (!cap_warned_) {
+                    cap_warned_ = true;
+                    RCLCPP_ERROR(this->get_logger(),
+                        "MapSaving: accumulated map reached the %zu-point cap; "
+                        "further /global_map messages are DROPPED. Save now "
+                        "(the map is incomplete from here on) and raise "
+                        "max_points, or save more often.", max_points_);
+                }
+                return;
+            }
             *accumulated_map += *cloud;
         } catch (const std::exception& e) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,

@@ -69,8 +69,14 @@ struct MahalanobisGate {
 
   // Disarm threshold: if strictly more than this fraction of the update's
   // candidate rows would be rejected, treat that as evidence against the prior
-  // and admit everything. 0 disables the escape hatch (not recommended); 1
-  // never disarms.
+  // and admit everything.
+  //
+  // 1.0 = never disarm (the gate always applies its verdict).
+  // 0.0 = the gate never applies its verdict, i.e. it is effectively DISABLED —
+  //       staysArmed() requires rejected <= 0.0 * candidates, which no non-zero
+  //       rejection count can satisfy. An earlier version of this comment said
+  //       0 "disables the escape hatch", which reads as the opposite (always
+  //       armed) and is wrong.
   double max_reject_frac = 0.5;
 
   bool enabled() const { return sigma > 0.0; }

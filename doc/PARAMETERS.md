@@ -199,12 +199,13 @@ when the robot starts on a slope or is already moving at launch.
 | `<name>/topic_lidar` | — | Point cloud topic |
 | `<name>/lidar_type` | — | `Ouster`, `Hesai`, `Mid360Boxi`, `HAP360`, `Mid70Avia`, `AviaResple`, or **`PointCloud2`** (generic: field layout introspected at runtime — works with any driver) |
 | `<name>/blind` | — | Drop points within this radius (m) of the sensor |
+| `<name>/scan_line` | `0` | Number of scan lines/rings. **Only the three Livox `CustomMsg` callbacks read it** (`livoxLidarCallback`, `livoxLidar2Callback`, `livoxAVIACallback`), where it drives the per-line reordering. It is INERT for `Ouster`, `Hesai`, `Mid360Boxi` and the generic `PointCloud2` type — all 20 shipped configs set it regardless, which is harmless but misleading. Previously undocumented. |
 | `<name>/q_lb`, `<name>/t_lb` | — | body→LiDAR extrinsics: `p_lidar = q_lb · p_body + t_lb` (quaternion `w,x,y,z`; translation m). The code inverts them (`q_bl = q_lb⁻¹`, `t_bl = q_lb⁻¹·(−t_lb)`) to map LiDAR points into the body frame — do **not** supply the LiDAR-pose-in-body here, it is the inverse of that |
-| `<name>/w_pt` | — | Per-point measurement weight |
+| `<name>/w_pt` | `0.01` (code fallback) | Per-point LiDAR measurement **VARIANCE** in m², despite the name — it is used as `var_pt`, and `R⁻¹` for the row is `1/(var_pt·noise_scale)`. So SMALLER means the point is trusted MORE, the opposite of what "weight" suggests. `0.01` = σ 0.1 m; shipped configs use 0.01 (16 of 20), 0.05 (3) and 0.5 (1). A missing or mistyped entry falls back to 0.01 in code (it was `1e-9` = σ 31 µm, i.e. effectively infinite trust, until hazard 93). It also sets the scale of the `coeff_cov` escape clause and the `lidar_gate_sigma` gate, both of which are expressed relative to it. |
 | `<name>/time_field` | `""` (auto) | `PointCloud2` type only: per-point time field name override |
 | `<name>/time_unit` | `auto` | `auto` \| `s` \| `ms` \| `us` \| `ns` |
 | `<name>/intensity_field` | `""` (auto) | Intensity/reflectivity field override |
-| `lidar_time_offset` | `0.0` | Constant offset (s) added to LiDAR stamps |
+| `lidar_time_offset` | `0.0` | Constant offset (s) **SUBTRACTED** from LiDAR stamps: every call site computes `stamp_ns - time_offset` (12 sites across both nodes; this row previously said "added", which is backwards). So a POSITIVE value moves LiDAR data EARLIER in time — use it when the LiDAR stamps lag the IMU/spline time base. Paired everywhere with a `stamp_ns < time_offset` early-return that drops messages whose stamp precedes the offset (the early-sim-time case). 5 shipped configs use 0.1. |
 | `imu_init_num_samples` | `50` | Stationary samples for gravity alignment |
 | `imu_init_max_variance` | `5.0` | Reject init if accel variance exceeds this (m/s²)² |
 | `lo_imu_wait_timeout` | `10.0` | LO mode only: seconds to wait for IMU before initializing without gravity alignment (identity orientation). LIO always requires IMU |
@@ -227,13 +228,13 @@ when the robot starts on a slope or is already moving at launch.
 | `knot_hz` | — | B-spline knot rate (Hz); 100 is the canonical value |
 | `n_iter` | `1` | IEKF iterations per update |
 | `num_points_upd` | `100` | Max LiDAR points per IEKF step |
-| `num_match_points` | `5` | k for the k-NN plane fit |
+| `num_match_points` | `5` | k for the k-NN plane fit. Declared with a **hard-fail** `ParameterDescriptor` range of 3–10: a value outside it makes the node REFUSE TO START (rclcpp rejects the parameter), it is not clamped. Note a CUDA build additionally caps the GPU path at 8 — 9 and 10 fall back to the ikd-Tree with a WARN. |
 | `nn_thresh` | — | Point-to-plane residual threshold in the IEKF (m). **Read the `coeff_cov` row: this only binds when `coeff_cov <= 1`.** |
 | `coeff_cov` | — | Escape hatch on the row accept test, which is `\|zp\| < nn_thresh` **\|\|** `lid_cov < var_pt*coeff_cov` with `lid_cov = H·P·Hᵗ + var_pt`. Since `lid_cov >= var_pt` always, any value `> 1` makes the second disjunct hold for a converged `P` — it short-circuits and **`nn_thresh` never binds**. `1.0` makes it unsatisfiable and thereby activates `nn_thresh` (what `config_narrow_tunnel.yaml` does). With `coeff_cov > 1` the only outlier rejection that fires is `findCorresp`'s `\|pd2\| < sqrt(range)/9`: 0.11 m at 1 m, 0.35 m at 10 m, 0.79 m at 50 m — at full weight unless `robust_kernel` is on. `cov_escape_admits` in the Diagnostics msg counts the rows this admits past `nn_thresh`. |
 | `ds_scan_voxel`, `ds_lm_voxel` | — | Scan / local-map voxel downsampling (m) |
 | `point_filter_num` | `1` | Keep every n-th point |
 | `cube_len` | `1000.0` | FOV-cube local map size (m) |
-| `num_threads` | `5` | OpenMP threads for k-NN / transforms |
+| `num_threads` | `5` | OpenMP threads for k-NN / transforms. Declared with a **hard-fail** `ParameterDescriptor` range of 1–16: outside it the node refuses to start. Inside it, the value is then clamped at runtime to `max(1, hardware_concurrency − 2)` with a WARN — so "rejected" and "clamped" apply to different ranges, which the note below only described for the second. |
 | `cov_P0`, `cov_RCP_*`, `std_sys_*`, `cov_acc`, `cov_gyro`, `cov_ba`, `cov_bg` | — | Filter prior / process / measurement noise (see example configs) |
 
 ### Robustness & diagnostics (HARDENING series)
