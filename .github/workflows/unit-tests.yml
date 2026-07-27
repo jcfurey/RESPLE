@@ -159,3 +159,31 @@ jobs:
             ros-jazzy-diagnostic-updater ros-jazzy-ament-cmake-gtest
       - name: Build + run smoke
         run: SECONDS_RUN=45 ./scripts/e2e_smoke.sh
+      - name: Integration tests (ROS + PCL)
+        # These were gated behind -DRESPLE_BUILD_INTEGRATION_TESTS=OFF and run
+        # by NOTHING, so the coverage they claim (real sensor_msgs/PointCloud2
+        # through ingestPointCloud2; the esti_plane PCL path; the full lifecycle
+        # re-cycle) did not actually exist — and the lifecycle test was in fact
+        # broken in a way that could never pass, which is what happens to a test
+        # nobody runs. This job already has ROS 2 Jazzy + PCL installed, so
+        # running them here costs only the build.
+        #
+        # Not folded into the other jobs: they are deliberately ROS-free and
+        # fast. This is the one job that already pays for a ROS install.
+        # Reuses the workspace e2e_smoke.sh already assembled at ~/ros2_ws
+        # (symlinked packages + the data_injector), so this is a re-configure of
+        # an existing build tree, not a second checkout.
+        run: |
+          set -euo pipefail
+          source /opt/ros/jazzy/setup.bash
+          cd "${HOME}/ros2_ws"
+          PYEXE=/usr/bin/python3.12
+          colcon build --packages-up-to resple \
+            --cmake-args -DRESPLE_BUILD_INTEGRATION_TESTS=ON \
+                         -DENABLE_NATIVE_ARCH=OFF \
+                         "-DPython3_EXECUTABLE=${PYEXE}"
+          # --return-code-on-test-failure: without it colcon test exits 0 even
+          # when cases fail, which is how this repo has shipped green-but-empty
+          # gates before.
+          colcon test --packages-select resple --return-code-on-test-failure \
+            --event-handlers console_direct+
