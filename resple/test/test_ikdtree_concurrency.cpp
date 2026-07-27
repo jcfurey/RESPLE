@@ -349,8 +349,14 @@ TEST(IkdTreeConcurrency, RebuildVsMutatorRace)
         t.join();
 
     // Report the depth actually achieved: a run that got 2 cycles in its budget
-    // is a WEAKER canary than one that got 6, and that difference should be
-    // visible in the CI log rather than hidden behind a green tick.
+    // is a WEAKER canary than one that got 6, and that difference is worth
+    // seeing. NOTE where it is actually visible: ctest --output-on-failure (how
+    // scripts/run_unit_tests.sh and the estimator-core CI job invoke it)
+    // suppresses stdout for PASSING tests, so there it appears only on failure.
+    // It is always visible when the binary runs directly — the ikdtree-tsan CI
+    // job does that, and locally use:
+    //   ctest -R RebuildVsMutatorRace -V
+    //   ./build/unit-tests/test_ikdtree_concurrency --gtest_filter=*RebuildVs*
     std::cout << "[ikd-stress] " << cycles_done << "/" << kMutCycles
               << " mutator cycles in " << stress_seconds << " s budget, "
               << total_searches.load() << " searches\n";
