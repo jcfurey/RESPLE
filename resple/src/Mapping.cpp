@@ -75,6 +75,12 @@ class MappingBase
 {
   public:
 
+    // Virtual: mappingMain owns the seven concrete buffs through MappingBase*
+    // and deletes them through that pointer. Without this, ~Derived never runs
+    // — UB, and in practice the derived subscription shared_ptrs are never
+    // released, so the node keeps receiving into a half-destroyed object.
+    virtual ~MappingBase() = default;
+
     std::mutex mtx;       // protects pc_L_buff (shared with the worker thread)
     // Serializes the sensor callback body. The lidar subs share a
     // MutuallyExclusive callback group, but under the MultiThreadedExecutor TSan
@@ -474,10 +480,14 @@ class MappingBase
 
     PointType transformPoint(int64_t time_ns, const SplineState* spl, const PointType& pt_in) const
     {
+        // itpPose, not itpQuaternion + itpPosition: the two separate calls each
+        // redo the whole knot-index lookup, u/basis-coefficient evaluation and
+        // window setup for the SAME time_ns. This is the map's per-point hot
+        // path (every point of every scan), and RESPLE's own deskew already
+        // uses the combined query. Measured ~38% off this function.
         Eigen::Quaterniond q_itp;
         Eigen::Vector3d t_itp;
-        spl->itpQuaternion(time_ns, &q_itp);
-        t_itp = spl->itpPosition(time_ns);
+        spl->itpPose(time_ns, &t_itp, nullptr, &q_itp, nullptr);
         // Mirror RESPLE's Association::pointBodyToWorld EXACTLY: the spline is
         // the world<-base_link trajectory (RESPLE applies it to TF-transformed
         // base_link points, with the YAML q_bl/t_bl as an extra offset that is
@@ -1074,9 +1084,30 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
     {
         RCLCPP_INFO(this->get_logger(), "Configuring Mapping...");
 
+        // A previously-detached worker is still executing with raw references
+        // to the publishers / broadcasters / tf_buffer that on_cleanup
+        // deliberately leaked to keep it memory-safe (hazard 88). Reassigning
+        // them below would destroy exactly those objects — a use-after-free in
+        // a live localization node, plus a non-atomic shared_ptr write racing
+        // the zombie's read. Refuse instead.
+        if (worker_detached_.load(std::memory_order_acquire)) {
+            RCLCPP_ERROR(this->get_logger(),
+                "refusing to configure: a previous process thread was detached "
+                "while wedged and is still running with references to this "
+                "node's publishers and TF buffer. Restart the process.");
+            return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::FAILURE;
+        }
+
         // Initialize TF buffer and listener.
         // Bump cache_time to 30s (default 10s) so a brief stall in
         // RESPLE's pose stream doesn't immediately starve our lookups.
+        // Listener first, buffer second — the listener holds a Buffer& (not a
+        // shared_ptr), so reassigning tf_buffer while an old listener survives
+        // leaves that listener pointing at freed memory for the duration of
+        // one statement, and its /tf callback runs on another thread. Same
+        // ordering rule as on_cleanup (hazard 72). Normally both are already
+        // null here; this is belt-and-braces for any path that skips cleanup.
+        tf_listener.reset();
         tf_buffer = std::make_shared<tf2_ros::Buffer>(
             this->get_clock(),
             tf2::durationFromSec(30.0));
@@ -1195,6 +1226,21 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
         }
         tf_absence_wait_.reset();  // window (re)starts at first valid clock sample
         
+        // Same guard as on_configure: setting processing_active_ = true below
+        // would revive a DETACHED worker's `while (processing_active_ && ok())`
+        // loop, giving two concurrent process() loops over one spline replica
+        // and one set of MappingBase scratch members (pc, pc_pending_,
+        // t_end_cache_, last_gated_t_end_ns_ — none covered by `mtx`, which
+        // guards only pc_L_buff). The std::thread move-assign below would NOT
+        // terminate and catch it, because a detached thread is non-joinable.
+        if (worker_detached_.load(std::memory_order_acquire)) {
+            RCLCPP_ERROR(this->get_logger(),
+                "refusing to activate: a previous process thread was detached "
+                "while wedged; activating would run two process() loops over "
+                "the same state. Restart the process.");
+            return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::FAILURE;
+        }
+
         // Start processing thread (exited-flag store last, for the bounded
         // join's join-vs-detach decision — see joinProcessingThreadBounded).
         processing_active_ = true;
@@ -1352,8 +1398,23 @@ Mapping(const rclcpp::NodeOptions& options, std::vector<MappingBase<pcl::PointXY
             processing_thread_.join();
         } else {
             processing_thread_.detach();
+            // Latch it. A detached worker is still RUNNING and still holding
+            // raw references to this node's publishers, broadcasters and TF
+            // buffer — that is exactly why on_cleanup deliberately leaks them
+            // (hazard 88). But on_configure/on_activate had no idea, so a
+            // subsequent re-cycle destroyed the objects the zombie was using
+            // and restarted its loop condition. joinable() cannot be used as
+            // the signal because detach() clears it; hence a separate flag.
+            //
+            // Never cleared: once a worker has been abandoned we cannot prove
+            // it ever finished (its release-store may land at any time, and it
+            // is the same flag a NEW worker uses). Refusing to re-configure is
+            // the safe answer; the operator restarts the process.
+            worker_detached_.store(true, std::memory_order_release);
             RCLCPP_WARN(this->get_logger(),
-                "Mapping process thread did not exit within timeout; detached");
+                "Mapping process thread did not exit within timeout; detached. "
+                "This node will refuse to re-configure/re-activate — restart "
+                "the process instead.");
         }
     }
 
@@ -1563,6 +1624,11 @@ private:
     // joinProcessingThreadBounded (join-vs-detach without concurrent access
     // to processing_thread_).
     std::atomic<bool> processing_thread_exited_{false};
+    // Set once joinProcessingThreadBounded has DETACHED a wedged worker. That
+    // worker keeps dereferencing pub_odom / br / tf_buffer, so on_cleanup
+    // leaks them (hazard 88) and on_configure/on_activate must refuse to run
+    // rather than destroy them or start a second process() loop.
+    std::atomic<bool> worker_detached_{false};
     std::vector<MappingBase<pcl::PointXYZINormal>*> vis_maps;
     // /diagnostics (2026-07-11): string-keyed diagnostic_updater only — the
     // typed Diagnostics msg stays RESPLE-side. Caches are written on the
@@ -1961,9 +2027,22 @@ private:
                     odom_to_baselink = tf_buffer->lookupTransform(
                         this->frame_id, this->odom_id, tip_time);
                     got_odom_transform = true;
+                // No wait here either (was 0.1 s). This whole function runs
+                // while the worker holds m_spline AND ScopedMappingsLock (every
+                // per-sensor buffer mutex), so a blocking TF wait stalls all
+                // seven sensor callbacks with it — and under a frozen sim clock
+                // tf2's timed canTransform busy-polls `now() < start + timeout`
+                // and never returns, wedging the worker into exactly the
+                // detach-on-teardown path hazard 88 exists for.
+                //
+                // Waiting cannot help in any case: the buffer is filled
+                // asynchronously by the TransformListener thread, so history
+                // that is absent now and would arrive within 100 ms will simply
+                // be there on the next publish cycle 50 ms later. Blocking only
+                // converts "retry shortly" into "hold every lock and hope".
                 } else if (tf_buffer->canTransform(this->frame_id, this->odom_id,
                                                    tf2::TimePointZero,
-                                                   tf2::durationFromSec(0.1))) {
+                                                   tf2::durationFromSec(0.0))) {
                     odom_to_baselink = tf_buffer->lookupTransform(
                         this->frame_id, this->odom_id, tf2::TimePointZero);
                     got_odom_transform = true;

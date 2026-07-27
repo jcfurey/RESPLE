@@ -601,8 +601,27 @@ void CudaMap::batch_search(const pcl::PointXYZINormal* queries, std::size_t n_qu
         return;
     }
     if (k <= 0 || k > kMaxK) {
-        throw std::runtime_error(
-            "CudaMap::batch_search: k out of range [1, kMaxK]");
+        // Latch the failure and fall back, do NOT throw out of here. This used
+        // to throw from OUTSIDE the try/catch below, so the exception escaped
+        // batch_search -> findCorresp -> updateIEKFLiDAR* -> processData
+        // without ever setting impl_->failed. empty() therefore stayed false,
+        // use_gpu stayed true, and the node re-threw on every worker iteration
+        // and never produced odometry again — a permanent stall from a single
+        // out-of-range parameter, with no CPU fallback.
+        //
+        // num_match_points is declared with an upper bound of 10 while kMaxK is
+        // 8, so 9 and 10 are reachable through the node's own parameter range.
+        // (No shipped config exceeds 8, so nothing in-tree hits it.)
+        if (!impl_->failed) {
+            std::fprintf(stderr,
+                "[CudaMap] k=%d out of range [1, %d]; disabling the GPU k-NN "
+                "path and falling back to the ikd-Tree for the rest of the "
+                "session (num_match_points must be <= %d in a CUDA build)\n",
+                k, kMaxK, kMaxK);
+        }
+        impl_->failed = true;
+        prof::frame_done();
+        return;
     }
 
     try {

@@ -245,11 +245,19 @@ target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 # catches the local/member name reuse that the audit flagged as the kind of
 # bug that would slip past code review. -Wextra is strictly more than -Wall.
 # Kept private so downstream consumers aren't forced into the same warnings.
+# COMPILE_LANGUAGE:CXX guard: with ENABLE_CUDA=ON, src/gpu/cuda_knn.cu joins
+# THIS target, and CMake applies target COMPILE_OPTIONS to every source
+# regardless of language — so nvcc received -Wall/-Wextra/-Wshadow (and, below,
+# -march=native, which it fatals on outright). That is why the CUDA path has
+# not been buildable since these flags were added.
 target_compile_options(${PROJECT_NAME} PRIVATE
-	-Wall
-	-Wextra
-	-Wshadow
-	$<$<CONFIG:Debug>:-DEIGEN_INITIALIZE_MATRICES_BY_NAN>
+	$<$<COMPILE_LANGUAGE:CXX>:-Wall>
+	$<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+	$<$<COMPILE_LANGUAGE:CXX>:-Wshadow>
+	$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Debug>>:-DEIGEN_INITIALIZE_MATRICES_BY_NAN>
+	# Pass the host-side warning set through to nvcc's host compiler pass so
+	# the .cu file's host code is still checked.
+	$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
 )
 
 # Optimization / sanitizer flag selection.
@@ -300,11 +308,20 @@ elseif(ENABLE_NATIVE_ARCH)
 else()
 	set(RESPLE_OPT_FLAGS -O3)
 endif()
-target_compile_options(${PROJECT_NAME} PRIVATE ${RESPLE_OPT_FLAGS})
+# CXX-only for the same reason as the warning set above: -march=native is an
+# `nvcc fatal : Unknown option` and would break every ENABLE_CUDA=ON build.
+# nvcc gets the optimization level via -Xcompiler on its host pass; device-side
+# optimization is nvcc's own default (-O3 equivalent) and is not set here.
+target_compile_options(${PROJECT_NAME} PRIVATE
+	$<$<COMPILE_LANGUAGE:CXX>:${RESPLE_OPT_FLAGS}>
+	$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>
+)
 if(RESPLE_SAN_FLAGS)
 	# Sanitizer flags must apply to every TU and to the link of any executable
-	# that pulls in this library, so mark them PUBLIC.
-	target_compile_options(${PROJECT_NAME} PUBLIC ${RESPLE_SAN_FLAGS})
+	# that pulls in this library, so mark them PUBLIC. CUDA host pass gets them
+	# via -Xcompiler; device code is not instrumented (nvcc cannot be).
+	target_compile_options(${PROJECT_NAME} PUBLIC
+		$<$<COMPILE_LANGUAGE:CXX>:${RESPLE_SAN_FLAGS}>)
 	target_link_options(${PROJECT_NAME} PUBLIC ${RESPLE_SAN_FLAGS})
 endif()
 

@@ -66,13 +66,39 @@ TEST(NisDetector, ModeratelyHighNisWarns) {
   EXPECT_EQ(det.state(), FilterState::WARN);
 }
 
-TEST(NisDetector, NonFiniteNisCountsAsBreach) {
+TEST(NisDetector, NonFiniteNisCountsAsBreachWhenTheUpdateRan) {
+  // dof > 0 means update() ran and still produced a non-finite NIS — a real
+  // divergence signal, counted immediately without windowing.
   auto cfg = fastNisCfg();
   NisDivergenceDetector det(cfg);
   for (int i = 0; i < cfg.breach_limit; ++i) {
     det.feed(std::numeric_limits<double>::quiet_NaN(), kDof);
   }
   EXPECT_EQ(det.state(), FilterState::DIVERGED);
+}
+
+TEST(NisDetector, NonFiniteNisWithZeroDofIsIgnored) {
+  // THE pair production actually emits for a skipped update: updateIEKF* sets
+  // last_nis_ = NaN AND last_nis_dof_ = 0 on entry, and a frame that finds zero
+  // correspondences breaks out without ever calling update(). feed() must
+  // ignore it — an information dropout (occlusion, featureless geometry) is not
+  // evidence of an over-confident filter, and counting it would make the
+  // detector fire on healthy frames.
+  //
+  // The sibling test above used to be the ONLY non-finite case covered, which
+  // left the documented "a skipped update feeds the detector a breach" claim
+  // untested and, as it turned out, false. Total dropout is observable via
+  // corresp_used in the Diagnostics message, not via this detector.
+  auto cfg = fastNisCfg();
+  NisDivergenceDetector det(cfg);
+  for (int i = 0; i < cfg.breach_limit * 10; ++i) {
+    det.feed(std::numeric_limits<double>::quiet_NaN(), 0);
+  }
+  EXPECT_EQ(det.state(), FilterState::OK);
+  EXPECT_EQ(det.totalBreaches(), 0u);
+  // A negative dof (should never happen, but the guard is `<= 0`) likewise.
+  det.feed(std::numeric_limits<double>::quiet_NaN(), -1);
+  EXPECT_EQ(det.state(), FilterState::OK);
 }
 
 TEST(NisDetector, RecoversAfterHealthyWindows) {

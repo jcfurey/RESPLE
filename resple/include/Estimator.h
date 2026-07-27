@@ -288,8 +288,25 @@ class Estimator
         // correspondences breaks out below WITHOUT calling update(), so without
         // this reset lastNis() would return the PREVIOUS frame's (healthy) value
         // and the divergence detector would miss a lost-correspondence frame —
-        // exactly the case it exists to catch. Reset to NaN so a frame that never
-        // calls update() feeds the detector a breach (its non-finite path).
+        // exactly the case it exists to catch.
+        //
+        // What the NaN actually does, precisely (the earlier claim here that it
+        // "feeds the detector a breach via its non-finite path" was WRONG):
+        // NisDivergenceDetector::feed returns early on dof <= 0, BEFORE its
+        // non-finite check, and a frame that never calls update() reports
+        // dof = 0 alongside the NaN. So such a frame is IGNORED by the
+        // detector, not counted as a breach — which is the behaviour we want
+        // (a legitimate correspondence dropout, e.g. occlusion, is an absence
+        // of information, not evidence of over-confidence; counting it would be
+        // a false positive). The NaN's real job is to stop lastNis() returning
+        // the PREVIOUS frame's healthy value, which would let a stale reading
+        // be attributed to this frame.
+        //
+        // The non-finite path is still reachable and still meaningful: an
+        // update that RAN (dof > 0) but produced a non-finite NIS is a genuine
+        // breach. Total dropout is deliberately NOT the detector's
+        // jurisdiction; it is observable via corresp_used in the Diagnostics
+        // message and gated in scripts/e2e_smoke_check.py.
         last_nis_ = std::numeric_limits<double>::quiet_NaN();
         last_nis_dof_ = 0;
         last_update_performed_ = false;
@@ -365,8 +382,25 @@ class Estimator
         // correspondences breaks out below WITHOUT calling update(), so without
         // this reset lastNis() would return the PREVIOUS frame's (healthy) value
         // and the divergence detector would miss a lost-correspondence frame —
-        // exactly the case it exists to catch. Reset to NaN so a frame that never
-        // calls update() feeds the detector a breach (its non-finite path).
+        // exactly the case it exists to catch.
+        //
+        // What the NaN actually does, precisely (the earlier claim here that it
+        // "feeds the detector a breach via its non-finite path" was WRONG):
+        // NisDivergenceDetector::feed returns early on dof <= 0, BEFORE its
+        // non-finite check, and a frame that never calls update() reports
+        // dof = 0 alongside the NaN. So such a frame is IGNORED by the
+        // detector, not counted as a breach — which is the behaviour we want
+        // (a legitimate correspondence dropout, e.g. occlusion, is an absence
+        // of information, not evidence of over-confidence; counting it would be
+        // a false positive). The NaN's real job is to stop lastNis() returning
+        // the PREVIOUS frame's healthy value, which would let a stale reading
+        // be attributed to this frame.
+        //
+        // The non-finite path is still reachable and still meaningful: an
+        // update that RAN (dof > 0) but produced a non-finite NIS is a genuine
+        // breach. Total dropout is deliberately NOT the detector's
+        // jurisdiction; it is observable via corresp_used in the Diagnostics
+        // message and gated in scripts/e2e_smoke_check.py.
         last_nis_ = std::numeric_limits<double>::quiet_NaN();
         last_nis_dof_ = 0;
         last_update_performed_ = false;
@@ -439,8 +473,25 @@ class Estimator
         // correspondences breaks out below WITHOUT calling update(), so without
         // this reset lastNis() would return the PREVIOUS frame's (healthy) value
         // and the divergence detector would miss a lost-correspondence frame —
-        // exactly the case it exists to catch. Reset to NaN so a frame that never
-        // calls update() feeds the detector a breach (its non-finite path).
+        // exactly the case it exists to catch.
+        //
+        // What the NaN actually does, precisely (the earlier claim here that it
+        // "feeds the detector a breach via its non-finite path" was WRONG):
+        // NisDivergenceDetector::feed returns early on dof <= 0, BEFORE its
+        // non-finite check, and a frame that never calls update() reports
+        // dof = 0 alongside the NaN. So such a frame is IGNORED by the
+        // detector, not counted as a breach — which is the behaviour we want
+        // (a legitimate correspondence dropout, e.g. occlusion, is an absence
+        // of information, not evidence of over-confidence; counting it would be
+        // a false positive). The NaN's real job is to stop lastNis() returning
+        // the PREVIOUS frame's healthy value, which would let a stale reading
+        // be attributed to this frame.
+        //
+        // The non-finite path is still reachable and still meaningful: an
+        // update that RAN (dof > 0) but produced a non-finite NIS is a genuine
+        // breach. Total dropout is deliberately NOT the detector's
+        // jurisdiction; it is observable via corresp_used in the Diagnostics
+        // message and gated in scripts/e2e_smoke_check.py.
         last_nis_ = std::numeric_limits<double>::quiet_NaN();
         last_nis_dof_ = 0;
         last_update_performed_ = false;
@@ -516,8 +567,25 @@ class Estimator
         // correspondences breaks out below WITHOUT calling update(), so without
         // this reset lastNis() would return the PREVIOUS frame's (healthy) value
         // and the divergence detector would miss a lost-correspondence frame —
-        // exactly the case it exists to catch. Reset to NaN so a frame that never
-        // calls update() feeds the detector a breach (its non-finite path).
+        // exactly the case it exists to catch.
+        //
+        // What the NaN actually does, precisely (the earlier claim here that it
+        // "feeds the detector a breach via its non-finite path" was WRONG):
+        // NisDivergenceDetector::feed returns early on dof <= 0, BEFORE its
+        // non-finite check, and a frame that never calls update() reports
+        // dof = 0 alongside the NaN. So such a frame is IGNORED by the
+        // detector, not counted as a breach — which is the behaviour we want
+        // (a legitimate correspondence dropout, e.g. occlusion, is an absence
+        // of information, not evidence of over-confidence; counting it would be
+        // a false positive). The NaN's real job is to stop lastNis() returning
+        // the PREVIOUS frame's healthy value, which would let a stale reading
+        // be attributed to this frame.
+        //
+        // The non-finite path is still reachable and still meaningful: an
+        // update that RAN (dof > 0) but produced a non-finite NIS is a genuine
+        // breach. Total dropout is deliberately NOT the detector's
+        // jurisdiction; it is observable via corresp_used in the Diagnostics
+        // message and gated in scripts/e2e_smoke_check.py.
         last_nis_ = std::numeric_limits<double>::quiet_NaN();
         last_nis_dof_ = 0;
         last_update_performed_ = false;
@@ -975,9 +1043,12 @@ class Estimator
     {
         Eigen::Quaterniond q_itp;
         Eigen::Vector3d rot_vel;
-        Jacobian43 J_ortdel;
-        Jacobian J_line_acc;
-        Jacobian33 J_gyro;
+        // thread_local for the same reason as prepLiDAR (see the note there):
+        // these carry resize()d std::vectors and prepIMU also runs inside an
+        // OpenMP parallel-for, one call per staged IMU sample.
+        thread_local Jacobian43 J_ortdel;
+        thread_local Jacobian J_line_acc;
+        thread_local Jacobian33 J_gyro;
         spl.itpQuaternion(imu_data.time_ns, &q_itp, &rot_vel, &J_ortdel, &J_gyro);
         Eigen::Vector3d a_w_no_g = spl.itpPosition<2>(imu_data.time_ns, &J_line_acc);
         Eigen::Vector3d a_w = a_w_no_g + g;
@@ -1018,8 +1089,20 @@ class Estimator
         if (pt_data.if_valid) {
             Eigen::Matrix<double, 1, XSIZE> Hi = Eigen::Matrix<double, 1, XSIZE>::Zero();
             Eigen::Quaterniond q_itp;
-            Jacobian43 J_ortdel;
-            Jacobian J_pos;
+            // thread_local, not plain locals: these hold std::vectors that
+            // itpPose resize()s, so a fresh pair per point meant two
+            // operator new + two frees for EVERY valid LiDAR point (measured
+            // 791 allocations on a 300-point, 2-iteration update). Reusing
+            // them makes resize() free after the first point in each thread.
+            //
+            // Safe against stale contents: both itpPose write sites fill ALL
+            // size_J entries after the resize (J_p's forward loop and J_q's
+            // reverse loop), and the defensive early-return paths clear() both
+            // in lockstep — so nothing from the previous point survives into
+            // this one. thread_local gives each OpenMP worker its own pair, so
+            // the parallel-for over points stays race-free.
+            thread_local Jacobian43 J_ortdel;
+            thread_local Jacobian J_pos;
             Eigen::Vector3d p_itp;
             spl.itpPose(pt_data.time_ns, &p_itp, &J_pos, &q_itp, &J_ortdel);
             Eigen::Matrix3d R_IL = pt_data.q_bl.toRotationMatrix();

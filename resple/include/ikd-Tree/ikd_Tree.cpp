@@ -913,7 +913,13 @@ int KD_TREE<PointType>::Delete_by_range(KD_TREE_NODE **root, BoxPointType boxpoi
     if ((*root) == nullptr || (*root)->tree_deleted)
         return 0;
     (*root)->working_flag = true;
-    Push_Down(*root);
+    // Hoisted fast-path predicate: Push_Down's first act is this same
+    // test, but it is an out-of-line call (verified: no partial inlining
+    // at -O3 or -O3 -march=native), so every visited node paid a
+    // call/ret plus two atomic loads to learn there was nothing to do.
+    // The node is already known non-null here. Push_Down keeps its own
+    // check — that one is the re-validation under its node lock.
+    if ((*root)->need_push_down_to_left || (*root)->need_push_down_to_right) Push_Down(*root);
     int tmp_counter = 0;
     if (boxpoint.vertex_max[0] <= (*root)->node_range_x[0] || boxpoint.vertex_min[0] > (*root)->node_range_x[1])
         return 0;
@@ -1005,7 +1011,13 @@ void KD_TREE<PointType>::Delete_by_point(KD_TREE_NODE **root, PointType point, b
     if ((*root) == nullptr || (*root)->tree_deleted)
         return;
     (*root)->working_flag = true;
-    Push_Down(*root);
+    // Hoisted fast-path predicate: Push_Down's first act is this same
+    // test, but it is an out-of-line call (verified: no partial inlining
+    // at -O3 or -O3 -march=native), so every visited node paid a
+    // call/ret plus two atomic loads to learn there was nothing to do.
+    // The node is already known non-null here. Push_Down keeps its own
+    // check — that one is the re-validation under its node lock.
+    if ((*root)->need_push_down_to_left || (*root)->need_push_down_to_right) Push_Down(*root);
     if (same_point((*root)->point, point) && !(*root)->point_deleted)
     {
         (*root)->point_deleted = true;
@@ -1073,7 +1085,13 @@ void KD_TREE<PointType>::Add_by_range(KD_TREE_NODE **root, BoxPointType boxpoint
     if ((*root) == nullptr)
         return;
     (*root)->working_flag = true;
-    Push_Down(*root);
+    // Hoisted fast-path predicate: Push_Down's first act is this same
+    // test, but it is an out-of-line call (verified: no partial inlining
+    // at -O3 or -O3 -march=native), so every visited node paid a
+    // call/ret plus two atomic loads to learn there was nothing to do.
+    // The node is already known non-null here. Push_Down keeps its own
+    // check — that one is the re-validation under its node lock.
+    if ((*root)->need_push_down_to_left || (*root)->need_push_down_to_right) Push_Down(*root);
     if (boxpoint.vertex_max[0] <= (*root)->node_range_x[0] || boxpoint.vertex_min[0] > (*root)->node_range_x[1])
         return;
     if (boxpoint.vertex_max[1] <= (*root)->node_range_y[0] || boxpoint.vertex_min[1] > (*root)->node_range_y[1])
@@ -1162,7 +1180,13 @@ void KD_TREE<PointType>::Add_by_point(KD_TREE_NODE **root, PointType point, bool
     // struct timespec Timeout;
     add_log.op = ADD_POINT;
     add_log.point = point;
-    Push_Down(*root);
+    // Hoisted fast-path predicate: Push_Down's first act is this same
+    // test, but it is an out-of-line call (verified: no partial inlining
+    // at -O3 or -O3 -march=native), so every visited node paid a
+    // call/ret plus two atomic loads to learn there was nothing to do.
+    // The node is already known non-null here. Push_Down keeps its own
+    // check — that one is the re-validation under its node lock.
+    if ((*root)->need_push_down_to_left || (*root)->need_push_down_to_right) Push_Down(*root);
     if (((*root)->division_axis == 0 && point.x < (*root)->point.x) || ((*root)->division_axis == 1 && point.y < (*root)->point.y) || ((*root)->division_axis == 2 && point.z < (*root)->point.z))
     {
         if ((Rebuild_Ptr == nullptr) || (*root)->left_son_ptr != *Rebuild_Ptr.load())
@@ -1225,7 +1249,13 @@ void KD_TREE<PointType>::Search(KD_TREE_NODE *root, int k_nearest, PointType poi
     // the node's push_down_mutex_lock internally (parent lock for this node's
     // flag clears, child lock for the child-field writes), so the call site is
     // a bare call. The old trylock-or-wait dance here is no longer needed.
-    Push_Down(root);
+    // Hoisted fast-path predicate: Push_Down's first act is this same
+    // test, but it is an out-of-line call (verified: no partial inlining
+    // at -O3 or -O3 -march=native), so every visited node paid a
+    // call/ret plus two atomic loads to learn there was nothing to do.
+    // The node is already known non-null here. Push_Down keeps its own
+    // check — that one is the re-validation under its node lock.
+    if (root->need_push_down_to_left || root->need_push_down_to_right) Push_Down(root);
     if (!root->point_deleted)
     {
         float dist = calc_dist(point, root->point);
@@ -1270,7 +1300,13 @@ void KD_TREE<PointType>::Search_by_range(KD_TREE_NODE *root, BoxPointType boxpoi
 {
     if (root == nullptr)
         return;
-    Push_Down(root);
+    // Hoisted fast-path predicate: Push_Down's first act is this same
+    // test, but it is an out-of-line call (verified: no partial inlining
+    // at -O3 or -O3 -march=native), so every visited node paid a
+    // call/ret plus two atomic loads to learn there was nothing to do.
+    // The node is already known non-null here. Push_Down keeps its own
+    // check — that one is the re-validation under its node lock.
+    if (root->need_push_down_to_left || root->need_push_down_to_right) Push_Down(root);
     if (boxpoint.vertex_max[0] <= root->node_range_x[0] || boxpoint.vertex_min[0] > root->node_range_x[1])
         return;
     if (boxpoint.vertex_max[1] <= root->node_range_y[0] || boxpoint.vertex_min[1] > root->node_range_y[1])
@@ -1297,7 +1333,13 @@ void KD_TREE<PointType>::Search_by_radius(KD_TREE_NODE *root, PointType point, f
 {
     if (root == nullptr)
         return;
-    Push_Down(root);
+    // Hoisted fast-path predicate: Push_Down's first act is this same
+    // test, but it is an out-of-line call (verified: no partial inlining
+    // at -O3 or -O3 -march=native), so every visited node paid a
+    // call/ret plus two atomic loads to learn there was nothing to do.
+    // The node is already known non-null here. Push_Down keeps its own
+    // check — that one is the re-validation under its node lock.
+    if (root->need_push_down_to_left || root->need_push_down_to_right) Push_Down(root);
     PointType range_center;
     range_center.x = (root->node_range_x[0] + root->node_range_x[1]) * 0.5;
     range_center.y = (root->node_range_y[0] + root->node_range_y[1]) * 0.5;
@@ -1639,7 +1681,13 @@ void KD_TREE<PointType>::flatten(KD_TREE_NODE *root, PointVector &Storage, delet
 {
     if (root == nullptr)
         return;
-    Push_Down(root);
+    // Hoisted fast-path predicate: Push_Down's first act is this same
+    // test, but it is an out-of-line call (verified: no partial inlining
+    // at -O3 or -O3 -march=native), so every visited node paid a
+    // call/ret plus two atomic loads to learn there was nothing to do.
+    // The node is already known non-null here. Push_Down keeps its own
+    // check — that one is the re-validation under its node lock.
+    if (root->need_push_down_to_left || root->need_push_down_to_right) Push_Down(root);
     if (!root->point_deleted)
     {
         Storage.push_back(root->point);
@@ -1673,7 +1721,13 @@ void KD_TREE<PointType>::delete_tree_nodes(KD_TREE_NODE **root)
 {
     if (*root == nullptr)
         return;
-    Push_Down(*root);
+    // Hoisted fast-path predicate: Push_Down's first act is this same
+    // test, but it is an out-of-line call (verified: no partial inlining
+    // at -O3 or -O3 -march=native), so every visited node paid a
+    // call/ret plus two atomic loads to learn there was nothing to do.
+    // The node is already known non-null here. Push_Down keeps its own
+    // check — that one is the re-validation under its node lock.
+    if ((*root)->need_push_down_to_left || (*root)->need_push_down_to_right) Push_Down(*root);
     delete_tree_nodes(&(*root)->left_son_ptr);
     delete_tree_nodes(&(*root)->right_son_ptr);
 

@@ -83,12 +83,47 @@ sleep 2
 ./install/data_injector/lib/data_injector/injector > /tmp/injector_sweep.log 2>&1 &
 INJ=$!
 sleep "${SECS}"
+
+# LIVENESS GATE, before the kill. Without this the sweep's only verdict is
+# "did a sanitizer print anything", and a node that died two seconds in prints
+# nothing at all — so a startup crash was reported as "data sweep CLEAN". Check
+# both children are still running while we can still tell.
+SWEEP_DIED=0
+if ! kill -0 "${RP}" 2>/dev/null; then
+  echo "==> FAILED: RESPLE is no longer running after ${SECS}s — it died during" \
+       "the sweep, so an absence of sanitizer findings proves nothing." >&2
+  tail -40 /tmp/resple_sweep.log >&2 || true
+  SWEEP_DIED=1
+fi
+if ! kill -0 "${INJ}" 2>/dev/null; then
+  echo "==> FAILED: the data injector is no longer running after ${SECS}s;" \
+       "RESPLE may have been starved of input for most of the sweep." >&2
+  tail -20 /tmp/injector_sweep.log >&2 || true
+  SWEEP_DIED=1
+fi
+
 kill -INT "${RP}" "${INJ}" 2>/dev/null || true
 sleep 4
 kill -KILL "${RP}" "${INJ}" 2>/dev/null || true
 wait 2>/dev/null || true
 
-echo "==> steady state:"; grep -iE "Gravity alignment successful|initialization complete|heartbeat" /tmp/resple_sweep.log | tail -3 || true
+if [ "${SWEEP_DIED}" -ne 0 ]; then
+  exit 1
+fi
+
+# PROGRESS GATE. Liveness alone is not enough: a node can sit alive forever
+# waiting for gravity init or a TF and never run a single IEKF iteration, which
+# again exercises none of the code the sanitizers are watching.
+echo "==> steady state:"
+STEADY="$(grep -iE "initialization complete|heartbeat" /tmp/resple_sweep.log | tail -3 || true)"
+if [ -z "${STEADY}" ]; then
+  echo "==> FAILED: RESPLE never reached steady state (no 'initialization" \
+       "complete' or heartbeat line in /tmp/resple_sweep.log). The sweep ran" \
+       "but exercised almost none of the instrumented code." >&2
+  tail -40 /tmp/resple_sweep.log >&2 || true
+  exit 1
+fi
+printf '%s\n' "${STEADY}"
 echo "==> sanitizer reports (${LOGBASE}.*):"
 # WHY this is not a bare `grep ... | sort | uniq -c` any more: under
 # `set -euo pipefail` that form INVERTED the verdict of the whole sweep. grep

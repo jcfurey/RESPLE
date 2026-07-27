@@ -73,23 +73,57 @@ class TestRespleLifecycle(unittest.TestCase):
         rclpy.spin_until_future_complete(self.node, future, timeout_sec=timeout_sec)
         return future.result().current_state.id
 
-    def test_full_lifecycle_cycle(self):
-        # Allow the node to come up.
-        time.sleep(2.0)
-        self.assertTrue(self._change_state(Transition.TRANSITION_CONFIGURE),
-                        "configure failed")
-        self.assertEqual(self._current_state(),
-                         State.PRIMARY_STATE_INACTIVE)
-        self.assertTrue(self._change_state(Transition.TRANSITION_ACTIVATE),
-                        "activate failed")
-        self.assertEqual(self._current_state(),
-                         State.PRIMARY_STATE_ACTIVE)
-        # Let the worker thread spin briefly under the active state.
-        time.sleep(2.0)
+    def _await_state(self, wanted, timeout_sec=15.0):
+        """Poll get_state until it reports `wanted`, then return."""
+        deadline = time.time() + timeout_sec
+        seen = None
+        while time.time() < deadline:
+            seen = self._current_state()
+            if seen == wanted:
+                return
+            time.sleep(0.25)
+        self.fail("node never reached state {} (last seen {})".format(wanted, seen))
+
+    def test_full_lifecycle_recycle(self):
+        # respleMain() drives configure() and activate() ITSELF before spinning
+        # (see the RCLCPP_FATAL guards there), so the node is already ACTIVE
+        # when this test starts. The previous version of this test opened with
+        # TRANSITION_CONFIGURE, which is invalid from ACTIVE and always failed —
+        # i.e. it could not pass, and so was never run.
+        #
+        # Start from ACTIVE and drive a full RE-CYCLE instead. That is also the
+        # more valuable test: deactivate -> cleanup -> configure -> activate is
+        # exactly the path hazards 17, 18, 71, 72, 76, 87 and the Mapping
+        # zombie-worker guards all concern, and none of it is covered elsewhere.
+        self._await_state(State.PRIMARY_STATE_ACTIVE)
+
         self.assertTrue(self._change_state(Transition.TRANSITION_DEACTIVATE),
                         "deactivate failed")
+        self.assertEqual(self._current_state(), State.PRIMARY_STATE_INACTIVE)
+
         self.assertTrue(self._change_state(Transition.TRANSITION_CLEANUP),
                         "cleanup failed")
+        self.assertEqual(self._current_state(),
+                         State.PRIMARY_STATE_UNCONFIGURED)
+
+        # The re-cycle proper. A declare_parameter without a has_parameter
+        # guard (hazard 17) or an unreset resource (hazard 18/71/72/76) makes
+        # THIS call fail or abort the process.
+        self.assertTrue(self._change_state(Transition.TRANSITION_CONFIGURE),
+                        "re-configure after cleanup failed")
+        self.assertEqual(self._current_state(), State.PRIMARY_STATE_INACTIVE)
+
+        self.assertTrue(self._change_state(Transition.TRANSITION_ACTIVATE),
+                        "re-activate after cleanup failed")
+        self.assertEqual(self._current_state(), State.PRIMARY_STATE_ACTIVE)
+
+        # Let the freshly restarted worker thread spin.
+        time.sleep(2.0)
+
+        self.assertTrue(self._change_state(Transition.TRANSITION_DEACTIVATE),
+                        "second deactivate failed")
+        self.assertTrue(self._change_state(Transition.TRANSITION_CLEANUP),
+                        "second cleanup failed")
 
 
 @launch_testing.post_shutdown_test()

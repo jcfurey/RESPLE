@@ -1576,8 +1576,13 @@ public:
                 // difference would silence the tick until the clock re-reaches
                 // the stale stamp.
                 if (std::llabs(this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) >= 1000000000LL) {
+                    // updateDiagnostics advances last_process_ns_ itself now
+                    // (it must own the window it consumes — see the comment
+                    // there), so this gate needs no store of its own. It also
+                    // means the Updater's internal timer resets this gate, so
+                    // the worker's force_update fires only when the timer has
+                    // not run for a second — which is the intent.
                     diagnostics_.force_update();
-                    last_process_ns_.store(this->now().nanoseconds(), std::memory_order_relaxed);
                 }
             }
                 if (!collected_any) {
@@ -2775,7 +2780,20 @@ private:
             param.cov_gyro << gyro_var.at(0), gyro_var.at(1), gyro_var.at(2);
         }
 
-        dt_ns = 1e9 / CommonUtils::readParam<int>(this->get_node_parameters_interface(), "knot_hz", 100);
+        // knot_hz must be positive: dt_ns = 1e9 / knot_hz, so 0 makes the
+        // double division +inf and the narrowing conversion to int64_t UB
+        // (observed: dt_ns = INT64_MIN, dt_s = -9.2e9 s). That value then
+        // scales cov_P0 and cov_sys_pos/ort below and becomes the spline's
+        // knot interval, poisoning the whole filter SILENTLY — no crash, just
+        // nonsense. A negative value is equally bad.
+        int knot_hz = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "knot_hz", 100);
+        if (knot_hz <= 0) {
+            RCLCPP_WARN(this->get_logger(),
+                "knot_hz=%d must be > 0 (it sets the spline knot interval and "
+                "scales the process/prior covariances); using 100", knot_hz);
+            knot_hz = 100;
+        }
+        dt_ns = 1e9 / knot_hz;
         double dt_s = double(dt_ns) * 1e-9;
         cov_P0 = CommonUtils::readParam<double>(this->get_node_parameters_interface(), "cov_P0", 0.02);
         cov_P0 *= (dt_s*dt_s);
@@ -2807,6 +2825,20 @@ private:
                 map_prune_radius_, 2.0 * double(det_range), 2.0 * double(det_range));
         }
         point_filter_num = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "point_filter_num", 1);
+        // Validate: this is the right-hand side of an integer `%` in six
+        // hand-written sensor callbacks (e.g. line 3683), so 0 is a division
+        // by zero — SIGFPE, which the per-callback catch(std::exception) cannot
+        // intercept. The crash handler does name the callsite, but the node is
+        // dead either way. Negative values silently keep only the first point
+        // of each modulus cycle. The shared generic ingest path already floors
+        // it (utils/point_cloud_ingest.h), so the hand-written ones were the
+        // odd men out.
+        if (point_filter_num < 1) {
+            RCLCPP_WARN(this->get_logger(),
+                "point_filter_num=%d is invalid (it is a decimation STRIDE, so "
+                "the no-op value is 1, not 0); using 1", point_filter_num);
+            point_filter_num = 1;
+        }
         num_points_upd = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "num_points_upd", 100);
         if (if_lidar_only) {
             estimator_lo.n_iter = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "n_iter", 1);
@@ -3343,8 +3375,30 @@ private:
         const uint64_t comp_time_us = total_computation_time_us_.load(std::memory_order_relaxed);
         const size_t iekf_iters = total_iekf_iterations_.load(std::memory_order_relaxed);
 
-        // Calculate processing rate
-        double time_elapsed = (this->now().nanoseconds() - last_process_ns_.load(std::memory_order_relaxed)) / 1e9;
+        // Calculate processing rate over a SELF-CONSISTENT window.
+        //
+        // This function has two independent ~1 Hz callers: the worker's
+        // force_update() and diagnostic_updater::Updater's own internal timer
+        // on the executor thread. Both consume the counters (the fetch_sub at
+        // the end), but only the worker used to advance last_process_ns_. So
+        // the timer invocation drained the frames accumulated since the
+        // worker's last tick, and the worker's next invocation then divided the
+        // REMAINDER by a full second — reporting R*(1-phi) for a drifting phase
+        // offset phi, and feeding that number to the 14 Hz / 10 Hz thresholds.
+        // The result was spurious WARN/ERROR on a perfectly healthy node.
+        //
+        // Advancing the anchor here makes whichever caller runs own exactly the
+        // window it consumes: numerator and denominator always cover the same
+        // interval. Note this can only ever have caused FALSE alarms — the
+        // worker-side numerator was a subset of its own denominator's window,
+        // so the reported rate was an under-estimate; a genuine slowdown was
+        // still visible in the timer-side messages.
+        const int64_t now_ns = this->now().nanoseconds();
+        const int64_t window_start_ns =
+            last_process_ns_.exchange(now_ns, std::memory_order_relaxed);
+        // llabs for the same reason the worker's gate uses it: the node clock
+        // can jump backwards on a bag loop restart under use_sim_time.
+        double time_elapsed = std::llabs(now_ns - window_start_ns) / 1e9;
         double processing_rate = (time_elapsed > 0) ? frame_count / time_elapsed : 0.0;
         double avg_computation_time = (frame_count > 0) ? (comp_time_us / 1000.0) / frame_count : 0.0;
         double avg_iekf_iters = (frame_count > 0) ? static_cast<double>(iekf_iters) / frame_count : 0.0;

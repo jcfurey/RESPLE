@@ -272,3 +272,70 @@ TEST(PointCloudAdapter, AutoKeepsConventionForRelativeOffsets) {
                            layout, {}, out));
   EXPECT_NEAR(out[1].time_ms - out[0].time_ms, 50.0, 1e-3);
 }
+
+// ---------------- malformed-input memory-safety guards (hazard 82) ----------
+//
+// These guards had ZERO automated coverage: deleting the field-fits check in
+// convertCloud passed the entire suite, and it is the guard standing between a
+// malformed PointCloud2 and an out-of-bounds heap read in readFieldAsDouble.
+// The threat model is a misbehaving or hostile publisher, so the check must be
+// pinned, not assumed.
+
+TEST(PointCloudAdapterSafety, RejectsFieldExtendingPastPointStride) {
+  // z's float32 runs to offset 12, but the declared stride is 10 — reading it
+  // walks past the last point's row and off the end of the buffer.
+  std::vector<FieldInfo> fields = {
+      {"x", 0, FLOAT32, 1}, {"y", 4, FLOAT32, 1}, {"z", 8, FLOAT32, 1},
+  };
+  auto layout = resolveLayout(fields);
+  ASSERT_TRUE(layout.valid);
+  std::vector<uint8_t> data(10 * 4, 0);
+  std::vector<OutPoint> out;
+  EXPECT_FALSE(convertCloud(data.data(), data.size(), /*point_step=*/10,
+                            /*num_points=*/4, false, layout, {}, out));
+  // Exactly-fitting stride is the boundary and must be ACCEPTED.
+  std::vector<uint8_t> ok_data(12 * 4, 0);
+  EXPECT_TRUE(convertCloud(ok_data.data(), ok_data.size(), /*point_step=*/12,
+                           /*num_points=*/4, false, layout, {}, out));
+}
+
+TEST(PointCloudAdapterSafety, RejectsOptionalFieldPastStride) {
+  // The optional time/intensity fields go through the same check; a layout
+  // where only THEY overrun must still be rejected.
+  std::vector<FieldInfo> fields = {
+      {"x", 0, FLOAT32, 1},  {"y", 4, FLOAT32, 1},
+      {"z", 8, FLOAT32, 1},  {"t", 14, FLOAT32, 1},
+  };
+  auto layout = resolveLayout(fields);
+  ASSERT_TRUE(layout.valid && layout.has_time);
+  std::vector<uint8_t> data(16 * 4, 0);
+  std::vector<OutPoint> out;
+  EXPECT_FALSE(convertCloud(data.data(), data.size(), /*point_step=*/16,
+                            /*num_points=*/4, false, layout, {}, out));
+}
+
+TEST(PointCloudAdapterSafety, RejectsUnderDeclaredBuffer) {
+  // num_points * point_step must fit in the buffer the publisher handed us.
+  std::vector<FieldInfo> fields = {
+      {"x", 0, FLOAT32, 1}, {"y", 4, FLOAT32, 1}, {"z", 8, FLOAT32, 1},
+  };
+  auto layout = resolveLayout(fields);
+  ASSERT_TRUE(layout.valid);
+  std::vector<uint8_t> data(12 * 3, 0);   // room for 3 points...
+  std::vector<OutPoint> out;
+  EXPECT_FALSE(convertCloud(data.data(), data.size(), 12, /*num_points=*/4,
+                            false, layout, {}, out));   // ...4 declared
+  EXPECT_TRUE(convertCloud(data.data(), data.size(), 12, 3, false, layout, {}, out));
+}
+
+TEST(PointCloudAdapterSafety, RejectsZeroPointStep) {
+  std::vector<FieldInfo> fields = {
+      {"x", 0, FLOAT32, 1}, {"y", 4, FLOAT32, 1}, {"z", 8, FLOAT32, 1},
+  };
+  auto layout = resolveLayout(fields);
+  ASSERT_TRUE(layout.valid);
+  std::vector<uint8_t> data(48, 0);
+  std::vector<OutPoint> out;
+  EXPECT_FALSE(convertCloud(data.data(), data.size(), /*point_step=*/0, 4,
+                            false, layout, {}, out));
+}
