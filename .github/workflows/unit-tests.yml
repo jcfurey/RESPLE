@@ -175,7 +175,10 @@ jobs:
         # an existing build tree, not a second checkout.
         run: |
           set -euo pipefail
-          source /opt/ros/jazzy/setup.bash
+          # set +u around the source: ROS's setup.bash reads unbound variables
+          # (AMENT_TRACE_SETUP_FILES), so `set -u` kills the step before it does
+          # anything. Same guard scripts/e2e_smoke.sh uses.
+          set +u; source /opt/ros/jazzy/setup.bash; set -u
           cd "${HOME}/ros2_ws"
           PYEXE=/usr/bin/python3.12
           colcon build --packages-up-to resple \
