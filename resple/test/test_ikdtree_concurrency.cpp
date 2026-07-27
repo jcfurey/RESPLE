@@ -289,7 +289,16 @@ TEST(IkdTreeConcurrency, RebuildVsMutatorRace)
     auto reader_fn = [&](int tid) {
         std::mt19937 rng(5000 + tid);
         long n = 0;
-        while (!stop.load(std::memory_order_relaxed))
+        // The readers observe the DEADLINE as well as `stop`, and that is what
+        // makes the wall bound real. The mutator can only check the deadline
+        // BETWEEN bursts, and a burst's cost is set by how long it waits for the
+        // unique lock against four spinning readers — measured on a loaded
+        // GitHub runner, ONE burst took ~650 s against a 90 s budget (1/6 cycles
+        // completed). Retiring the readers at the deadline lets the in-flight
+        // burst finish uncontended in seconds, so total runtime is
+        // budget + one UNCONTENDED burst rather than budget + one contended one.
+        while (!stop.load(std::memory_order_relaxed) &&
+               std::chrono::steady_clock::now() < deadline)
         {
             {
                 std::shared_lock<std::shared_mutex> lk(map_mtx);

@@ -185,6 +185,12 @@ jobs:
             --cmake-args -DRESPLE_BUILD_INTEGRATION_TESTS=ON \
                          -DENABLE_NATIVE_ARCH=OFF \
                          "-DPython3_EXECUTABLE=${PYEXE}"
+          # Source the OVERLAY before testing. colcon test runs each test with
+          # the build environment, not the install prefix, so the launch_test's
+          # FindPackageShare('resple') resolves against /opt/ros/jazzy only and
+          # dies with "package 'resple' not found". The gtest cases do not care;
+          # the launch test does.
+          set +u; source install/setup.bash; set -u
           # --return-code-on-test-failure: without it colcon test exits 0 even
           # when cases fail, which is how this repo has shipped green-but-empty
           # gates before.
