@@ -513,6 +513,10 @@ public:
         if_init_filter = false;
         if_init_map = false;
         localmap_initialized_ = false;
+        // Boxes recorded against the PREVIOUS activation's cube must not be
+        // carried into a freshly-initialised one — they would be re-submitted
+        // to Delete_Point_Boxes against an unrelated local map.
+        cub_needrm.clear();
         radius_prune_initialized_ = false;
         nis_hold_active_.store(false);
         imu_first_logged_.store(false);
@@ -2190,6 +2194,12 @@ private:
             pcl::PointCloud<pcl::PointXYZINormal>::Ptr map_cloud(new pcl::PointCloud<pcl::PointXYZINormal>());
             {
                 std::unique_lock<std::shared_mutex> map_lock(mtx_map_);
+                // clear() first: flatten APPENDS, and PCL_Storage is a member
+                // of the tree shared with the CUDA map-refresh path (which
+                // does clear it — see the two sites near lines 1447 and 4717).
+                // Without this the saved map carried whatever the previous
+                // flatten left behind and grew on every SaveMap invocation.
+                ikdtree.PCL_Storage.clear();
                 ikdtree.flatten_safe(ikdtree.PCL_Storage, NOT_RECORD);
                 map_cloud->points = ikdtree.PCL_Storage;
             }
@@ -4807,6 +4817,25 @@ private:
         if (lidars.empty()) {
             return;
         }
+        // clear(), not just shrink_to_fit(). cub_needrm is a node MEMBER, and
+        // shrink_to_fit only trims capacity — it keeps every element. So each
+        // cube move re-submitted the entire history of FOV-trim boxes to
+        // Delete_Point_Boxes, not just this move's trailing slabs. Upstream
+        // FAST-LIO's lasermap_fov_segment() opens with cub_needrm.clear();
+        // that line was lost here.
+        //
+        // Consequence on a REVISITED traverse: a box recorded while trimming
+        // behind the platform on the outbound leg lies INSIDE the live cube
+        // once the platform turns around, so the stale box deletes map the
+        // filter is currently localizing against. Verified against the real
+        // vendored ikd-Tree on an out-and-back run; needs roughly three cube
+        // shifts out (~950 m at the shipped cube_len 1000 / det_range 100)
+        // plus a two-shift return before a stale box reaches the live cube,
+        // and k-NN recovers on the next mapIncremental — so it is a
+        // one-frame degradation per cube move, not a permanent hole. The
+        // unbounded O(moves^2) growth of the delete list, all under mtx_map_
+        // UNIQUE (which blocks the IEKF's k-NN), is the other half.
+        cub_needrm.clear();
         cub_needrm.shrink_to_fit();
         Eigen::Vector3d pos_lidar_min(std::numeric_limits<double>::max(), std::numeric_limits<double>::max(),
             std::numeric_limits<double>::max());

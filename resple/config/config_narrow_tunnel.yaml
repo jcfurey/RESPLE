@@ -176,10 +176,18 @@
     # [NARROW] With 0.075 m voxels an 8-neighbor patch spans ~0.3 m; on a
     # 0.4 m-radius wall the curvature sagitta is ~3 cm. Tighten the residual
     # gate (production 0.1) so curvature-biased fits are rejected instead of
-    # feeding biased radial normals, and enable the rank-conditioning guard
-    # to kill collinear/degenerate patches (grazing-incidence stripes).
+    # feeding biased radial normals, and enable the planarity guard to kill
+    # collinear/degenerate patches (grazing-incidence stripes).
     plane_fit_thresh: 0.05
-    plane_min_cond_ratio: 0.05
+    # 2026-07-27: this value was 0.05 under the OLD uncentered-scatter test,
+    # where it rejected 100% of patches at every range (measured: 0% accepted,
+    # good and collinear alike) — i.e. this profile could not fuse a single
+    # LiDAR correspondence. The guard is now a normalized in-plane eigenvalue
+    # ratio (see utils/geometry_core.h); 0.10 measured 82% of good patches
+    # accepted against 24% of noisy-collinear ones, flat from 1 m to 200 m.
+    # Raise toward 0.20 (62%/8%) for a stricter cut, lower to 0.05 (90%/55%)
+    # for a looser one. 0 disables.
+    plane_min_cond_ratio: 0.10
     # [NARROW] k-th-neighbor gate tightened from 5.0 m^2 (2.24 m radius —
     # wider than the tunnel): neighbors farther than 1 m are cross-bore or
     # stale-map garbage.

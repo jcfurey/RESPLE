@@ -82,6 +82,85 @@ TEST(FitPlane, CollinearAcceptedByDefaultButRejectedWithConditioning) {
   EXPECT_TRUE(fitPlane<double>(onPlaneZ1(), 1e-6, out, /*min_cond_ratio=*/1e-6));
 }
 
+TEST(FitPlane, PlanarityGuardIsTranslationInvariant) {
+  // THE regression for the 2026-07-27 fix. The guard used to run its rank test
+  // on the UNCENTRED scatter Σ p pᵀ, which is dominated by the centroid outer
+  // product k·c·cᵀ — so its verdict was a function of how far the patch sat
+  // from the odom origin, not of whether the points span a plane. Measured
+  // before the fix: the good-patch pivot ratio fell ~5 decades from 1 m to
+  // 200 m, and beyond ~20 m good and collinear patches were indistinguishable.
+  //
+  // The property that must hold is translation invariance: sliding the SAME
+  // patch away from the origin cannot change the verdict.
+  Vec4 out;
+  const double kThresh = 0.10;
+  // Range stops at 200 m deliberately: beyond ~1.5 km the PLANE FIT itself
+  // degenerates (see FitPlaneFarFromOriginLimit below), which is a separate,
+  // pre-existing property of the A·n = −1 parameterization and would confound
+  // what this test is about.
+  for (double R : {0.0, 1.0, 20.0, 200.0}) {
+    std::vector<Vec3> patch;   // well-spread square patch on z = -0.3
+    for (double dx : {-0.15, 0.15})
+      for (double dy : {-0.15, 0.15}) patch.push_back({R + dx, dy, -0.3});
+    patch.push_back({R, 0.0, -0.3});
+    EXPECT_TRUE(fitPlane<double>(patch, 0.1, out, kThresh))
+        << "well-spread patch rejected at R=" << R;
+
+    std::vector<Vec3> line;    // collinear, same offset
+    for (int i = -2; i <= 2; ++i) line.push_back({R + 0.075 * i, 0.0, -0.3});
+    EXPECT_FALSE(fitPlane<double>(line, 0.1, out, kThresh))
+        << "collinear patch accepted at R=" << R;
+  }
+}
+
+TEST(FitPlane, FitPlaneFarFromOriginLimit) {
+  // KNOWN LIMIT, pinned so it is visible rather than rediscovered in the
+  // field. fitPlane solves A·n = −1, i.e. it parameterizes the plane by
+  // n = normal/d with d the distance to the ORIGIN. Its conditioning is
+  // therefore ~(|centroid| / patch extent)², and at a few km from the odom
+  // origin the solve goes rank-deficient: ColPivHouseholderQR returns a
+  // least-norm vector (|n| collapses from 3.33 to 5e-4 in the case below) and
+  // the residual gate then rejects the fit.
+  //
+  // Measured breakdown for a 0.3 m patch: exact to ~1e-13 at 1500 m, total
+  // failure by 2000 m. The odom origin is the start pose and is never reset,
+  // so a multi-kilometre traverse walks into this — and the failure mode is
+  // that EVERY correspondence is rejected, i.e. the filter starves rather
+  // than mis-estimating. Fixing it means re-parameterizing the fit around the
+  // patch centroid, which changes the numerics of the whole correspondence
+  // path and wants bag validation; this test records the boundary until then.
+  Vec4 out;
+  auto patchAt = [](double R) {
+    std::vector<Vec3> p;
+    for (double dx : {-0.15, 0.15})
+      for (double dy : {-0.15, 0.15}) p.push_back({R + dx, dy, -0.3});
+    p.push_back({R, 0.0, -0.3});
+    return p;
+  };
+  EXPECT_TRUE(fitPlane<double>(patchAt(1000.0), 0.1, out)) << "1 km must still fit";
+  EXPECT_TRUE(fitPlane<double>(patchAt(1500.0), 0.1, out)) << "1.5 km must still fit";
+  // If a future change makes this pass, the limit moved — update the numbers
+  // above and in doc/PARAMETERS.md rather than deleting the test.
+  EXPECT_FALSE(fitPlane<double>(patchAt(5000.0), 0.1, out))
+      << "5 km unexpectedly fits — the documented breakdown distance moved";
+}
+
+TEST(FitPlane, PlanarityGuardScaleIsNormalized) {
+  // The threshold is now a ratio of in-plane extents in (0,1], not a pivot
+  // ratio of ~1e-6. Pin the scale so a future change cannot quietly revert to
+  // the old units: a 4:1 elongated patch (λ2/λ1 ≈ 1/16) must pass at 0.05 and
+  // fail at 0.20, at any distance from the origin.
+  Vec4 out;
+  for (double R : {0.0, 50.0}) {
+    std::vector<Vec3> elongated;
+    for (int i = -2; i <= 2; ++i)
+      for (int j = -1; j <= 1; ++j)
+        elongated.push_back({R + 0.20 * i, 0.05 * j, 1.0});
+    EXPECT_TRUE(fitPlane<double>(elongated, 0.1, out, 0.02)) << "R=" << R;
+    EXPECT_FALSE(fitPlane<double>(elongated, 0.1, out, 0.20)) << "R=" << R;
+  }
+}
+
 TEST(FitPlane, RejectsPlaneThroughOrigin) {
   // Documented degenerate case: A n = -1 has no solution when every point lies
   // on a plane through the origin.  Must fail cleanly, not emit garbage.

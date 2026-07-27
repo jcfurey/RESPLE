@@ -210,11 +210,30 @@ class SplineState
     void updateKnots(SplineState* other)
     {
         int64_t num_knots_other = other->numKnots();
-        // The incoming idles describe the spline ORIGIN (knots -3..-1 of
-        // absolute index 0); they are only valid here while our knot 0 is
-        // still the absolute origin. After pruning, our idle slots hold the
-        // slid pre-window knots and must not be clobbered.
-        if (num_knots_pruned_ == 0 && num_knot <= num_knots_other) {
+        // The incoming idles are the ANCHOR for the window that follows them:
+        // absolute knots start_idx-3 .. start_idx-1 (hazard 90 / commit
+        // 7b22037). They are NOT the spline origin any more — that is what
+        // they were before the anchor fix, and this guard still encoded the
+        // old contract, so for any start_idx > 0 it overwrote our idle slots
+        // (which must describe pruned-3 .. pruned-1) with knots start_idx
+        // positions too new.
+        //
+        // Copy only into a FRESH receiver, where our knot 0 IS the window's
+        // first knot and the anchor is therefore exactly what our idle slots
+        // must hold. A receiver that already has knots needs nothing from the
+        // anchor: its own idle slots already describe pruned-3 .. pruned-1
+        // correctly, and the window's absolute indexing places every incoming
+        // knot on its own.
+        //
+        // Measured before the fix, driving the real getSplineMsg and
+        // reconstructing the receiver exactly as Mapping::getEstCallback
+        // does: one bad copy on the second accepted window, shifting the
+        // replica's idle window by one knot (0.573 deg at 0.573 deg/knot) and
+        // corrupting queries in [minTimeNs, minTimeNs + 2*dt) only — q_knots
+        // is never touched, so it is bounded to the first two knot intervals
+        // and self-heals. Mapping-replica only (/global_map, /traj_path);
+        // RESPLE's own /odometry never reads these.
+        if (num_knot == 0) {
             q_idle = other->q_idle;
             ort_delta_idle = other->ort_delta_idle;
             t_idle = other->t_idle;
@@ -457,7 +476,15 @@ class SplineState
                 q_itps[2] = q_itps[1] * q_delta_scale[2];
                 q_itps[3] = q_itps[2] * q_delta_scale[3];
                 q_itps[3].normalize();
-                *q_out = q_itps[3];
+                // Guarded: this branch is entered on J_q alone, so q_out may
+                // legitimately be null — a caller wanting only the Jacobian
+                // passes (nullptr, nullptr, &J_q). Last hole in the "write
+                // every non-null out-param, dereference no null one" contract
+                // that hazards 0 and 89 closed at the other two sites (the
+                // q_out-only branch below and the itpPose copy both check).
+                if (q_out) {
+                    *q_out = q_itps[3];
+                }
                 Eigen::Matrix4d Q_l_all[4];
                 Quater::Qleft(cp0, Q_l_all[0]);
                 Quater::Qleft(q_itps[0], Q_l_all[1]);

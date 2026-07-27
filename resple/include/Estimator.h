@@ -1057,9 +1057,14 @@ class Estimator
     bool updateLiDAR(Eigen::aligned_deque<PointData>& pt_meas, int num_valid, const Eigen::Matrix<double, XSIZE, 1>& x_prop, 
         const Eigen::Matrix<double, XSIZE, XSIZE>& P_prop, const double pt_thresh, const double cov_thresh, int num_threads = 5)
     {
-        H_buf_.conservativeResize(num_valid, XSIZE);
-        innv_buf_.conservativeResize(num_valid, 1);
-        cov_inv_buf_.conservativeResize(num_valid, 1);
+        // resize, not conservativeResize: all three are overwritten wholesale
+        // on the next three lines, so preserving the old contents is pure
+        // copying of data that is immediately discarded. Eigen's resize() is a
+        // no-op when the size is unchanged (the steady-state case), so this
+        // also avoids the reallocation conservativeResize can force.
+        H_buf_.resize(num_valid, XSIZE);
+        innv_buf_.resize(num_valid, 1);
+        cov_inv_buf_.resize(num_valid, 1);
         H_buf_.setZero();
         innv_buf_.setZero();
         cov_inv_buf_.setConstant(1/0.01);
@@ -1165,9 +1170,12 @@ class Estimator
             prepIMU(imu_meas[i], g);
         }
         int dim_meas = 6*imu_meas.size() + num_valid;
-        H_buf_.conservativeResize(dim_meas, XSIZE);
-        innv_buf_.conservativeResize(dim_meas, 1);
-        cov_inv_buf_.conservativeResize(dim_meas, 1);
+        // resize, not conservativeResize — see updateLiDAR: the three buffers
+        // are setZero'd immediately below, so the preserved contents are
+        // copied and then thrown away.
+        H_buf_.resize(dim_meas, XSIZE);
+        innv_buf_.resize(dim_meas, 1);
+        cov_inv_buf_.resize(dim_meas, 1);
         H_buf_.setZero();
         innv_buf_.setZero();
         cov_inv_buf_.setZero();
@@ -1194,12 +1202,25 @@ class Estimator
         double mahal_w = 0.0;
         int mahal_n = 0;
         int accepted_rows = 0;
+        // Hoisted out of the loop below, where it materialized a 4608-byte
+        // copy for EVERY valid LiDAR point purely to form a 1x1 quadratic
+        // form. cov_rcp is not written anywhere in this function, so the copy
+        // is loop-invariant, and the compiler does not hoist it (measured:
+        // 449.9 -> 423.0 us on a 300-point call).
+        //
+        // Kept as a contiguous copy rather than switched to the block
+        // expression: the contiguous 24x24 makes the following product faster
+        // (loop 68.2 shipped -> 60.1 block-expr -> 57.1 us hoisted, no-BLAS),
+        // and a strided block would change the summation order and hence the
+        // last ULP of lid_cov, which feeds both the accept test and the
+        // hazard-97 gate. This keeps the arithmetic bit-identical.
+        const Eigen::Matrix<double, 24, 24> cov =
+            cov_rcp.template topLeftCorner<24, 24>();
         for (size_t j = 0; j < imu_meas.size() + pt_meas.size(); j++) {
             if ((id_pt < pt_meas.size() && id_imu < imu_meas.size() && pt_meas[id_pt].time_ns < imu_meas[id_imu].time_ns) ||
                 (id_pt < pt_meas.size() && id_imu >= imu_meas.size())) {
                     PointData& pt_data = pt_meas[id_pt];
                     if (pt_data.if_valid) {
-                        Eigen::Matrix<double, 24, 24> cov = cov_rcp.template topLeftCorner<24, 24>();
                         double lid_cov = pt_data.H*cov*pt_data.H.transpose() + pt_data.var_pt;
                         const double noise_scale =
                             resple::range::rangeNoiseWeight(rn_cfg, pt_data.range_sensor, rn_norm);

@@ -78,10 +78,42 @@ inline bool fitPlane(int num_pts, Accessor&& get_xyz, T threshold,
   }
   Eigen::ColPivHouseholderQR<Eigen::Matrix3d> qr(ATA);
   if (min_cond_ratio > static_cast<T>(0)) {
-    // Threshold is relative to the largest pivot, so the rank test is
-    // scale-invariant.  rank < 3 ⇒ the points do not span a well-defined plane.
-    qr.setThreshold(static_cast<double>(min_cond_ratio));
-    if (qr.rank() < 3) {
+    // Degeneracy test on the CENTERED scatter S = Σ (p−c)(p−c)ᵀ.
+    //
+    // This used to be a rank test on ATA = Σ p pᵀ directly. That matrix is
+    // dominated by the centroid outer product k·c·cᵀ, so its pivot ratio is a
+    // function of where the patch sits relative to the ODOM ORIGIN, not of
+    // whether the neighbours span a plane: measured, it falls about five
+    // decades from 1 m to 200 m out, and by 20 m the good-patch and
+    // collinear-patch distributions are identical to three digits. A single
+    // global threshold therefore had no stable meaning — tuned near the start
+    // pose it rejected nothing; carried 20 m out it rejected almost
+    // everything. Centering removes the c·cᵀ term and makes the test
+    // translation-invariant, which is what the fit's conditioning actually
+    // depends on.
+    //
+    // The test also has to INVERT. A good planar patch is rank 2 in S (the
+    // off-plane eigenvalue is pure noise), so "rank(S) == 3" would reject
+    // exactly the patches we want. The discriminator between a plane and a
+    // line is the ratio of the two IN-PLANE extents: λ2/λ1 near 1 is a
+    // well-spread patch, λ2/λ1 → 0 is collinear.
+    //
+    // Note this changes the parameter's numeric scale. It is now a normalized
+    // eigenvalue ratio in (0,1] — 0.05 means the second in-plane extent is at
+    // least ~22% of the first — where before it was a pivot ratio of ATA whose
+    // usable values were ~1e-6 and distance-dependent. See doc/PARAMETERS.md.
+    const Eigen::Vector3d centroid = -ATb / static_cast<double>(num_pts);
+    Eigen::Matrix3d S = ATA;
+    S.noalias() -= static_cast<double>(num_pts) * centroid * centroid.transpose();
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(S);
+    if (es.info() != Eigen::Success) {
+      return false;
+    }
+    // Ascending order: (0) off-plane, (1) minor in-plane, (2) major in-plane.
+    const double lambda_major = es.eigenvalues()(2);
+    const double lambda_minor = es.eigenvalues()(1);
+    if (!(lambda_major > 0.0) ||
+        lambda_minor / lambda_major < static_cast<double>(min_cond_ratio)) {
       return false;
     }
   }
