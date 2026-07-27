@@ -386,13 +386,14 @@ if(BUILD_TESTING)
   # ikd-Tree concurrency regression (HARDENING Phase 2.4 Push_Down race). Unlike
   # the cores above this one needs PCL (pcl::PointXYZINormal) — a hard package
   # dep — and compiles the kd-tree TU directly. It is a short multi-threaded
-  # stress; the TIMEOUT guards against the pre-existing rebuild-path deadlock
-  # (see resple/test/tsan_suppressions.txt) surfacing as a hang under load.
+  # stress; the stress case bounds ITSELF by wall time
+  # (RESPLE_IKD_STRESS_SECONDS, default 90 s), so this TIMEOUT is only the
+  # backstop for a genuine hang — see the note in test/CMakeLists.txt.
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/test_ikdtree_concurrency.cpp)
     ament_add_gtest(test_ikdtree_concurrency
       test/test_ikdtree_concurrency.cpp
       include/ikd-Tree/ikd_Tree.cpp
-      TIMEOUT 300)
+      TIMEOUT 1200)
     target_include_directories(test_ikdtree_concurrency PRIVATE
       include ${PCL_INCLUDE_DIRS})
     target_compile_definitions(test_ikdtree_concurrency PRIVATE ${PCL_DEFINITIONS})

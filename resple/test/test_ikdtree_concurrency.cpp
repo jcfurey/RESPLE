@@ -34,6 +34,8 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -255,10 +257,29 @@ TEST(IkdTreeConcurrency, RebuildVsMutatorRace)
     // thread's flatten/swap windows into the mutator's bursts). Keep the
     // spin readers and hot-region bursts — throttled readers or
     // full-extent spread were measured to make the test fast but blind.
-    // Native runtime ~9 s; under TSan expect minutes; under ASan it can
-    // exceed the 120 s ctest timeout (run the phased test above for the
-    // ASan/UAF angle instead).
+    //
+    // RUNTIME IS BOUNDED BY WALL TIME, NOT BY CYCLE COUNT. The cost of a cycle
+    // is not a property of the work: the mutator needs the UNIQUE lock while
+    // four readers spin re-acquiring the shared one, so on an oversubscribed
+    // machine a cycle costs whatever the scheduler decides. Measured spread for
+    // the same 6 cycles: ~9 s on a wide host, ~135 s on a 4-CPU box, and >300 s
+    // (ctest timeout, job red) on a loaded GitHub runner — three CI failures
+    // that said nothing about the ikd-Tree. Since this is documented above as a
+    // CANARY rather than a proof of absence, "stress for N seconds and check
+    // what came back" is the honest contract, and it cannot time out.
+    //
+    // Override with RESPLE_IKD_STRESS_SECONDS for a deeper hunt; the TSan CI job
+    // does exactly that (it has a 45-minute budget and ~30x the slowdown, so the
+    // default would buy it very few cycles).
     constexpr int kMutCycles = 6;
+    const double stress_seconds = []() {
+        const char* env = std::getenv("RESPLE_IKD_STRESS_SECONDS");
+        if (!env) return 90.0;
+        const double v = std::atof(env);
+        return v > 0.0 ? v : 90.0;
+    }();
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::duration<double>(stress_seconds);
 
     std::shared_mutex map_mtx;  // stands in for RESPLE's mtx_map_
     std::atomic<bool> stop{false};
@@ -300,8 +321,10 @@ TEST(IkdTreeConcurrency, RebuildVsMutatorRace)
     // burst's pull-up Updates run — the racing overlap under test. The
     // brief unlocked sleep lets the rebuild thread make progress mid-burst.
     std::mt19937 mut_rng(4242);
+    int cycles_done = 0;
     for (int cycle = 0; cycle < kMutCycles && !error_flag.load(); ++cycle)
     {
+        if (std::chrono::steady_clock::now() >= deadline) break;
         {
             std::unique_lock<std::shared_mutex> lk(map_mtx);
             std::vector<BoxPointType> boxes;
@@ -316,6 +339,7 @@ TEST(IkdTreeConcurrency, RebuildVsMutatorRace)
             PointVector add = makeCloud(mut_rng, 2500, 0.0f, kHotExtent);
             tree.Add_Points(add, false);
         }
+        ++cycles_done;
         // Brief gap so the rebuild thread can pick up the queued rebuild —
         // the NEXT burst then lands while it is mid-rebuild.
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -324,7 +348,20 @@ TEST(IkdTreeConcurrency, RebuildVsMutatorRace)
     for (auto& t : readers)
         t.join();
 
+    // Report the depth actually achieved: a run that got 2 cycles in its budget
+    // is a WEAKER canary than one that got 6, and that difference should be
+    // visible in the CI log rather than hidden behind a green tick.
+    std::cout << "[ikd-stress] " << cycles_done << "/" << kMutCycles
+              << " mutator cycles in " << stress_seconds << " s budget, "
+              << total_searches.load() << " searches\n";
+
     EXPECT_EQ(error_flag.load(), 0) << "reader observed inconsistent search output";
     EXPECT_GT(total_searches.load(), 0);
     EXPECT_GT(tree.size(), 0);
+    // One completed burst is a very low bar — the mutator only has to win the
+    // unique lock once inside the whole budget. Failing it means the writer is
+    // being starved outright (or a mutator call is wedged), which IS a finding.
+    EXPECT_GE(cycles_done, 1) << "mutator never completed a burst within "
+                              << stress_seconds << " s — writer starvation or a "
+                                 "wedged tree operation";
 }

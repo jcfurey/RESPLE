@@ -43,14 +43,15 @@ jobs:
         # and reported a smaller suite as green. Verified locally: the PCL-gated
         # target contributes 2 ctest cases that are otherwise absent.
         #
-        # Runtime note (measured on a 4-CPU box, i.e. runner-equivalent):
-        # IkdTreeConcurrency.RebuildVsMutatorRace takes ~135 s natively — NOT
-        # the "~9 s" claimed in test_ikdtree_concurrency.cpp, which must have
-        # been measured on a much wider machine. It is the dominant cost of this
-        # job and it runs against the 300 s TIMEOUT the test sets, so ~2x
-        # headroom. If this job starts flaking on that one case, raise that
-        # TIMEOUT rather than dropping the test — the case is also covered by
-        # ikdtree-tsan below, which has its own 45-minute budget.
+        # Runtime note: IkdTreeConcurrency.RebuildVsMutatorRace is the dominant
+        # cost of this job, and its cost is set by the SCHEDULER, not by the
+        # work — the mutator needs a unique lock while four readers spin on the
+        # shared one. Measured: ~9 s on a wide host, ~135 s on a 4-CPU box,
+        # >300 s on a loaded runner. The advice that used to live here ("raise
+        # the TIMEOUT if it flakes") lost that race three times; the case now
+        # bounds ITSELF by wall time (RESPLE_IKD_STRESS_SECONDS, default 90 s,
+        # +1 in-flight burst) and the ctest TIMEOUT is only a hang backstop. Set
+        # the env var here if this job's budget ever needs the stress shortened.
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -81,14 +82,20 @@ jobs:
           cmake --build build/asan -j"$(nproc)"
       - name: Run under ASan + UBSan
         # -E RebuildVsMutatorRace: that one case is a deliberately unthrottled
-        # 4-reader spin stress and is documented in test_ikdtree_concurrency.cpp
-        # (~line 258) as exceeding the ctest timeout under ASan — measured here:
-        # still running after 560 s vs the 300 s TIMEOUT the test sets, i.e. it
-        # would turn this job red for a reason unrelated to memory safety. Its
-        # sibling ParallelSearchPushDownRace still runs, which is what exercises
-        # the PCL point types through Eigen's aligned allocator (the ABI guard
-        # above). The excluded case is covered by the ikdtree-tsan job, whose
-        # 45-minute budget is sized for it.
+        # 4-reader spin stress. It used to be excluded because it blew the ctest
+        # timeout under ASan; it now self-bounds by wall time, so that reason is
+        # gone and the honest one is COST. Measured under ASan+UBSan with the
+        # stress budget cut to 60 s: 338 s total, because ~280 s of it is the
+        # fixed 40k-point Build plus tree teardown, which no budget shortens.
+        # That is 5-10 minutes of a 30-minute job for UAF coverage of the
+        # rebuild path — affordable, but it would be the job's dominant cost, so
+        # it stays out by choice. Re-enabling is a one-line change (drop -E, add
+        # RESPLE_IKD_STRESS_SECONDS=20 and raise timeout-minutes).
+        #
+        # Its sibling ParallelSearchPushDownRace still runs, which is what
+        # exercises the PCL point types through Eigen's aligned allocator (the
+        # ABI guard above). The excluded case is covered by the ikdtree-tsan
+        # job, whose 45-minute budget is sized for it.
         run: |
           ASAN_OPTIONS="detect_leaks=1" UBSAN_OPTIONS="print_stacktrace=1" \
             ctest --test-dir build/asan --output-on-failure --no-tests=error \
@@ -114,7 +121,15 @@ jobs:
         # (Phase 2.5 #1 fixed); passing it keeps the invocation canonical and
         # makes any future (justified) suppression take effect here too.
         # halt_on_error=1: any data race / lock-order report fails the job.
+        #
+        # RESPLE_IKD_STRESS_SECONDS: the stress case self-bounds at 90 s by
+        # default, which under TSan's ~30x slowdown would buy almost no mutator
+        # bursts — and THIS is the job where the rebuild-vs-mutator hunt
+        # actually happens. Give it 20 minutes of the 45-minute budget (the
+        # deadline is checked between bursts, so allow for one more in flight
+        # plus the TSan build above).
         run: |
+          RESPLE_IKD_STRESS_SECONDS=1200 \
           TSAN_OPTIONS="halt_on_error=1:suppressions=$PWD/resple/test/tsan_suppressions.txt" \
             ./build/tsan/test_ikdtree_concurrency
 

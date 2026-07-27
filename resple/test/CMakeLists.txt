@@ -128,5 +128,12 @@ else()
   target_link_libraries(test_ikdtree_concurrency PRIVATE
     GTest::gtest GTest::gtest_main Threads::Threads)
   target_compile_options(test_ikdtree_concurrency PRIVATE -Wall -Wextra)
-  gtest_discover_tests(test_ikdtree_concurrency PROPERTIES TIMEOUT 300)
+  # The stress case bounds ITSELF by wall time (RESPLE_IKD_STRESS_SECONDS,
+  # default 90 s) precisely so ctest's timeout is never the thing that decides
+  # the verdict — three CI failures came from the old 300 s cap firing on a
+  # loaded runner and reporting a scheduling artefact as an ikd-Tree failure.
+  # This cap is the backstop for a genuine HANG (the deadline is only checked
+  # between mutator bursts, so one wedged tree operation still needs catching),
+  # and it must stay well above whatever budget the TSan job passes in.
+  gtest_discover_tests(test_ikdtree_concurrency PROPERTIES TIMEOUT 1200)
 endif()
