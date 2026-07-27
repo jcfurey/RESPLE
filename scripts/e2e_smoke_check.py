@@ -29,6 +29,19 @@ class SmokeCollector(Node):
         self.diverged_count = 0
         self.tf_conflict_count = 0
         self.diag_count = 0
+        # LIVENESS OF THE MEASUREMENT UPDATE. Everything above is satisfied by
+        # a node that fuses nothing at all: on a stationary scene, dead
+        # reckoning sits exactly on the ground truth this gate checks.
+        # Demonstrated, not theorised — running the node with
+        # `-p nn_max_sq_dist:=1e-9` (k-NN gate rejects every neighbour, so
+        # zero point-to-plane rows ever reach the IEKF) produced all seven
+        # original PASSes with max|pos| = final|pos| = final|v| = 0.0000 and
+        # corresp_used = 0. These fields are what make that impossible.
+        self.corresp_used_last = 0
+        self.corresp_used_seen = False
+        self.numerical_failures = 0
+        self.cov_sanitized = 0
+        self.frames_with_corresp = 0
         qos = QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE)
         # resple_diagnostics publishes BEST_EFFORT — a reliable subscription
         # would silently receive nothing (QoS incompatibility).
@@ -48,6 +61,17 @@ class SmokeCollector(Node):
             self.diverged_count += 1
         if msg.tf_conflict_active:
             self.tf_conflict_count += 1
+        # corresp_used is PER-FRAME (the worker copies the last IEKF update's
+        # CorrespStats into each message), not cumulative — so count frames
+        # that fused something rather than looking for monotonic growth.
+        self.corresp_used_seen = True
+        self.corresp_used_last = msg.corresp_used
+        if msg.corresp_used > 0:
+            self.frames_with_corresp += 1
+        # Both of these are cumulative and documented as MUST-stay-0.
+        self.numerical_failures = max(self.numerical_failures,
+                                      msg.iekf_numerical_failures)
+        self.cov_sanitized = max(self.cov_sanitized, msg.cov_sanitized)
 
 
 def main():
@@ -63,6 +87,11 @@ def main():
                     help='mean position norm over the last 50 msgs')
     ap.add_argument('--final-speed-mps', type=float, default=0.05,
                     help='mean |v| over the last 50 msgs (scene is static)')
+    ap.add_argument('--min-corresp-frames', type=int, default=100,
+                    help='minimum diagnostics frames reporting corresp_used > 0. '
+                         'This is the criterion a no-op estimator cannot meet — '
+                         'without it the whole gate passes with the LiDAR '
+                         'measurement update dead (see SmokeCollector).')
     args = ap.parse_args()
 
     rclpy.init()
@@ -91,6 +120,14 @@ def main():
         ('diagnostics received', node.diag_count, node.diag_count > 0),
         ('never DIVERGED', node.diverged_count, node.diverged_count == 0),
         ('TF guard quiet', node.tf_conflict_count, node.tf_conflict_count == 0),
+        # The measurement update must actually be running. Everything above
+        # this line is satisfied by a node that fuses nothing.
+        ('frames fusing LiDAR >= %d' % args.min_corresp_frames,
+         node.frames_with_corresp,
+         node.corresp_used_seen and node.frames_with_corresp >= args.min_corresp_frames),
+        ('IEKF numerical failures', node.numerical_failures,
+         node.numerical_failures == 0),
+        ('covariance sanitized', node.cov_sanitized, node.cov_sanitized == 0),
     ]
     ok = True
     print('%-32s %12s  %s' % ('check', 'value', 'verdict'))

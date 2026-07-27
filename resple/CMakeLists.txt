@@ -160,7 +160,7 @@ target_include_directories(${PROJECT_NAME}
 #                                          bypassing the handmade path
 #                                          regardless of which other macros
 #                                          Memory.h sets.
-#   EIGEN_DEFAULT_ALIGN_BYTES=16         : pin alignment to 16 to match what
+#   EIGEN_MAX_ALIGN_BYTES=16             : pin alignment to 16 to match what
 #                                          PCL was compiled with (per the
 #                                          PCL build warning) and what
 #                                          std::malloc actually delivers.
@@ -169,11 +169,75 @@ target_include_directories(${PROJECT_NAME}
 #                                          underlying malloc only guarantees
 #                                          16, which would re-trigger the
 #                                          aligned-malloc dispatch logic.
+#
+# Third attempt (2026-07-27): the second attempt made its OWN diagnosis's
+# mistake a second time. It pinned EIGEN_DEFAULT_ALIGN_BYTES, which
+# ConfigureVectorization.h:179/181 #defines UNCONDITIONALLY — no #ifndef — so
+# the -D was discarded exactly like EIGEN_HAS_POSIX_MEMALIGN was in attempt
+# one. The guarded knob is EIGEN_MAX_ALIGN_BYTES (:174 `#elif
+# !defined(EIGEN_MAX_ALIGN_BYTES)`), and that is what is set below.
+#
+# This was not cosmetic. EIGEN_MALLOC_ALREADY_ALIGNED=1 IS honoured
+# (Memory.h:22 `#ifndef`), so aligned_malloc really did route to plain
+# std::malloc (16-byte). With the pin inert and ENABLE_NATIVE_ARCH ON (the
+# default), Eigen kept EIGEN_MAX_ALIGN_BYTES at 32/64 and emitted ALIGNED AVX
+# stores (vmovapd) into 16-byte-aligned storage. The eigen_assert that exists
+# to catch precisely that is `#if EIGEN_DEFAULT_ALIGN_BYTES==16`
+# (Memory.h:184) — false under the inert pin — so the one guard was compiled
+# out by the same bug. Reproduced: a loop allocating and retaining
+# MatrixXd(30,30) (the shape of Estimator.h's per-frame H_buf_/I_X) segfaults
+# under the old defines at -march=native AND at -march=x86-64-v3, and
+# survives with EIGEN_MAX_ALIGN_BYTES=16. NOTE the reproduction needs the
+# allocations RETAINED: a destroy-each-iteration loop reuses one chunk that
+# is usually 64-aligned by luck and hides the fault entirely.
+#
+# Every build entry point in THIS repo passes -DENABLE_NATIVE_ARCH=OFF
+# (build_workspace.sh, Dockerfile, e2e_smoke.sh, run_data_sweep.sh), which
+# forces MAX_ALIGN back to 16 and is why neither CI nor any in-repo build
+# ever saw it. The exposure was the production build, where CLAUDE.md
+# documents -march=native as ON.
 target_compile_definitions(${PROJECT_NAME} PUBLIC
 	_GNU_SOURCE
 	EIGEN_MALLOC_ALREADY_ALIGNED=1
-	EIGEN_DEFAULT_ALIGN_BYTES=16
+	EIGEN_MAX_ALIGN_BYTES=16
 )
+
+# Assert the pin above actually TOOK. Both previous attempts failed silently
+# by setting a macro Eigen redefines unconditionally, and the failure mode is
+# a SIGSEGV in the IEKF on an AVX production host — the worst possible place
+# to discover it. A static_assert at configure time costs nothing and makes
+# an inert pin impossible to ship again. It runs with the same defines and
+# the same -march the library will use, so it also catches a future flag
+# reordering that changes the resolved value.
+set(_resple_align_check_flags "")
+if(ENABLE_NATIVE_ARCH)
+	# -march is the only flag that moves Eigen's resolved alignment, so the
+	# check reproduces it and ignores the rest of RESPLE_OPT_FLAGS (which is
+	# not computed until further down anyway).
+	set(_resple_align_check_flags "-march=native")
+endif()
+try_compile(RESPLE_EIGEN_ALIGN_PINNED
+	${CMAKE_CURRENT_BINARY_DIR}/eigen_align_check
+	SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/eigen_align_check.cpp
+	CMAKE_FLAGS
+		"-DINCLUDE_DIRECTORIES=${EIGEN3_INCLUDE_DIR}"
+		"-DCMAKE_CXX_FLAGS=${_resple_align_check_flags}"
+		"-DCMAKE_CXX_STANDARD=17"
+	COMPILE_DEFINITIONS
+		-D_GNU_SOURCE
+		-DEIGEN_MALLOC_ALREADY_ALIGNED=1
+		-DEIGEN_MAX_ALIGN_BYTES=16
+	OUTPUT_VARIABLE RESPLE_EIGEN_ALIGN_LOG)
+if(NOT RESPLE_EIGEN_ALIGN_PINNED)
+	message(FATAL_ERROR
+		"Eigen alignment pin is INERT: EIGEN_MAX_ALIGN_BYTES did not resolve to 16.\n"
+		"Eigen's aligned_malloc is routed to plain std::malloc (16-byte) by\n"
+		"EIGEN_MALLOC_ALREADY_ALIGNED=1, so a larger EIGEN_MAX_ALIGN_BYTES makes\n"
+		"Eigen emit ALIGNED AVX stores into 16-byte storage -> SIGSEGV in the IEKF.\n"
+		"Do not work around this by removing the check.\n\n"
+		"${RESPLE_EIGEN_ALIGN_LOG}")
+endif()
+message(STATUS "resple: Eigen alignment pinned to EIGEN_MAX_ALIGN_BYTES=16 (verified)")
 
 # Enforce C++17 and apply optimization flags to the library target
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
