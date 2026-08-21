@@ -35,7 +35,7 @@ enable_testing()
 add_compile_definitions(
   _GNU_SOURCE
   EIGEN_MALLOC_ALREADY_ALIGNED=1
-  EIGEN_DEFAULT_ALIGN_BYTES=16)
+  EIGEN_MAX_ALIGN_BYTES=16)
 
 set(RESPLE_TEST_SOURCES
   test_geometry_core.cpp
@@ -45,6 +45,7 @@ set(RESPLE_TEST_SOURCES
   test_tf_ownership.cpp
   test_sim_time_wait.cpp
   test_dense_pub.cpp
+  test_measurement_merge.cpp
   test_spline_state.cpp
   test_est_window_anchor.cpp
   test_range_weighting.cpp

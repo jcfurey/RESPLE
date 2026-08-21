@@ -1087,7 +1087,7 @@ class Estimator
     void prepLiDAR(PointData& pt_data) const
     {
         if (pt_data.if_valid) {
-            Eigen::Matrix<double, 1, XSIZE> Hi = Eigen::Matrix<double, 1, XSIZE>::Zero();
+            pt_data.H.setZero();
             Eigen::Quaterniond q_itp;
             // thread_local, not plain locals: these hold std::vectors that
             // itpPose resize()s, so a fresh pair per point meant two
@@ -1119,11 +1119,10 @@ class Estimator
                 // deque end against a clamp regression. Matches the diagnostic
                 // covariance paths' guard.
                 if (j >= 0 && j < 4) {
-                    Hi.block(0, j*6, 1, 3) = pt_data.normvec.transpose() * J_pos.d_val_d_knot[i];
-                    Hi.block(0, j*6 + 3, 1, 3) = tmp * J_ortdel.d_val_d_knot[i];
+                    pt_data.H.block<1, 3>(0, j*6) = pt_data.normvec.transpose() * J_pos.d_val_d_knot[i];
+                    pt_data.H.block<1, 3>(0, j*6 + 3) = tmp * J_ortdel.d_val_d_knot[i];
                 }
             }  
-            pt_data.H = Hi.template leftCols<24>();
         }
     } 
 

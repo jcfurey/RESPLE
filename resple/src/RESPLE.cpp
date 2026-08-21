@@ -80,6 +80,7 @@
 #include "utils/overload_control.h"
 #include "utils/tf_ownership.h"
 #include "utils/dense_pub.h"
+#include "utils/measurement_merge.h"
 #ifdef RESPLE_USE_CUDA
 #include "gpu/cuda_knn.h"
 #endif
@@ -4814,17 +4815,16 @@ private:
         if (spline->numKnots() > 4) {
             max_time_ns = spline->maxTimeNs();
         }
-        int cnt = 0;
-        for (auto& [lidar_name, lidar_data] : lidars_data) {
-            while (!lidar_data.pt_buff.empty() && lidar_data.pt_buff.front().time_ns <= max_time_ns &&
-                    cnt < num_points_upd) {
-                if (spline->numKnots() < 10 || lidar_data.pt_buff.front().time_ns >= spline->maxTimeNs() - dt_ns) {
-                    pt_meas.emplace_back(lidar_data.pt_buff.front());
-                }
-                lidar_data.pt_buff.pop_front();
-                cnt++;
-            }
-        }
+        const int64_t spline_edge_ns = spline->maxTimeNs();
+        const bool retain_all = spline->numKnots() < 10;
+        const int64_t retain_after_ns = spline_edge_ns - dt_ns;
+        const std::size_t point_budget = num_points_upd > 0
+            ? static_cast<std::size_t>(num_points_upd) : 0;
+        resple::measurements::drainEarliest(
+            lidars_data, pt_meas, max_time_ns, point_budget,
+            [retain_all, retain_after_ns](const PointData& point) {
+                return retain_all || point.time_ns >= retain_after_ns;
+            });
         if (!if_lidar_only) {
             while (!imu_buff.empty() && imu_buff.front().time_ns < spline->minTimeNs()) {
                 imu_buff.pop_front();

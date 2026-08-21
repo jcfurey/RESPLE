@@ -762,16 +762,13 @@ class SplineState
             start_idx = num_knots_pruned_;
         }
         spline_msg.start_idx = start_idx;
-        // Time of absolute knot total-5 == local knot num_knot-5 (guarded for
-        // the first cycles, where num_knot can still be < 5).
-        //
-        // CAUTION (2026-07-07 review): start_t describes knot total-5, but
-        // start_idx above can be clamped LOWER (last_start_idx_+1 lags, or the
-        // prune floor) — so start_t is NOT necessarily the time of the first
-        // knot in this message. No current consumer relies on that pairing
-        // (Mapping's updateKnots uses start_i + the receiver's own time axis;
-        // window_st_ns is unused), but do not introduce one without fixing
-        // this to getKnotTimeNs(start_idx - num_knots_pruned_).
+        // Protocol contract: start_t is the mature-window boundary at absolute
+        // knot total-5 (local knot num_knot-5, guarded during startup). It is
+        // intentionally NOT the timestamp of knots.front(): start_idx may lag
+        // total-5 because of the publish handshake throttle or pruning floor.
+        // Mapping places knots using start_idx and carries start_t separately.
+        // Changing start_t to pair with knots.front() therefore requires a
+        // coordinated est_window protocol migration, not a local correction.
         spline_msg.start_t = getKnotTimeNs(std::max<int64_t>(num_knot - 5, 0));
         for (int64_t i = start_idx - num_knots_pruned_; i < num_knot; i++) {
             estimate_msgs::msg::Knot knot_msg;

@@ -368,7 +368,7 @@ target_link_libraries(MapSaving ${PCL_LIBRARIES})
 target_compile_definitions(MapSaving PRIVATE
   _GNU_SOURCE
   EIGEN_MALLOC_ALREADY_ALIGNED=1
-  EIGEN_DEFAULT_ALIGN_BYTES=16
+  EIGEN_MAX_ALIGN_BYTES=16
 )
 
 if(ENABLE_OPENMP)
@@ -404,6 +404,7 @@ if(BUILD_TESTING)
     test/test_tf_ownership.cpp
     test/test_sim_time_wait.cpp
     test/test_dense_pub.cpp
+    test/test_measurement_merge.cpp
     test/test_range_weighting.cpp
     test/test_lidar_gate.cpp)
   foreach(_test_src ${RESPLE_UNIT_TESTS})
