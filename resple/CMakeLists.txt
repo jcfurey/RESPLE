@@ -405,6 +405,7 @@ if(BUILD_TESTING)
     test/test_sim_time_wait.cpp
     test/test_dense_pub.cpp
     test/test_measurement_merge.cpp
+    test/test_init_map_seed.cpp
     test/test_range_weighting.cpp
     test/test_lidar_gate.cpp)
   foreach(_test_src ${RESPLE_UNIT_TESTS})

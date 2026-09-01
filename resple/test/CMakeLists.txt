@@ -46,6 +46,7 @@ set(RESPLE_TEST_SOURCES
   test_sim_time_wait.cpp
   test_dense_pub.cpp
   test_measurement_merge.cpp
+  test_init_map_seed.cpp
   test_spline_state.cpp
   test_est_window_anchor.cpp
   test_range_weighting.cpp

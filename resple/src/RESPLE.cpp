@@ -80,6 +80,7 @@
 #include "utils/overload_control.h"
 #include "utils/tf_ownership.h"
 #include "utils/dense_pub.h"
+#include "utils/init_map_seed.h"
 #include "utils/measurement_merge.h"
 #ifdef RESPLE_USE_CUDA
 #include "gpu/cuda_knn.h"
@@ -283,8 +284,27 @@ public:
         // Setup subscriptions
         rclcpp::SubscriptionOptions sensor_sub_opt;
         sensor_sub_opt.callback_group = sensor_cb_group;
-        auto imu_qos = rclcpp::SensorDataQoS().keep_last(200).best_effort();
-        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
+        auto imu_qos = rclcpp::SensorDataQoS().keep_last(200);
+        auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100);
+        // SensorDataQoS defaults to best effort, which is appropriate for
+        // hardware drivers that offer only best effort.  A reliable upstream
+        // adapter, however, can provide lossless scans and IMU samples.  This
+        // matters for a rotating head: silently losing one or more complete
+        // sectors makes a nominal one-revolution seed geometrically incomplete
+        // and changes initialization with executor load.  Keep the historical
+        // default for compatibility and let deployments with reliable
+        // publishers opt in explicitly.
+        const bool sensor_qos_reliable = CommonUtils::readParam<bool>(
+            this->get_node_parameters_interface(), "sensor_qos_reliable", false);
+        if (sensor_qos_reliable) {
+            imu_qos.reliable();
+            lidar_qos.reliable();
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] sensor subscriptions use RELIABLE QoS");
+        } else {
+            imu_qos.best_effort();
+            lidar_qos.best_effort();
+        }
         
         // Always subscribe to IMU for gravity alignment at startup.
         // In LO mode, the subscription is dropped after initialization completes.
@@ -885,8 +905,10 @@ public:
                     size_t pt_buff_total = 0;
                     for (const auto& [n, d] : lidars_data) pt_buff_total += d.pt_buff.size();
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                        "[RESPLE] init_map blocked: pt_buff total=%zu (need ≥100 in first 100ms)",
-                        pt_buff_total);
+                        "[RESPLE] init_map blocked: pt_buff total=%zu "
+                        "(need >=100 in first %ld ms)",
+                        pt_buff_total,
+                        static_cast<long>(init_map_window_ns_ / 1'000'000));
                 }
                 std::this_thread::sleep_for(kRatePeriod);
                 continue;
@@ -2149,6 +2171,13 @@ private:
     Parameters param;
     int64_t dt_ns;
     int num_points_upd;
+
+    // Duration of LiDAR history used to seed the first ikd-Tree map. The
+    // upstream 100 ms default is one scan for a typical 10 Hz LiDAR. Sensors
+    // on a continuously rotating head can expose a different sector on every
+    // scan, so deployments may retain a longer stationary startup interval
+    // (for example one complete head revolution) before scan matching starts.
+    int64_t init_map_window_ns_ = 100'000'000;
     
     // IMU initialization parameters
     int imu_init_num_samples_ = 50;
@@ -2841,6 +2870,27 @@ private:
             point_filter_num = 1;
         }
         num_points_upd = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "num_points_upd", 100);
+
+        int init_map_window_ms = CommonUtils::readParam<int>(
+            this->get_node_parameters_interface(), "init_map_window_ms", 100);
+        if (init_map_window_ms <= 0) {
+            RCLCPP_WARN(this->get_logger(),
+                "init_map_window_ms=%d must be positive; using 100 ms",
+                init_map_window_ms);
+            init_map_window_ms = 100;
+        } else if (init_map_window_ms > 60000) {
+            RCLCPP_WARN(this->get_logger(),
+                "init_map_window_ms=%d is excessive; clamping to 60000 ms",
+                init_map_window_ms);
+            init_map_window_ms = 60000;
+        }
+        init_map_window_ns_ = static_cast<int64_t>(init_map_window_ms) * 1'000'000LL;
+        if (init_map_window_ms != 100) {
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] initial map will use %d ms of LiDAR history; keep the "
+                "platform stationary until initialization completes",
+                init_map_window_ms);
+        }
         if (if_lidar_only) {
             estimator_lo.n_iter = CommonUtils::readParam<int>(this->get_node_parameters_interface(), "n_iter", 1);
         } else {
@@ -4416,10 +4466,12 @@ private:
         // confirmed active by this point (we wouldn't be here without
         // first IMU + first LiDAR). Drop everything in pc_buff/t_buff/
         // pt_buff older than a short window before the most recent
-        // point. 200ms = ~2 Avia scans, enough geometric overlap for
-        // the first IEKF iteration without dragging in stale history.
+        // point. Keep at least 200 ms (the historical default), and extend it
+        // to init_map_window_ns_ when a deployment deliberately seeds from a
+        // longer stationary interval (for example a full rotating-head sweep).
         if (!if_init_filter) {
-            constexpr int64_t init_lag_window_ns = 200'000'000;  // 200ms
+            const int64_t init_lag_window_ns =
+                std::max<int64_t>(200'000'000, init_map_window_ns_);
             int64_t latest_t_ns = std::numeric_limits<int64_t>::min();
             for (auto& [lidar_name, lidar_data] : lidars_data) {
                 if (!lidar_data.pt_buff.empty()) {
@@ -4738,15 +4790,45 @@ private:
             } else {
                 estimator_lio.propRCP(start_t_ns);
             }
+            // A configurable seed window must be complete before we build the
+            // first map. Merely changing the cutoff below is not sufficient:
+            // the old code built as soon as 100 points existed, which is often
+            // only a few milliseconds of the first scan. On a rotating head
+            // that made init_map_window_ms nondeterministic and still seeded a
+            // single narrow sector instead of the requested full revolution.
+            // Require every configured LiDAR to have reached the end of the
+            // common seed interval AND the next scan boundary; pt_buff is
+            // time-sorted and is not drained until the map has been built.
+            // Snapping the cutoff to a boundary prevents steady state from
+            // starting on an arbitrary tiny tail of the crossing scan. Such a
+            // tail can be only a few points and is a particularly ambiguous
+            // first update for a rotating head.
+            const int64_t init_map_end_ns = start_t_ns + init_map_window_ns_;
+            int64_t init_map_actual_end_ns = init_map_end_ns;
+            std::map<std::string, std::size_t> seed_end_indices;
+            for (const auto& [lidar_name, lidar_data] : lidars_data) {
+                // Voxel-filtered points are sorted by the per-scan offset in
+                // pt.intensity. It rises within a scan and drops at the first
+                // point of the next scan.
+                const auto boundary =
+                    resple::initialization::completeScanSeedEnd(
+                        lidar_data.pt_buff,
+                        init_map_end_ns,
+                        [](const PointData& point) { return point.time_ns; },
+                        [](const PointData& point) {
+                            return point.pt.intensity;
+                        });
+                if (!boundary.has_value()) {
+                    return false;
+                }
+                seed_end_indices.emplace(lidar_name, *boundary);
+                init_map_actual_end_ns = std::max(
+                    init_map_actual_end_ns,
+                    lidar_data.pt_buff[*boundary - 1].time_ns);
+            }
             int feats_down_size = 0;
             for (const auto& [lidar_name, lidar_data] : lidars_data) {
-                for (size_t i = 0; i < lidar_data.pt_buff.size(); i++) {
-                    if (lidar_data.pt_buff[i].time_ns < start_t_ns + 100000000LL) {
-                        feats_down_size++;
-                    } else {
-                        break;
-                    }
-                }
+                feats_down_size += static_cast<int>(seed_end_indices.at(lidar_name));
             }
             if(feats_down_size < 100) {
                 return false;
@@ -4755,18 +4837,40 @@ private:
             pc_world.resize(feats_down_size);
             int world_i = 0;
             for (const auto& [lidar_name, lidar_data] : lidars_data) {
-                for (size_t i = 0; i < lidar_data.pt_buff.size(); i++) {
-                    if (lidar_data.pt_buff[i].time_ns < start_t_ns + 100000000LL) {
-                        Association::pointBodyToWorld(start_t_ns, spline, lidar_data.pt_buff[i].pt,
-                            pc_world.points[world_i], lidar_data.pt_buff[i].t_bl, lidar_data.pt_buff[i].q_bl);
-                        world_i++;
-                    } else {
-                        break;
-                    }
+                const std::size_t seed_count = seed_end_indices.at(lidar_name);
+                for (size_t i = 0; i < seed_count; i++) {
+                    Association::pointBodyToWorld(start_t_ns, spline, lidar_data.pt_buff[i].pt,
+                        pc_world.points[world_i], lidar_data.pt_buff[i].t_bl, lidar_data.pt_buff[i].q_bl);
+                    world_i++;
                 }
             }
+            // Each incoming scan was voxelized independently. A seed spanning
+            // multiple scans (especially one full rotating-head revolution)
+            // therefore still contains near-duplicate points wherever sectors
+            // overlap. Building the kd-tree directly from that concatenation
+            // lets its k nearest neighbors collapse onto duplicate samples of
+            // one return instead of describing the surrounding plane, making
+            // initialization depend on the arbitrary head phase. Apply one
+            // map-resolution voxel pass across the complete seed before Build.
+            // Keep the raw seed as a defensive fallback for pathological user
+            // voxel settings that would collapse the map below the estimator's
+            // minimum initialization size.
+            pcl::PointCloud<pcl::PointXYZINormal> init_map_voxelized;
+            pcl::VoxelGrid<pcl::PointXYZINormal> init_map_filter;
+            init_map_filter.setLeafSize(ds_lm_voxel, ds_lm_voxel, ds_lm_voxel);
+            init_map_filter.setInputCloud(pc_world.makeShared());
+            init_map_filter.filter(init_map_voxelized);
+            if (init_map_voxelized.size() >= 100) {
+                pc_world.swap(init_map_voxelized);
+            } else {
+                RCLCPP_WARN(this->get_logger(),
+                    "[RESPLE] initial-map voxel pass at %.3f m retained only %zu "
+                    "points; using the %d-point raw seed instead",
+                    ds_lm_voxel, init_map_voxelized.size(), feats_down_size);
+            }
             for (auto& [lidar_name, lidar_data] : lidars_data) {
-                while (!lidar_data.pt_buff.empty() && lidar_data.pt_buff.front().time_ns < start_t_ns + 100000000LL) {
+                const std::size_t seed_count = seed_end_indices.at(lidar_name);
+                for (std::size_t i = 0; i < seed_count; ++i) {
                     lidar_data.pt_buff.pop_front();
                 }
             }
@@ -4780,6 +4884,58 @@ private:
                 g_cuda_map.update(ikdtree.PCL_Storage.data(), ikdtree.PCL_Storage.size());
 #endif
             }
+
+            // The seed window is deliberately not estimated: it is collected
+            // while the platform is stationary and used only to establish a
+            // geometrically complete initial map.  Keep the filter clock in
+            // sync with that contract.  Leaving the spline anchored at the
+            // beginning of a long seed makes the first steady-state call to
+            // propRCP() extrapolate the entire window in one shot (roughly 130
+            // knots for a 1.3 s rotating-head seed at 100 Hz), before a single
+            // LiDAR residual has constrained it.  The resulting large prior
+            // and constant-velocity gap extrapolation make startup depend on
+            // the arbitrary head phase.
+            //
+            // Re-anchor at the first point deliberately left after the scan
+            // boundary above.  The initial pose is unchanged, so the new
+            // spline and the map just built in that pose remain consistent.
+            // IMU samples older than the new anchor belong to the skipped seed
+            // interval and must not be fused into the re-anchored state.
+            int64_t steady_start_ns = std::numeric_limits<int64_t>::max();
+            for (const auto& [lidar_name, lidar_data] : lidars_data) {
+                steady_start_ns = std::min(
+                    steady_start_ns, lidar_data.pt_buff.front().time_ns);
+            }
+            Eigen::Vector3d initial_position;
+            Eigen::Quaterniond initial_orientation;
+            {
+                std::lock_guard<std::mutex> spline_lock(spline_mutex_);
+                initial_position = spline->getKnotPos(0);
+                initial_orientation = spline->getKnotOrt(0);
+                initFilter(steady_start_ns, initial_position, initial_orientation);
+            }
+            {
+                std::lock_guard<std::mutex> imu_lock(m_buff);
+                while (!imu_buff.empty() &&
+                       imu_buff.front().time_ns < steady_start_ns) {
+                    imu_buff.pop_front();
+                }
+            }
+            imu_meas.clear();
+
+            // Mapping treats a new start_time as a staged restart.  No estimate
+            // windows have been published during seeding, so replacing the
+            // earlier provisional anchor is lossless and keeps its replica on
+            // the same time axis as the re-anchored odometry spline.
+            std_msgs::msg::Int64 steady_start_time;
+            steady_start_time.data = steady_start_ns;
+            pub_start_time->publish(steady_start_time);
+            RCLCPP_INFO(this->get_logger(),
+                "[RESPLE] initial map built from %zu voxelized points "
+                "(%d pre-voxel) spanning %ld ms; filter re-anchored at %ld",
+                pc_world.size(), feats_down_size,
+                static_cast<long>((init_map_actual_end_ns - start_t_ns) / 1'000'000),
+                static_cast<long>(steady_start_ns));
             pc_world.clear();
             if_init_map = true;
         }

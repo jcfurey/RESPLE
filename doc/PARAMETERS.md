@@ -195,6 +195,7 @@ when the robot starts on a slope or is already moving at launch.
 | --- | --- | --- |
 | `topic_imu` | `imu` | IMU topic (LIO mode) |
 | `acc_ratio` | `false` | Accelerometer reports g-units (Livox built-ins): scale by 9.81 |
+| `sensor_qos_reliable` | `false` | QoS for both IMU and LiDAR subscriptions. `false` preserves the historical sensor-data best-effort policy. Set `true` only when every upstream sensor publisher offers reliable delivery; it prevents whole scans from being lost under executor/DDS load, but a reliable subscriber is incompatible with a best-effort-only publisher and will receive no data from it. |
 | `lidars` | — | List of sensor names; each gets its own block (below) |
 | `<name>/topic_lidar` | — | Point cloud topic |
 | `<name>/lidar_type` | — | `Ouster`, `Hesai`, `Mid360Boxi`, `HAP360`, `Mid70Avia`, `AviaResple`, or **`PointCloud2`** (generic: field layout introspected at runtime — works with any driver) |
@@ -226,6 +227,7 @@ when the robot starts on a slope or is already moving at launch.
 | --- | --- | --- |
 | `if_lidar_only` | `false` | LO (`true`) vs LIO (`false`) |
 | `knot_hz` | — | B-spline knot rate (Hz); 100 is the canonical value |
+| `init_map_window_ms` | `100` | Stationary LiDAR history used to seed the first local map. RESPLE waits until the requested interval and the following complete-scan boundary are available, voxel-filters the combined seed at `ds_lm_voxel`, then re-anchors the filter at the first post-seed scan. A rotating sensor can set this to at least one head revolution plus one LiDAR scan so startup geometry does not depend on head phase. Values ≤0 fall back to 100; values above 60,000 clamp to 60,000. Keep the platform stationary through this interval. |
 | `n_iter` | `1` | IEKF iterations per update |
 | `num_points_upd` | `100` | Max LiDAR points per IEKF step |
 | `num_match_points` | `5` | k for the k-NN plane fit. Declared with a **hard-fail** `ParameterDescriptor` range of 3–10: a value outside it makes the node REFUSE TO START (rclcpp rejects the parameter), it is not clamped. Note a CUDA build additionally caps the GPU path at 8 — 9 and 10 fall back to the ikd-Tree with a WARN. |
