@@ -1,0 +1,98 @@
+# RESPLE standalone replay profile for Super SACS Run 1 (2026-01-20).
+#
+# The source MCAP records native OS0-128 packets under
+# /record/sensor/lidar/lidar0. The matching launch strips /record and decodes
+# them with ouster_ros into:
+#   /sensor/lidar/lidar0/points  128x512 organized PointCloud2 at 10 Hz
+#   /sensor/lidar/lidar0/imu     sensor_msgs/Imu at 100 Hz
+#
+# This is an isolated LIO/RViz profile. base_link is deliberately aligned with
+# the Ouster sensor reference; the launch publishes base_link ->
+# lidar0/sensor_frame as identity and ouster_ros publishes the metadata-derived
+# sensor -> lidar/imu transforms. The recorded wheel odometry, GPS, camera, and
+# diagnostics channels are not replayed.
+/**:
+  ros__parameters:
+    use_sim_time: true
+
+    odom/frame_id: odom
+    map/frame_id: map
+    frame_id: base_link
+    odom/publish_tf: true
+    odom/invert_tf: false
+    map/publish_tf: true
+    map/invert_tf: false
+
+    cov_pose: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    cov_twist: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+
+    topic_imu: /sensor/lidar/lidar0/imu
+    acc_ratio: false
+    tf_extrinsics: true
+    tf_wait_timeout: 10.0
+    lidars: ["Ouster"]
+    Ouster:
+      topic_lidar: /sensor/lidar/lidar0/points
+      lidar_type: Ouster
+      scan_line: 128
+      blind: 0.5
+      # The complete calibrated mounting comes from TF. These are an
+      # additional offset and therefore remain identity.
+      q_lb: [1.0, 0.0, 0.0, 0.0]
+      t_lb: [0.0, 0.0, 0.0]
+      w_pt: 0.01
+    # ouster_ros timestamps each decoded sweep at its beginning and preserves
+    # the uint32 relative-nanosecond point offsets. No synthetic shift needed.
+    lidar_time_offset: 0.0
+
+    if_lidar_only: false
+    knot_hz: 100
+    imu_init_num_samples: 50
+    imu_init_max_variance: 5.0
+    gravity_magnitude: 9.80665
+    init_attitude_source: gravity
+
+    # Match the dataset's supplied RESPLE profile and the TestTrack-scale
+    # working density: 65,536 decoded returns per sweep are decimated before
+    # the 0.5 m scan/map voxel filters.
+    ds_scan_voxel: 0.5
+    ds_lm_voxel: 0.5
+    point_filter_num: 5
+    num_threads: 8
+    executor_threads: 4
+    nn_thresh: 0.25
+    num_match_points: 5
+    coeff_cov: 3.0
+    cube_len: 500.0
+
+    cov_P0: 0.02
+    cov_RCP_pos_old: 0.1
+    cov_RCP_ort_old: 0.1
+    cov_RCP_pos_new: 1.0
+    cov_RCP_ort_new: 1.0
+    std_sys_pos: 0.2
+    std_sys_ort: 0.1
+    cov_acc: [1.0, 1.0, 1.0]
+    cov_gyro: [0.1, 0.1, 0.1]
+    cov_ba: [0.2, 0.2, 0.2]
+    cov_bg: [0.004, 0.004, 0.004]
+    n_iter: 1
+    num_points_upd: 500
+
+    spline_prune_keep_knots: 600
+    nn_max_sq_dist: 5.0
+    plane_fit_thresh: 0.1
+    plane_min_cond_ratio: 0.0
+    nis_window: 32
+    nis_warn_ratio: 2.0
+    nis_diverged_ratio: 4.0
+    nis_breach_limit: 3
+    nis_recovery_mode: "off"
+    nis_reset_cov: 1.0
+    map_prune_radius: 0.0
+    max_scan_buffer: 64
+    max_imu_staging: 2000
+
+    tf_conflict_action: "warn"
+    tf_conflict_quiet_sec: 5.0
+    tf_absent_warn_sec: 10.0

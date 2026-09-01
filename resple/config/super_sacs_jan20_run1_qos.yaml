@@ -1,0 +1,23 @@
+# rosbag2 publisher QoS for the native Super SACS Ouster channels.
+/record/sensor/lidar/lidar0/metadata: &metadata_qos
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/sensor/lidar/lidar0/metadata: *metadata_qos
+
+# The OS0-128 512x10 profile emits 32 packets per sweep. Two complete frames
+# match ouster_ros's metadata-derived packet subscription depth.
+/record/sensor/lidar/lidar0/lidar_packets: &lidar_packet_qos
+  history: keep_last
+  depth: 64
+  reliability: reliable
+  durability: volatile
+/sensor/lidar/lidar0/lidar_packets: *lidar_packet_qos
+
+/record/sensor/lidar/lidar0/imu_packets: &imu_packet_qos
+  history: keep_last
+  depth: 256
+  reliability: reliable
+  durability: volatile
+/sensor/lidar/lidar0/imu_packets: *imu_packet_qos
