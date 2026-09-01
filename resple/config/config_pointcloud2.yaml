@@ -44,6 +44,12 @@
 
     topic_imu: /imu/data
     acc_ratio: false
+    # Sensor subscriptions use best-effort QoS by default for compatibility
+    # with hardware drivers. Set this true only when BOTH the IMU and every
+    # LiDAR publisher offer RELIABLE QoS. Reliable delivery prevents complete
+    # scans from disappearing under load, which is especially important when
+    # each scan observes a different sector (for example a rotating head).
+    sensor_qos_reliable: false
     # Extrinsic convention: the base_link<-sensor TF carries the mounting
     # extrinsic; q_lb/t_lb below is an EXTRA offset (identity here). Never
     # make both non-identity — they compose. See doc/PARAMETERS.md.
@@ -71,6 +77,14 @@
 
     knot_hz: 100
     if_lidar_only: false            # LIO mode (LiDAR-inertial)
+    # Stationary LiDAR history used for the initial map. RESPLE waits for this
+    # interval AND the next complete-scan boundary, voxelizes the combined
+    # seed, then re-anchors the filter at the first post-seed scan. 100 ms is
+    # one scan for a conventional fixed 10 Hz sensor. For a rotating head, use
+    # at least one head revolution plus one LiDAR scan (for example 1300 ms for
+    # a measured 1.115 s revolution and a 10 Hz scanner), and keep the platform
+    # stationary until initialization completes.
+    init_map_window_ms: 100
 
     ds_scan_voxel: 0.2
     point_filter_num: 3
@@ -148,4 +162,3 @@
     tf_conflict_quiet_sec: 5.0     # quiet window before yield resumes
     tf_absent_warn_sec: 10.0       # publish_tf=False: one-shot WARN if nobody
                                    # publishes the pair within this (0 = off)
-
