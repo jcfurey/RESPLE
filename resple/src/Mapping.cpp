@@ -651,7 +651,12 @@ class OusterBuff : public MappingBase<pcl::PointXYZINormal>
         if (this->pc_last->points.empty()) return;
 
         // Transform point cloud to body frame
-        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+        // RESPLE pins Eigen storage to 16-byte alignment.  PCL's AVX
+        // double-transform path assumes a 32-byte-aligned matrix; select its
+        // float path for point coordinates while retaining the cached TF in
+        // double precision.
+        pcl::transformPointCloud(
+            *this->pc_last, *this->pc_last, lidar_to_baselink_.cast<float>());
 
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
@@ -712,7 +717,8 @@ class GenericPC2Buff : public MappingBase<pcl::PointXYZINormal>
         if (this->pc_last->points.empty()) return;
 
         // Transform point cloud to body frame
-        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+        pcl::transformPointCloud(
+            *this->pc_last, *this->pc_last, lidar_to_baselink_.cast<float>());
 
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
@@ -777,7 +783,8 @@ class Mid70AviaBuff : public MappingBase<pcl::PointXYZINormal>
         if (this->pc_last->points.empty()) return;
  
         // Transform point cloud to body frame
-        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+        pcl::transformPointCloud(
+            *this->pc_last, *this->pc_last, lidar_to_baselink_.cast<float>());
 
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
@@ -841,7 +848,8 @@ public:
         if (this->pc_last->points.empty()) return;
 
         // Transform point cloud to body frame
-        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+        pcl::transformPointCloud(
+            *this->pc_last, *this->pc_last, lidar_to_baselink_.cast<float>());
 
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
@@ -905,7 +913,8 @@ public:
         if (this->pc_last->points.empty()) return;
 
         // Transform point cloud to body frame
-        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+        pcl::transformPointCloud(
+            *this->pc_last, *this->pc_last, lidar_to_baselink_.cast<float>());
 
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
@@ -974,7 +983,8 @@ class HesaiBuff : public MappingBase<pcl::PointXYZINormal>
         if (this->pc_last->points.empty()) return;
 
         // Transform point cloud to body frame
-        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+        pcl::transformPointCloud(
+            *this->pc_last, *this->pc_last, lidar_to_baselink_.cast<float>());
 
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();
@@ -1041,7 +1051,8 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
         if (this->pc_last->points.empty()) return;
 
         // Transform point cloud to body frame
-        pcl::transformPointCloud(*this->pc_last, *this->pc_last, lidar_to_baselink_);
+        pcl::transformPointCloud(
+            *this->pc_last, *this->pc_last, lidar_to_baselink_.cast<float>());
 
         ds_filter_each_scan.setInputCloud(pc_last);
         this->pc_last_ds->clear();

@@ -3803,7 +3803,13 @@ private:
         // fallback mode points stay in the sensor frame and q_bl/t_bl is
         // applied per point downstream)
         if (lidar.tf_latched) {
-            pcl::transformPointCloud(*pc_last, *pc_last, lidar.lidar_to_baselink);
+            // RESPLE pins Eigen storage to 16-byte alignment.  PCL's AVX
+            // double-transform path performs 32-byte aligned matrix loads, so
+            // feeding it an Affine3d can fault even though the transform is
+            // valid.  Keep the cached/estimator transform in double precision
+            // and use PCL's 16-byte-safe float path for point coordinates.
+            pcl::transformPointCloud(
+                *pc_last, *pc_last, lidar.lidar_to_baselink.cast<float>());
         }
 
         pushScanBounded(lidar_buffs, pc_last->points, time_begin);
@@ -3887,7 +3893,8 @@ private:
         // fallback mode points stay in the sensor frame and q_bl/t_bl is
         // applied per point downstream)
         if (lidar.tf_latched) {
-            pcl::transformPointCloud(*pc_last, *pc_last, lidar.lidar_to_baselink);
+            pcl::transformPointCloud(
+                *pc_last, *pc_last, lidar.lidar_to_baselink.cast<float>());
         }
 
         pushScanBounded(lidar_buffs, pc_last->points, time_begin);
@@ -3961,7 +3968,8 @@ private:
         // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         if (lidar.tf_latched) {
-            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+            pcl::transformPointCloud(
+                *pc_last, *pc_transformed, lidar.lidar_to_baselink.cast<float>());
         } else {
             pc_transformed = pc_last;
         }
@@ -4032,7 +4040,8 @@ private:
         // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         if (lidar.tf_latched) {
-            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+            pcl::transformPointCloud(
+                *pc_last, *pc_transformed, lidar.lidar_to_baselink.cast<float>());
         } else {
             pc_transformed = pc_last;
         }
@@ -4104,7 +4113,8 @@ private:
         // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         if (lidar.tf_latched) {
-            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+            pcl::transformPointCloud(
+                *pc_last, *pc_transformed, lidar.lidar_to_baselink.cast<float>());
         } else {
             pc_transformed = pc_last;
         }
@@ -4164,7 +4174,8 @@ private:
         // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         if (lidar.tf_latched) {
-            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+            pcl::transformPointCloud(
+                *pc_last, *pc_transformed, lidar.lidar_to_baselink.cast<float>());
         } else {
             pc_transformed = pc_last;
         }
@@ -4222,7 +4233,8 @@ private:
         // Transform point cloud to body frame (TF mode only; see 3a note)
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_transformed(new pcl::PointCloud<pcl::PointXYZINormal>());
         if (lidar.tf_latched) {
-            pcl::transformPointCloud(*pc_last, *pc_transformed, lidar.lidar_to_baselink);
+            pcl::transformPointCloud(
+                *pc_last, *pc_transformed, lidar.lidar_to_baselink.cast<float>());
         } else {
             pc_transformed = pc_last;
         }
