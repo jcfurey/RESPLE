@@ -13,6 +13,9 @@ Example configurations: [`resple/config/config_pointcloud2.yaml`](../resple/conf
 The dataset configs (`config_nc_short.yaml`, …) are kept at the values used
 for the published benchmarks.
 
+Field evaluation: [Exyn rotating-head tunnel LIO study
+(2026-09-01)](FINDINGS_2026-09-01_exyn_rotating_head_tunnel.md).
+
 The live-sensor launch files (`resple_pointcloud2.launch.py`,
 `resple_ouster.launch.py`, `resple_demonstrator.launch.py`) accept a
 `config_file` argument so a copied/adapted YAML can be used without editing
