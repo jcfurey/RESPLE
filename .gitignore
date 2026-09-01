@@ -242,6 +242,7 @@ align_est_gt/
 # CLion build files
 cmake-build-*
 .idea
+.vscode/
 
 # Python bytecode caches (e.g. from launch_test importing the integration tests)
 __pycache__/
